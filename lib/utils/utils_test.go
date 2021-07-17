@@ -20,17 +20,26 @@ import (
 	"bytes"
 	"io/ioutil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gravitational/teleport"
+	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/fixtures"
 
-	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/check.v1"
+
+	"github.com/gravitational/trace"
 )
+
+func TestMain(m *testing.M) {
+	InitLoggerForTests()
+	os.Exit(m.Run())
+}
 
 func TestUtils(t *testing.T) { check.TestingT(t) }
 
@@ -122,14 +131,14 @@ func (s *UtilsSuite) TestRandomDuration(c *check.C) {
 
 func (s *UtilsSuite) TestMiscFunctions(c *check.C) {
 	// SliceContainsStr
-	c.Assert(SliceContainsStr([]string{"two", "one"}, "one"), check.Equals, true)
-	c.Assert(SliceContainsStr([]string{"two", "one"}, "five"), check.Equals, false)
-	c.Assert(SliceContainsStr([]string(nil), "one"), check.Equals, false)
+	c.Assert(apiutils.SliceContainsStr([]string{"two", "one"}, "one"), check.Equals, true)
+	c.Assert(apiutils.SliceContainsStr([]string{"two", "one"}, "five"), check.Equals, false)
+	c.Assert(apiutils.SliceContainsStr([]string(nil), "one"), check.Equals, false)
 
 	// Deduplicate
-	c.Assert(Deduplicate([]string{}), check.DeepEquals, []string{})
-	c.Assert(Deduplicate([]string{"a", "b"}), check.DeepEquals, []string{"a", "b"})
-	c.Assert(Deduplicate([]string{"a", "b", "b", "a", "c"}), check.DeepEquals, []string{"a", "b", "c"})
+	c.Assert(apiutils.Deduplicate([]string{}), check.DeepEquals, []string{})
+	c.Assert(apiutils.Deduplicate([]string{"a", "b"}), check.DeepEquals, []string{"a", "b"})
+	c.Assert(apiutils.Deduplicate([]string{"a", "b", "b", "a", "c"}), check.DeepEquals, []string{"a", "b", "c"})
 
 	// RemoveFromSlice
 	c.Assert(RemoveFromSlice([]string{}, "a"), check.DeepEquals, []string{})
@@ -506,4 +515,54 @@ func (s *UtilsSuite) TestStringsSet(c *check.C) {
 	out := StringsSet(nil)
 	c.Assert(out, check.HasLen, 0)
 	c.Assert(out, check.NotNil)
+}
+
+// TestRepeatReader tests repeat reader
+func (s *UtilsSuite) TestRepeatReader(c *check.C) {
+	type tc struct {
+		repeat   byte
+		count    int
+		expected string
+	}
+	tcs := []tc{
+		{
+			repeat:   byte('a'),
+			count:    1,
+			expected: "a",
+		},
+		{
+			repeat:   byte('a'),
+			count:    0,
+			expected: "",
+		},
+		{
+			repeat:   byte('a'),
+			count:    3,
+			expected: "aaa",
+		},
+	}
+	for _, tc := range tcs {
+		data, err := ioutil.ReadAll(NewRepeatReader(tc.repeat, tc.count))
+		c.Assert(err, check.IsNil)
+		c.Assert(string(data), check.Equals, tc.expected)
+	}
+}
+
+func TestReadAtMost(t *testing.T) {
+	testCases := []struct {
+		limit int64
+		data  string
+		err   error
+	}{
+		{4, "hell", ErrLimitReached},
+		{5, "hello", ErrLimitReached},
+		{6, "hello", nil},
+	}
+
+	for _, tc := range testCases {
+		r := strings.NewReader("hello")
+		data, err := ReadAtMost(r, tc.limit)
+		require.Equal(t, []byte(tc.data), data)
+		require.Equal(t, tc.err, err)
+	}
 }

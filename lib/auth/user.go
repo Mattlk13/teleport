@@ -26,7 +26,9 @@ package auth
 import (
 	"context"
 
-	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/types"
+	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/services"
 
@@ -34,10 +36,12 @@ import (
 )
 
 // CreateUser inserts a new user entry in a backend.
-func (s *AuthServer) CreateUser(ctx context.Context, user services.User) error {
-	createdBy := user.GetCreatedBy()
-	if createdBy.IsEmpty() {
-		return trace.BadParameter("created by is not set for new user %q", user.GetName())
+func (s *Server) CreateUser(ctx context.Context, user types.User) error {
+	if user.GetCreatedBy().IsEmpty() {
+		user.SetCreatedBy(types.CreatedBy{
+			User: types.UserRef{Name: ClientUsername(ctx)},
+			Time: s.GetClock().Now().UTC(),
+		})
 	}
 
 	// TODO: ctx is being swallowed here because the current implementation of
@@ -49,52 +53,70 @@ func (s *AuthServer) CreateUser(ctx context.Context, user services.User) error {
 
 	var connectorName string
 	if user.GetCreatedBy().Connector == nil {
-		connectorName = teleport.Local
+		connectorName = constants.Local
 	} else {
 		connectorName = user.GetCreatedBy().Connector.ID
 	}
 
-	if err := s.EmitAuditEvent(events.UserCreate, events.EventFields{
-		events.EventUser:     createdBy.User.Name,
-		events.UserExpires:   user.Expiry(),
-		events.UserRoles:     user.GetRoles(),
-		events.FieldName:     user.GetName(),
-		events.UserConnector: connectorName,
+	if err := s.emitter.EmitAuditEvent(ctx, &apievents.UserCreate{
+		Metadata: apievents.Metadata{
+			Type: events.UserCreateEvent,
+			Code: events.UserCreateCode,
+		},
+		UserMetadata: apievents.UserMetadata{
+			User:         user.GetCreatedBy().User.Name,
+			Impersonator: ClientImpersonator(ctx),
+		},
+		ResourceMetadata: apievents.ResourceMetadata{
+			Name:    user.GetName(),
+			Expires: user.Expiry(),
+		},
+		Connector: connectorName,
+		Roles:     user.GetRoles(),
 	}); err != nil {
-		log.Warnf("Failed to emit user create event: %v", err)
+		log.WithError(err).Warn("Failed to emit user create event.")
 	}
 
 	return nil
 }
 
 // UpdateUser updates an existing user in a backend.
-func (s *AuthServer) UpdateUser(ctx context.Context, user services.User) error {
+func (s *Server) UpdateUser(ctx context.Context, user types.User) error {
 	if err := s.Identity.UpdateUser(ctx, user); err != nil {
 		return trace.Wrap(err)
 	}
 
 	var connectorName string
 	if user.GetCreatedBy().Connector == nil {
-		connectorName = teleport.Local
+		connectorName = constants.Local
 	} else {
 		connectorName = user.GetCreatedBy().Connector.ID
 	}
 
-	if err := s.EmitAuditEvent(events.UserUpdate, events.EventFields{
-		events.EventUser:     clientUsername(ctx),
-		events.FieldName:     user.GetName(),
-		events.UserExpires:   user.Expiry(),
-		events.UserRoles:     user.GetRoles(),
-		events.UserConnector: connectorName,
+	if err := s.emitter.EmitAuditEvent(ctx, &apievents.UserCreate{
+		Metadata: apievents.Metadata{
+			Type: events.UserUpdatedEvent,
+			Code: events.UserUpdateCode,
+		},
+		UserMetadata: apievents.UserMetadata{
+			User:         ClientUsername(ctx),
+			Impersonator: ClientImpersonator(ctx),
+		},
+		ResourceMetadata: apievents.ResourceMetadata{
+			Name:    user.GetName(),
+			Expires: user.Expiry(),
+		},
+		Connector: connectorName,
+		Roles:     user.GetRoles(),
 	}); err != nil {
-		log.Warnf("Failed to emit user update event: %v", err)
+		log.WithError(err).Warn("Failed to emit user update event.")
 	}
 
 	return nil
 }
 
 // UpsertUser updates a user.
-func (s *AuthServer) UpsertUser(user services.User) error {
+func (s *Server) UpsertUser(user types.User) error {
 	err := s.Identity.UpsertUser(user)
 	if err != nil {
 		return trace.Wrap(err)
@@ -102,26 +124,35 @@ func (s *AuthServer) UpsertUser(user services.User) error {
 
 	var connectorName string
 	if user.GetCreatedBy().Connector == nil {
-		connectorName = teleport.Local
+		connectorName = constants.Local
 	} else {
 		connectorName = user.GetCreatedBy().Connector.ID
 	}
 
-	if err := s.EmitAuditEvent(events.UserUpdate, events.EventFields{
-		events.EventUser:     user.GetName(),
-		events.UserExpires:   user.Expiry(),
-		events.UserRoles:     user.GetRoles(),
-		events.UserConnector: connectorName,
+	if err := s.emitter.EmitAuditEvent(s.closeCtx, &apievents.UserCreate{
+		Metadata: apievents.Metadata{
+			Type: events.UserCreateEvent,
+			Code: events.UserCreateCode,
+		},
+		UserMetadata: apievents.UserMetadata{
+			User: user.GetName(),
+		},
+		ResourceMetadata: apievents.ResourceMetadata{
+			Name:    user.GetName(),
+			Expires: user.Expiry(),
+		},
+		Connector: connectorName,
+		Roles:     user.GetRoles(),
 	}); err != nil {
-		log.Warnf("Failed to emit user update event: %v", err)
+		log.WithError(err).Warn("Failed to emit user upsert event.")
 	}
 
 	return nil
 }
 
 // DeleteUser deletes an existng user in a backend by username.
-func (s *AuthServer) DeleteUser(ctx context.Context, user string) error {
-	role, err := s.Access.GetRole(services.RoleNameForUser(user))
+func (s *Server) DeleteUser(ctx context.Context, user string) error {
+	role, err := s.Access.GetRole(ctx, services.RoleNameForUser(user))
 	if err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
@@ -140,11 +171,20 @@ func (s *AuthServer) DeleteUser(ctx context.Context, user string) error {
 	}
 
 	// If the user was successfully deleted, emit an event.
-	if err := s.EmitAuditEvent(events.UserDelete, events.EventFields{
-		events.FieldName: user,
-		events.EventUser: clientUsername(ctx),
+	if err := s.emitter.EmitAuditEvent(s.closeCtx, &apievents.UserDelete{
+		Metadata: apievents.Metadata{
+			Type: events.UserDeleteEvent,
+			Code: events.UserDeleteCode,
+		},
+		UserMetadata: apievents.UserMetadata{
+			User:         ClientUsername(ctx),
+			Impersonator: ClientImpersonator(ctx),
+		},
+		ResourceMetadata: apievents.ResourceMetadata{
+			Name: user,
+		},
 	}); err != nil {
-		log.Warnf("Failed to emit user delete event: %v", err)
+		log.WithError(err).Warn("Failed to emit user delete event.")
 	}
 
 	return nil

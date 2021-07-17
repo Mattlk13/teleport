@@ -1,0 +1,85 @@
+---
+title: Database Access GUI Clients
+description: How to configure graphical database clients for Teleport Database Access.
+---
+
+# Graphical Database Clients
+
+This article describes how to configure popular graphical database clients to
+work with Teleport Database Access.
+
+## Obtain local certificate/key-pair
+
+Issue the following command after you login with `tsh`:
+
+```bash
+# View configuration for the database you're logged in to.
+tsh db config
+# View configuration for the specific database when you're logged into multiple.
+tsh db config example
+```
+
+It will display the path to your locally cached PEM files:
+
+```
+Name:      example
+Host:      teleport.example.com
+Port:      3036
+User:      alice
+Database:
+CA:        /Users/alice/.tsh/keys/teleport.example.com/certs.pem
+Cert:      /Users/alice/.tsh/keys/teleport.example.com/alice-db/root/example-x509.pem
+Key:       /Users/alice/.tsh/keys/teleport.example.com/alice
+```
+
+The displayed `CA`, `Cert`, and `Key` files are used to connect through pgAdmin
+4, MySQL Workbench, and other graphical database clients that support mutual
+TLS authentication.
+
+## pgAdmin 4
+
+[pgAdmin 4](https://www.pgadmin.org/) is a popular graphical client for
+PostgreSQL servers.
+
+To configure a new connection, right-click on "Servers" in the main browser view
+and create a new server:
+
+![pgAdmin Add Server](../../../img/database-access/pgadmin-add-server@2x.png)
+
+In the "General" tab of the new server dialog, enter the server connection name:
+
+![pgAdmin General](../../../img/database-access/pgadmin-general@2x.png)
+
+In the "Connection" tab, enter the default database name (the *maintenance
+database*) and the connection service name (the same one that you specify when
+connecting through `psql`). Leave all the other fields blank:
+
+![pgAdmin Connection](../../../img/database-access/pgadmin-connection@2x.png)
+
+In the "SSL" tab, set "SSL Mode" to `Verify-Full`:
+
+![pgAdmin SSL](../../../img/database-access/pgadmin-ssl@2x.png)
+
+Click "Save", and pgAdmin should immediately connect.
+
+## MySQL Workbench
+
+[MySQL Workbench](https://www.mysql.com/products/workbench/) is a visual tool
+that provides comprehensive MySQL administration and SQL development tools.
+
+In MySQL Workbench "Setup New Connection" dialog, fill out "Connection Name",
+"Hostname", "Port", and "Username":
+
+![MySQL Workbench
+Parameters](../../../img/database-access/workbench-parameters@2x.png)
+
+In the "SSL" tab, set "Use SSL" to `Require and Verify Identity` and enter paths
+to  your CA, certificate, and private key files from `tsh db config` command:
+
+![MySQL Workbench SSL](../../../img/database-access/workbench-ssl@2x.png)
+
+Optionally, click "Test Connection" to verify connectivity:
+
+![MySQL Workbench Test](../../../img/database-access/workbench-test@2x.png)
+
+Save the connection, and connect to the database.

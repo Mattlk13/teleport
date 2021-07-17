@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Gravitational, Inc.
+Copyright 2017-2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@ limitations under the License.
 package services
 
 import (
-	"github.com/gravitational/teleport/lib/utils"
-
+	"github.com/gravitational/teleport/api/types"
 	check "gopkg.in/check.v1"
 )
 
@@ -26,11 +25,7 @@ type GithubSuite struct{}
 
 var _ = check.Suite(&GithubSuite{})
 
-func (s *GithubSuite) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests()
-}
-
-func (s *GithubSuite) TestUnmarshal(c *check.C) {
+func (g *GithubSuite) TestUnmarshal(c *check.C) {
 	data := []byte(`{"kind": "github",
 "version": "v3",
 "metadata": {
@@ -47,14 +42,14 @@ func (s *GithubSuite) TestUnmarshal(c *check.C) {
     "logins": ["admin"]
   }]
 }}`)
-	connector, err := GetGithubConnectorMarshaler().Unmarshal(data)
+	connector, err := UnmarshalGithubConnector(data)
 	c.Assert(err, check.IsNil)
-	expected := NewGithubConnector("github", GithubConnectorSpecV3{
+	expected, err := types.NewGithubConnector("github", types.GithubConnectorSpecV3{
 		ClientID:     "aaa",
 		ClientSecret: "bbb",
 		RedirectURL:  "https://localhost:3080/v1/webapi/github/callback",
 		Display:      "Github",
-		TeamsToLogins: []TeamMapping{
+		TeamsToLogins: []types.TeamMapping{
 			{
 				Organization: "gravitational",
 				Team:         "admins",
@@ -62,16 +57,17 @@ func (s *GithubSuite) TestUnmarshal(c *check.C) {
 			},
 		},
 	})
+	c.Assert(err, check.IsNil)
 	c.Assert(expected, check.DeepEquals, connector)
 }
 
-func (s *GithubSuite) TestMapClaims(c *check.C) {
-	connector := NewGithubConnector("github", GithubConnectorSpecV3{
+func (g *GithubSuite) TestMapClaims(c *check.C) {
+	connector, err := types.NewGithubConnector("github", types.GithubConnectorSpecV3{
 		ClientID:     "aaa",
 		ClientSecret: "bbb",
 		RedirectURL:  "https://localhost:3080/v1/webapi/github/callback",
 		Display:      "Github",
-		TeamsToLogins: []TeamMapping{
+		TeamsToLogins: []types.TeamMapping{
 			{
 				Organization: "gravitational",
 				Team:         "admins",
@@ -87,27 +83,29 @@ func (s *GithubSuite) TestMapClaims(c *check.C) {
 			},
 		},
 	})
-	logins, kubeGroups, kubeUsers := connector.MapClaims(GithubClaims{
+	c.Assert(err, check.IsNil)
+
+	logins, kubeGroups, kubeUsers := connector.MapClaims(types.GithubClaims{
 		OrganizationToTeams: map[string][]string{
-			"gravitational": []string{"admins"},
+			"gravitational": {"admins"},
 		},
 	})
 	c.Assert(logins, check.DeepEquals, []string{"admin", "dev"})
 	c.Assert(kubeGroups, check.DeepEquals, []string{"system:masters", "kube-devs"})
 	c.Assert(kubeUsers, check.DeepEquals, []string{"alice@example.com"})
 
-	logins, kubeGroups, kubeUsers = connector.MapClaims(GithubClaims{
+	logins, kubeGroups, kubeUsers = connector.MapClaims(types.GithubClaims{
 		OrganizationToTeams: map[string][]string{
-			"gravitational": []string{"devs"},
+			"gravitational": {"devs"},
 		},
 	})
 	c.Assert(logins, check.DeepEquals, []string{"dev", "test"})
 	c.Assert(kubeGroups, check.DeepEquals, []string{"kube-devs"})
 	c.Assert(kubeUsers, check.DeepEquals, []string(nil))
 
-	logins, kubeGroups, kubeUsers = connector.MapClaims(GithubClaims{
+	logins, kubeGroups, kubeUsers = connector.MapClaims(types.GithubClaims{
 		OrganizationToTeams: map[string][]string{
-			"gravitational": []string{"admins", "devs"},
+			"gravitational": {"admins", "devs"},
 		},
 	})
 	c.Assert(logins, check.DeepEquals, []string{"admin", "dev", "test"})

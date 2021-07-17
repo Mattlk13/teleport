@@ -23,7 +23,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/sshutils"
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/sshca"
@@ -40,9 +41,9 @@ type certificateCache struct {
 	keygen     sshca.Authority
 }
 
-// NewHostCertificateCache creates a shared host certificate cache that is
+// newHostCertificateCache creates a shared host certificate cache that is
 // used by the forwarding server.
-func NewHostCertificateCache(keygen sshca.Authority, authClient auth.ClientI) (*certificateCache, error) {
+func newHostCertificateCache(keygen sshca.Authority, authClient auth.ClientI) (*certificateCache, error) {
 	cache, err := ttlmap.New(defaults.HostCertCacheSize)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -55,12 +56,12 @@ func NewHostCertificateCache(keygen sshca.Authority, authClient auth.ClientI) (*
 	}, nil
 }
 
-// GetHostCertificate will fetch a certificate from the cache. If the certificate
+// getHostCertificate will fetch a certificate from the cache. If the certificate
 // is not in the cache, it will be generated, put in the cache, and returned. Mul
 // Multiple callers can arrive and generate a host certificate at the same time.
 // This is a tradeoff to prevent long delays here due to the expensive
 // certificate generation call.
-func (c *certificateCache) GetHostCertificate(addr string, additionalPrincipals []string) (ssh.Signer, error) {
+func (c *certificateCache) getHostCertificate(addr string, additionalPrincipals []string) (ssh.Signer, error) {
 	var certificate ssh.Signer
 	var err error
 	var ok bool
@@ -143,7 +144,7 @@ func (c *certificateCache) generateHostCert(principals []string) (ssh.Signer, er
 		principals[0],
 		principals,
 		clusterName,
-		teleport.Roles{teleport.RoleNode},
+		types.SystemRoles{types.RoleNode},
 		0)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -154,13 +155,9 @@ func (c *certificateCache) generateHostCert(principals []string) (ssh.Signer, er
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	publicKey, _, _, _, err := ssh.ParseAuthorizedKey(certBytes)
+	cert, err := sshutils.ParseCertificate(certBytes)
 	if err != nil {
 		return nil, err
-	}
-	cert, ok := publicKey.(*ssh.Certificate)
-	if !ok {
-		return nil, trace.BadParameter("not a certificate")
 	}
 
 	// return a ssh.Signer

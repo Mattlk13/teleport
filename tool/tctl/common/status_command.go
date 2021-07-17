@@ -22,11 +22,11 @@ import (
 	"strings"
 
 	"github.com/gravitational/kingpin"
-	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/asciitable"
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/service"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/trace"
 )
 
@@ -64,15 +64,25 @@ func (c *StatusCommand) Status(client auth.ClientI) error {
 	serverVersion := pingRsp.ServerVersion
 	clusterName := pingRsp.ClusterName
 
-	hostCAs, err := client.GetCertAuthorities(services.HostCA, false)
-	if err != nil {
-		return trace.Wrap(err)
-	}
+	authorities := []types.CertAuthority{}
 
-	userCAs, err := client.GetCertAuthorities(services.UserCA, false)
+	hostCAs, err := client.GetCertAuthorities(types.HostCA, false)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+	authorities = append(authorities, hostCAs...)
+
+	userCAs, err := client.GetCertAuthorities(types.UserCA, false)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	authorities = append(authorities, userCAs...)
+
+	jwtKeys, err := client.GetCertAuthorities(types.JWTSigner, false)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	authorities = append(authorities, jwtKeys...)
 
 	// Calculate the CA pin for this cluster. The CA pin is used by the client
 	// to verify the identity of the Auth Server.
@@ -81,7 +91,6 @@ func (c *StatusCommand) Status(client auth.ClientI) error {
 		return trace.Wrap(err)
 	}
 
-	authorities := append(userCAs, hostCAs...)
 	view := func() string {
 		table := asciitable.MakeHeadlessTable(2)
 		table.AddRow([]string{"Cluster", clusterName})
@@ -96,8 +105,8 @@ func (c *StatusCommand) Status(client auth.ClientI) error {
 				table.AddRow([]string{info,
 					fmt.Sprintf("%v, update_servers: %v, complete: %v",
 						rotation.String(),
-						rotation.Schedule.UpdateServers.Format(teleport.HumanDateFormatSeconds),
-						rotation.Schedule.Standby.Format(teleport.HumanDateFormatSeconds),
+						rotation.Schedule.UpdateServers.Format(constants.HumanDateFormatSeconds),
+						rotation.Schedule.Standby.Format(constants.HumanDateFormatSeconds),
 					)})
 			} else {
 				table.AddRow([]string{info, rotation.String()})

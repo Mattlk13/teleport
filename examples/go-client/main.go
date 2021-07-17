@@ -1,5 +1,5 @@
 /*
-Copyright 2018 Gravitational, Inc.
+Copyright 2018-2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,63 +18,60 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
+	"fmt"
 	"log"
-	"path/filepath"
-	"time"
 
-	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/utils"
-	"github.com/gravitational/trace"
+	"github.com/gravitational/teleport/api/client"
+	"github.com/gravitational/teleport/api/types"
+
+	"github.com/pborman/uuid"
 )
 
 func main() {
-	log.Printf("Starting teleport client...")
+	ctx := context.Background()
+	log.Printf("Starting Teleport client...")
 
-	// Teleport HTTPS client uses TLS client authentication
-	// so we have to set up certificates there
-	tlsConfig, err := setupClientTLS(context.Background())
-	if err != nil {
-		log.Fatalf("Failed to parse TLS config: %v", err)
+	cfg := client.Config{
+		Credentials: []client.Credentials{
+			client.LoadProfile("", ""),
+		},
 	}
-	authServerAddr := []utils.NetAddr{*utils.MustParseAddr("127.0.0.1:3025")}
-	clientConfig := auth.ClientConfig{Addrs: authServerAddr, TLS: tlsConfig}
 
-	client, err := auth.NewTLSClient(clientConfig)
+	clt, err := client.New(ctx, cfg)
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
+	defer clt.Close()
 
-	ctx := context.Background()
-	// make an API call to generate a cluster join token for
-	// adding another proxy to a cluster.
-	token, err := client.GenerateToken(ctx, auth.GenerateTokenRequest{
-		Token: "mytoken-proxy",
-		Roles: teleport.Roles{teleport.RoleProxy},
-		TTL:   time.Hour,
-	})
-	if err != nil {
-		log.Fatalf("Failed to generate token: %v", err)
+	if err := demoClient(ctx, clt); err != nil {
+		log.Printf("error in demoClient: %v", err)
 	}
-	log.Printf("Generated token: %v\n", token)
 }
 
-// setupClientTLS sets up client TLS authentiction between TLS client
-// and Teleport Auth server. This function uses hardcoded certificate paths,
-// assuming program runs alongside auth server, but it can be ran
-// on a remote location, assuming client has all the client certificates.
-func setupClientTLS(ctx context.Context) (*tls.Config, error) {
-	storage, err := auth.NewProcessStorage(ctx, filepath.Join("/var/lib/teleport", teleport.ComponentProcess))
+func demoClient(ctx context.Context, clt *client.Client) (err error) {
+	// Create a new access request for the `access-admin` user to use the `admin` role.
+	accessReq, err := types.NewAccessRequest(uuid.New(), "access-admin", "admin")
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return fmt.Errorf("failed to make new access request: %w", err)
 	}
-	defer storage.Close()
-
-	identity, err := storage.ReadIdentity(auth.IdentityCurrent, teleport.RoleAdmin)
-	if err != nil {
-		return nil, trace.Wrap(err)
+	if err = clt.CreateAccessRequest(ctx, accessReq); err != nil {
+		return fmt.Errorf("failed to create access request: %w", err)
 	}
+	log.Printf("Created access request: %v", accessReq)
 
-	return identity.TLSConfig(nil)
+	// Approve the access request as if this was another party.
+	if err = clt.SetAccessRequestState(ctx, types.AccessRequestUpdate{
+		RequestID: accessReq.GetName(),
+		State:     types.RequestState_APPROVED,
+	}); err != nil {
+		return fmt.Errorf("failed to accept request: %w", err)
+	}
+	log.Printf("Approved access request")
+
+	if err := clt.DeleteAccessRequest(ctx, accessReq.GetName()); err != nil {
+		return fmt.Errorf("failed to delete access request: %w", err)
+	}
+	log.Println("Deleted access request")
+
+	return nil
 }

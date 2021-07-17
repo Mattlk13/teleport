@@ -65,11 +65,6 @@ func (a *NetAddr) Port(defaultPort int) int {
 	return porti
 }
 
-// Equals returns true if address is equal to other
-func (a *NetAddr) Equals(other NetAddr) bool {
-	return a.Addr == other.Addr && a.AddrNetwork == other.AddrNetwork && a.Path == other.Path
-}
-
 // IsLocal returns true if this is a local address
 func (a *NetAddr) IsLocal() bool {
 	host, _, err := net.SplitHostPort(a.Addr)
@@ -86,7 +81,7 @@ func (a *NetAddr) IsLoopback() bool {
 
 // IsEmpty returns true if address is empty
 func (a *NetAddr) IsEmpty() bool {
-	return a.Addr == "" && a.AddrNetwork == "" && a.Path == ""
+	return a == nil || (a.Addr == "" && a.AddrNetwork == "" && a.Path == "")
 }
 
 // FullAddress returns full address including network and address (tcp://0.0.0.0:1243)
@@ -137,6 +132,15 @@ func (a *NetAddr) Set(s string) error {
 	return nil
 }
 
+// NetAddrsToStrings takes a list of netAddrs and returns a list of address strings.
+func NetAddrsToStrings(netAddrs []NetAddr) []string {
+	addrs := make([]string, len(netAddrs))
+	for i, addr := range netAddrs {
+		addrs[i] = addr.String()
+	}
+	return addrs
+}
+
 // ParseAddrs parses the provided slice of strings as a slice of NetAddr's.
 func ParseAddrs(addrs []string) (result []NetAddr, err error) {
 	for _, addr := range addrs {
@@ -156,7 +160,7 @@ func ParseAddr(a string) (*NetAddr, error) {
 		return nil, trace.BadParameter("missing parameter address")
 	}
 	if !strings.Contains(a, "://") {
-		return &NetAddr{Addr: a, AddrNetwork: "tcp"}, nil
+		a = "tcp://" + a
 	}
 	u, err := url.Parse(a)
 	if err != nil {
@@ -181,6 +185,15 @@ func MustParseAddr(a string) *NetAddr {
 		panic(fmt.Sprintf("failed to parse %v: %v", a, err))
 	}
 	return addr
+}
+
+// MustParseAddrList parses the provided list of strings into a NetAddr list or panics on error
+func MustParseAddrList(aList ...string) []NetAddr {
+	addrList := make([]NetAddr, len(aList))
+	for i, a := range aList {
+		addrList[i] = *MustParseAddr(a)
+	}
+	return addrList
 }
 
 // FromAddr returns NetAddr from golang standard net.Addr

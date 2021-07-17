@@ -21,10 +21,13 @@ import (
 	"testing"
 	"time"
 
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/fixtures"
-	"github.com/gravitational/teleport/lib/utils"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/check.v1"
 )
 
@@ -32,26 +35,20 @@ type ServerSuite struct {
 }
 
 var _ = check.Suite(&ServerSuite{})
-var _ = testing.Verbose
-var _ = fmt.Printf
-
-func (s *ServerSuite) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests(testing.Verbose())
-}
 
 // TestServersCompare tests comparing two servers
 func (s *ServerSuite) TestServersCompare(c *check.C) {
-	node := &ServerV2{
-		Kind:    KindNode,
-		Version: V2,
-		Metadata: Metadata{
+	node := &types.ServerV2{
+		Kind:    types.KindNode,
+		Version: types.V2,
+		Metadata: types.Metadata{
 			Name:      "node1",
-			Namespace: defaults.Namespace,
+			Namespace: apidefaults.Namespace,
 			Labels:    map[string]string{"a": "b"},
 		},
-		Spec: ServerSpecV2{
+		Spec: types.ServerSpecV2{
 			Addr:      "localhost:3022",
-			CmdLabels: map[string]CommandLabelV2{"a": CommandLabelV2{Period: Duration(time.Minute), Command: []string{"ls", "-l"}}},
+			CmdLabels: map[string]types.CommandLabelV2{"a": {Period: types.Duration(time.Minute), Command: []string{"ls", "-l"}}},
 			Version:   "4.0.0",
 		},
 	}
@@ -71,7 +68,7 @@ func (s *ServerSuite) TestServersCompare(c *check.C) {
 
 	// Command labels are different
 	node2 = *node
-	node2.Spec.CmdLabels = map[string]CommandLabelV2{"a": CommandLabelV2{Period: Duration(time.Minute), Command: []string{"ls", "-lR"}}}
+	node2.Spec.CmdLabels = map[string]types.CommandLabelV2{"a": {Period: types.Duration(time.Minute), Command: []string{"ls", "-lR"}}}
 	c.Assert(CompareServers(node, &node2), check.Equals, Different)
 
 	// Address has changed
@@ -96,14 +93,14 @@ func (s *ServerSuite) TestServersCompare(c *check.C) {
 
 	// Rotation has changed
 	node2 = *node
-	node2.Spec.Rotation = Rotation{
-		State:       RotationStateInProgress,
-		Phase:       RotationPhaseUpdateClients,
+	node2.Spec.Rotation = types.Rotation{
+		State:       types.RotationStateInProgress,
+		Phase:       types.RotationPhaseUpdateClients,
 		CurrentID:   "1",
 		Started:     time.Date(2018, 3, 4, 5, 6, 7, 8, time.UTC),
-		GracePeriod: Duration(3 * time.Hour),
+		GracePeriod: types.Duration(3 * time.Hour),
 		LastRotated: time.Date(2017, 2, 3, 4, 5, 6, 7, time.UTC),
-		Schedule: RotationSchedule{
+		Schedule: types.RotationSchedule{
 			UpdateClients: time.Date(2018, 3, 4, 5, 6, 7, 8, time.UTC),
 			UpdateServers: time.Date(2018, 3, 4, 7, 6, 7, 8, time.UTC),
 			Standby:       time.Date(2018, 3, 4, 5, 6, 13, 8, time.UTC),
@@ -122,22 +119,92 @@ func (s *ServerSuite) TestGuessProxyHostAndVersion(c *check.C) {
 	fixtures.ExpectNotFound(c, err)
 
 	// No proxies have public address set.
-	proxyA := ServerV2{}
+	proxyA := types.ServerV2{}
 	proxyA.Spec.Hostname = "test-A"
 	proxyA.Spec.Version = "test-A"
 
-	host, version, err = GuessProxyHostAndVersion([]Server{&proxyA})
+	host, version, err = GuessProxyHostAndVersion([]types.Server{&proxyA})
 	c.Assert(host, check.Equals, fmt.Sprintf("%v:%v", proxyA.Spec.Hostname, defaults.HTTPListenPort))
 	c.Assert(version, check.Equals, proxyA.Spec.Version)
 	c.Assert(err, check.IsNil)
 
 	// At least one proxy has public address set.
-	proxyB := ServerV2{}
+	proxyB := types.ServerV2{}
 	proxyB.Spec.PublicAddr = "test-B"
 	proxyB.Spec.Version = "test-B"
 
-	host, version, err = GuessProxyHostAndVersion([]Server{&proxyA, &proxyB})
+	host, version, err = GuessProxyHostAndVersion([]types.Server{&proxyA, &proxyB})
 	c.Assert(host, check.Equals, proxyB.Spec.PublicAddr)
 	c.Assert(version, check.Equals, proxyB.Spec.Version)
 	c.Assert(err, check.IsNil)
+}
+
+func TestUnmarshalServerKubernetes(t *testing.T) {
+	// Regression test for
+	// https://github.com/gravitational/teleport/issues/4862
+	//
+	// Verifies unmarshaling succeeds, when provided a 4.4 server JSON
+	// definition.
+	tests := []struct {
+		desc string
+		in   string
+		want *types.ServerV2
+	}{
+		{
+			desc: "4.4 kubernetes_clusters field",
+			in: `{
+	"version": "v2",
+	"kind": "kube_service",
+	"metadata": {
+		"name": "foo"
+	},
+	"spec": {
+		"kubernetes_clusters": ["a", "b", "c"]
+	}
+}`,
+			want: &types.ServerV2{
+				Version: types.V2,
+				Kind:    types.KindKubeService,
+				Metadata: types.Metadata{
+					Name:      "foo",
+					Namespace: apidefaults.Namespace,
+				},
+			},
+		},
+		{
+			desc: "5.0 kubernetes_clusters field",
+			in: `{
+	"version": "v2",
+	"kind": "kube_service",
+	"metadata": {
+		"name": "foo"
+	},
+	"spec": {
+		"kube_clusters": [{"name": "a"}, {"name": "b"}, {"name": "c"}]
+	}
+}`,
+			want: &types.ServerV2{
+				Version: types.V2,
+				Kind:    types.KindKubeService,
+				Metadata: types.Metadata{
+					Name:      "foo",
+					Namespace: apidefaults.Namespace,
+				},
+				Spec: types.ServerSpecV2{
+					KubernetesClusters: []*types.KubernetesCluster{
+						{Name: "a"},
+						{Name: "b"},
+						{Name: "c"},
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			got, err := UnmarshalServer([]byte(tt.in), types.KindKubeService)
+			require.NoError(t, err)
+			require.Empty(t, cmp.Diff(got, tt.want))
+		})
+	}
 }

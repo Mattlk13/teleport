@@ -19,10 +19,13 @@ package auth
 import (
 	"context"
 	"encoding/base32"
-	"fmt"
+	"math"
+	"sync"
 	"time"
 
-	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/types"
+	apievents "github.com/gravitational/teleport/api/types/events"
 	authority "github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/lite"
@@ -30,30 +33,22 @@ import (
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/suite"
-	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
 
 	"github.com/jonboulle/clockwork"
 	"github.com/pquerna/otp/totp"
+	"gopkg.in/check.v1"
 	. "gopkg.in/check.v1"
 )
 
 type PasswordSuite struct {
-	bk             backend.Backend
-	a              *AuthServer
-	mockedAuditLog *events.MockAuditLog
+	bk          backend.Backend
+	a           *Server
+	mockEmitter *events.MockEmitter
 }
 
-var _ = fmt.Printf
 var _ = Suite(&PasswordSuite{})
-
-func (s *PasswordSuite) SetUpSuite(c *C) {
-	utils.InitLoggerForTests()
-}
-
-func (s *PasswordSuite) TearDownSuite(c *C) {
-}
 
 func (s *PasswordSuite) SetUpTest(c *C) {
 	var err error
@@ -62,7 +57,7 @@ func (s *PasswordSuite) SetUpTest(c *C) {
 	c.Assert(err, IsNil)
 
 	// set cluster name
-	clusterName, err := services.NewClusterName(services.ClusterNameSpecV2{
+	clusterName, err := services.NewClusterNameWithRandomID(types.ClusterNameSpecV2{
 		ClusterName: "me.localhost",
 	})
 	c.Assert(err, IsNil)
@@ -72,30 +67,22 @@ func (s *PasswordSuite) SetUpTest(c *C) {
 		Authority:              authority.New(),
 		SkipPeriodicOperations: true,
 	}
-	s.a, err = NewAuthServer(authConfig)
+	s.a, err = NewServer(authConfig)
 	c.Assert(err, IsNil)
 
 	err = s.a.SetClusterName(clusterName)
 	c.Assert(err, IsNil)
 
-	clusterConfig, err := services.NewClusterConfig(services.ClusterConfigSpecV3{
-		LocalAuth: services.NewBool(true),
-	})
-	c.Assert(err, IsNil)
-
-	err = s.a.SetClusterConfig(clusterConfig)
-	c.Assert(err, IsNil)
-
 	// set static tokens
-	staticTokens, err := services.NewStaticTokens(services.StaticTokensSpecV2{
-		StaticTokens: []services.ProvisionTokenV1{},
+	staticTokens, err := types.NewStaticTokens(types.StaticTokensSpecV2{
+		StaticTokens: []types.ProvisionTokenV1{},
 	})
 	c.Assert(err, IsNil)
 	err = s.a.SetStaticTokens(staticTokens)
 	c.Assert(err, IsNil)
 
-	s.mockedAuditLog = events.NewMockAuditLog(0)
-	s.a.IAuditLog = s.mockedAuditLog
+	s.mockEmitter = &events.MockEmitter{}
+	s.a.emitter = s.mockEmitter
 }
 
 func (s *PasswordSuite) TearDownTest(c *C) {
@@ -108,42 +95,79 @@ func (s *PasswordSuite) TestTiming(c *C) {
 	err := s.a.UpsertPassword(username, []byte(password))
 	c.Assert(err, IsNil)
 
-	var elapsedExists time.Duration
-	for i := 0; i < 10; i++ {
-		start := time.Now()
-		err = s.a.CheckPasswordWOToken(username, []byte(password))
-		c.Assert(err, IsNil)
-		elapsed := time.Since(start)
-		elapsedExists = elapsedExists + elapsed
+	type res struct {
+		exists  bool
+		elapsed time.Duration
+		err     error
 	}
 
-	var elapsedNotExists time.Duration
+	// Run multiple password checks in parallel, for both existing and
+	// non-existing user. This should ensure that there's always contention and
+	// that both checking paths are subject to it together.
+	//
+	// This should result in timing results being more similar to each other
+	// and reduce test flakiness.
+	wg := sync.WaitGroup{}
+	resCh := make(chan res)
 	for i := 0; i < 10; i++ {
-		start := time.Now()
-		err = s.a.CheckPasswordWOToken("blah", []byte(password))
-		c.Assert(err, NotNil)
-		elapsed := time.Since(start)
-		elapsedNotExists = elapsedNotExists + elapsed
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start := time.Now()
+			err := s.a.checkPasswordWOToken(username, []byte(password))
+			resCh <- res{
+				exists:  true,
+				elapsed: time.Since(start),
+				err:     err,
+			}
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start := time.Now()
+			err := s.a.checkPasswordWOToken("blah", []byte(password))
+			resCh <- res{
+				exists:  false,
+				elapsed: time.Since(start),
+				err:     err,
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(resCh)
+	}()
+
+	var elapsedExists, elapsedNotExists time.Duration
+	for r := range resCh {
+		if r.exists {
+			c.Assert(r.err, IsNil)
+			elapsedExists += r.elapsed
+		} else {
+			c.Assert(r.err, NotNil)
+			elapsedNotExists += r.elapsed
+		}
 	}
 
-	// elapsedDifference must be less than 40 ms (with some leeway for delays in runtime)
-	elapsedDifference := elapsedExists/10 - elapsedNotExists/10
-	comment := Commentf("elapsed difference (%v) greater than 40 ms", elapsedDifference)
-	c.Assert(elapsedDifference.Seconds() < 0.040, Equals, true, comment)
+	// Get the relative percentage difference in runtimes of password check
+	// with real and non-existent users. It should be <10%.
+	diffFraction := math.Abs(1.0 - (float64(elapsedExists) / float64(elapsedNotExists)))
+	comment := Commentf("elapsed difference (%v%%) greater than 10%%", 100*diffFraction)
+	c.Assert(diffFraction < 0.1, Equals, true, comment)
 }
 
 func (s *PasswordSuite) TestUserNotFound(c *C) {
 	username := "unknown-user"
 	password := "barbaz"
 
-	err := s.a.CheckPasswordWOToken(username, []byte(password))
+	err := s.a.checkPasswordWOToken(username, []byte(password))
 	c.Assert(err, NotNil)
 	// Make sure the error is not a NotFound. That would be a username oracle.
 	c.Assert(trace.IsBadParameter(err), Equals, true)
 }
 
 func (s *PasswordSuite) TestChangePassword(c *C) {
-	req, err := s.prepareForPasswordChange("user1", []byte("abc123"), teleport.OFF)
+	req, err := s.prepareForPasswordChange("user1", []byte("abc123"), constants.SecondFactorOff)
 	c.Assert(err, IsNil)
 
 	fakeClock := clockwork.NewFakeClock()
@@ -152,8 +176,8 @@ func (s *PasswordSuite) TestChangePassword(c *C) {
 
 	err = s.a.ChangePassword(req)
 	c.Assert(err, IsNil)
-	c.Assert(s.mockedAuditLog.EmittedEvent.EventType, DeepEquals, events.UserPasswordChange)
-	c.Assert(s.mockedAuditLog.EmittedEvent.Fields[events.EventUser], Equals, "user1")
+	c.Assert(s.mockEmitter.LastEvent().GetType(), DeepEquals, events.UserPasswordChangeEvent)
+	c.Assert(s.mockEmitter.LastEvent().(*apievents.UserPasswordChange).User, Equals, "user1")
 
 	s.shouldLockAfterFailedAttempts(c, req)
 
@@ -166,15 +190,18 @@ func (s *PasswordSuite) TestChangePassword(c *C) {
 }
 
 func (s *PasswordSuite) TestChangePasswordWithOTP(c *C) {
-	req, err := s.prepareForPasswordChange("user2", []byte("abc123"), teleport.OTP)
-	c.Assert(err, IsNil)
-
-	otpSecret := base32.StdEncoding.EncodeToString([]byte("def456"))
-	err = s.a.UpsertTOTP(req.User, otpSecret)
+	req, err := s.prepareForPasswordChange("user2", []byte("abc123"), constants.SecondFactorOTP)
 	c.Assert(err, IsNil)
 
 	fakeClock := clockwork.NewFakeClock()
 	s.a.SetClock(fakeClock)
+
+	otpSecret := base32.StdEncoding.EncodeToString([]byte("def456"))
+	dev, err := services.NewTOTPDevice("otp", otpSecret, fakeClock.Now())
+	c.Assert(err, check.IsNil)
+	ctx := context.Background()
+	err = s.a.UpsertMFADevice(ctx, req.User, dev)
+	c.Assert(err, check.IsNil)
 
 	validToken, err := totp.GenerateCode(otpSecret, s.a.GetClock().Now())
 	c.Assert(err, IsNil)
@@ -199,13 +226,14 @@ func (s *PasswordSuite) TestChangePasswordWithOTP(c *C) {
 }
 
 func (s *PasswordSuite) TestChangePasswordWithToken(c *C) {
-	authPreference, err := services.NewAuthPreference(services.AuthPreferenceSpecV2{
-		Type:         teleport.Local,
-		SecondFactor: teleport.OFF,
+	ctx := context.Background()
+	authPreference, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:         constants.Local,
+		SecondFactor: constants.SecondFactorOff,
 	})
 	c.Assert(err, IsNil)
 
-	err = s.a.SetAuthPreference(authPreference)
+	err = s.a.SetAuthPreference(ctx, authPreference)
 	c.Assert(err, IsNil)
 
 	username := "joe@example.com"
@@ -225,18 +253,19 @@ func (s *PasswordSuite) TestChangePasswordWithToken(c *C) {
 	c.Assert(err, IsNil)
 
 	// password should be updated
-	err = s.a.CheckPasswordWOToken(username, password)
+	err = s.a.checkPasswordWOToken(username, password)
 	c.Assert(err, IsNil)
 }
 
 func (s *PasswordSuite) TestChangePasswordWithTokenOTP(c *C) {
-	authPreference, err := services.NewAuthPreference(services.AuthPreferenceSpecV2{
-		Type:         teleport.Local,
-		SecondFactor: teleport.OTP,
+	ctx := context.Background()
+	authPreference, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:         constants.Local,
+		SecondFactor: constants.SecondFactorOTP,
 	})
 	c.Assert(err, IsNil)
 
-	err = s.a.SetAuthPreference(authPreference)
+	err = s.a.SetAuthPreference(ctx, authPreference)
 	c.Assert(err, IsNil)
 
 	username := "joe@example.com"
@@ -262,14 +291,15 @@ func (s *PasswordSuite) TestChangePasswordWithTokenOTP(c *C) {
 	})
 	c.Assert(err, IsNil)
 
-	err = s.a.CheckPasswordWOToken(username, password)
+	err = s.a.checkPasswordWOToken(username, password)
 	c.Assert(err, IsNil)
 }
 
 func (s *PasswordSuite) TestChangePasswordWithTokenErrors(c *C) {
-	authPreference, err := services.NewAuthPreference(services.AuthPreferenceSpecV2{
-		Type:         teleport.Local,
-		SecondFactor: teleport.OTP,
+	ctx := context.Background()
+	authPreference, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:         constants.Local,
+		SecondFactor: constants.SecondFactorOTP,
 	})
 	c.Assert(err, IsNil)
 
@@ -287,13 +317,13 @@ func (s *PasswordSuite) TestChangePasswordWithTokenErrors(c *C) {
 
 	type testCase struct {
 		desc         string
-		secondFactor string
+		secondFactor constants.SecondFactorType
 		req          ChangePasswordWithTokenRequest
 	}
 
 	testCases := []testCase{
 		{
-			secondFactor: teleport.OFF,
+			secondFactor: constants.SecondFactorOff,
 			desc:         "invalid tokenID value",
 			req: ChangePasswordWithTokenRequest{
 				TokenID:  "what_token",
@@ -301,7 +331,7 @@ func (s *PasswordSuite) TestChangePasswordWithTokenErrors(c *C) {
 			},
 		},
 		{
-			secondFactor: teleport.OFF,
+			secondFactor: constants.SecondFactorOff,
 			desc:         "invalid password",
 			req: ChangePasswordWithTokenRequest{
 				TokenID:  validTokenID,
@@ -309,7 +339,7 @@ func (s *PasswordSuite) TestChangePasswordWithTokenErrors(c *C) {
 			},
 		},
 		{
-			secondFactor: teleport.OTP,
+			secondFactor: constants.SecondFactorOTP,
 			desc:         "missing second factor",
 			req: ChangePasswordWithTokenRequest{
 				TokenID:  validTokenID,
@@ -317,7 +347,7 @@ func (s *PasswordSuite) TestChangePasswordWithTokenErrors(c *C) {
 			},
 		},
 		{
-			secondFactor: teleport.OTP,
+			secondFactor: constants.SecondFactorOTP,
 			desc:         "invalid OTP value",
 			req: ChangePasswordWithTokenRequest{
 				TokenID:           validTokenID,
@@ -330,15 +360,15 @@ func (s *PasswordSuite) TestChangePasswordWithTokenErrors(c *C) {
 	for _, tc := range testCases {
 		// set new auth preference settings
 		authPreference.SetSecondFactor(tc.secondFactor)
-		err = s.a.SetAuthPreference(authPreference)
+		err = s.a.SetAuthPreference(ctx, authPreference)
 		c.Assert(err, IsNil)
 
 		_, err = s.a.changePasswordWithToken(context.TODO(), tc.req)
 		c.Assert(err, NotNil, Commentf("test case %q", tc.desc))
 	}
 
-	authPreference.SetSecondFactor(teleport.OFF)
-	err = s.a.SetAuthPreference(authPreference)
+	authPreference.SetSecondFactor(constants.SecondFactorOff)
+	err = s.a.SetAuthPreference(ctx, authPreference)
 	c.Assert(err, IsNil)
 
 	_, err = s.a.changePasswordWithToken(context.TODO(), ChangePasswordWithTokenRequest{
@@ -369,31 +399,32 @@ func (s *PasswordSuite) shouldLockAfterFailedAttempts(c *C, req services.ChangeP
 	c.Assert(trace.IsAccessDenied(err), Equals, true)
 }
 
-func (s *PasswordSuite) prepareForPasswordChange(user string, pass []byte, secondFactorType string) (services.ChangePasswordReq, error) {
+func (s *PasswordSuite) prepareForPasswordChange(user string, pass []byte, secondFactorType constants.SecondFactorType) (services.ChangePasswordReq, error) {
+	ctx := context.Background()
 	req := services.ChangePasswordReq{
 		User:        user,
 		OldPassword: pass,
 	}
 
-	err := s.a.UpsertCertAuthority(suite.NewTestCA(services.UserCA, "me.localhost"))
+	err := s.a.UpsertCertAuthority(suite.NewTestCA(types.UserCA, "me.localhost"))
 	if err != nil {
 		return req, err
 	}
 
-	err = s.a.UpsertCertAuthority(suite.NewTestCA(services.HostCA, "me.localhost"))
+	err = s.a.UpsertCertAuthority(suite.NewTestCA(types.HostCA, "me.localhost"))
 	if err != nil {
 		return req, err
 	}
 
-	ap, err := services.NewAuthPreference(services.AuthPreferenceSpecV2{
-		Type:         teleport.Local,
+	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:         constants.Local,
 		SecondFactor: secondFactorType,
 	})
 	if err != nil {
 		return req, err
 	}
 
-	err = s.a.SetAuthPreference(ap)
+	err = s.a.SetAuthPreference(ctx, ap)
 	if err != nil {
 		return req, err
 	}

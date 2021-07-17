@@ -17,10 +17,12 @@ limitations under the License.
 package ui
 
 import (
+	"context"
 	"sort"
 	"time"
 
-	"github.com/gravitational/teleport/lib/defaults"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/reversetunnel"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/trace"
@@ -36,21 +38,27 @@ type Cluster struct {
 	Status string `json:"status"`
 	// NodeCount is this cluster number of registered servers
 	NodeCount int `json:"nodeCount"`
-	// PublicURL is this cluster public URL (its first available proxy URL)
+	// PublicURL is this cluster public URL (its first available proxy URL),
+	// or possibly empty if no proxies could be loaded.
 	PublicURL string `json:"publicURL"`
 	// AuthVersion is the cluster auth's service version
 	AuthVersion string `json:"authVersion"`
-	// ProxyVersion is the cluster proxy's service version
+	// ProxyVersion is the cluster proxy's service version,
+	// or possibly empty if no proxies could be loaded.
 	ProxyVersion string `json:"proxyVersion"`
 }
 
 // NewClusters creates a slice of Cluster's, containing data about each cluster.
 func NewClusters(remoteClusters []reversetunnel.RemoteSite) ([]Cluster, error) {
-	clusters := []Cluster{}
+	clusters := make([]Cluster, 0, len(remoteClusters))
 	for _, site := range remoteClusters {
-		cluster, err := GetClusterDetails(site)
-		if err != nil {
-			return nil, trace.Wrap(err)
+		// Other fields such as node count, url, and proxy/auth versions are not set
+		// because each cluster will need to make network calls to retrieve information
+		// which does not scale well (ie: 1k clusters, each request will take seconds).
+		cluster := &Cluster{
+			Name:          site.GetName(),
+			LastConnected: site.GetLastConnected(),
+			Status:        site.GetStatus(),
 		}
 
 		clusters = append(clusters, *cluster)
@@ -63,14 +71,28 @@ func NewClusters(remoteClusters []reversetunnel.RemoteSite) ([]Cluster, error) {
 	return clusters, nil
 }
 
+// NewClustersFromRemote creates a slice of Cluster's, containing data about each cluster.
+func NewClustersFromRemote(remoteClusters []types.RemoteCluster) ([]Cluster, error) {
+	clusters := make([]Cluster, 0, len(remoteClusters))
+	for _, rc := range remoteClusters {
+		cluster := Cluster{
+			Name:          rc.GetName(),
+			LastConnected: rc.GetLastHeartbeat(),
+			Status:        rc.GetConnectionStatus(),
+		}
+		clusters = append(clusters, cluster)
+	}
+	return clusters, nil
+}
+
 // GetClusterDetails retrieves and sets details about a cluster
-func GetClusterDetails(site reversetunnel.RemoteSite) (*Cluster, error) {
+func GetClusterDetails(ctx context.Context, site reversetunnel.RemoteSite, opts ...services.MarshalOption) (*Cluster, error) {
 	clt, err := site.CachingAccessPoint()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	nodes, err := clt.GetNodes(defaults.Namespace)
+	nodes, err := clt.GetNodes(ctx, apidefaults.Namespace, opts...)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -80,7 +102,7 @@ func GetClusterDetails(site reversetunnel.RemoteSite) (*Cluster, error) {
 		return nil, trace.Wrap(err)
 	}
 	proxyHost, proxyVersion, err := services.GuessProxyHostAndVersion(proxies)
-	if err != nil {
+	if err != nil && !trace.IsNotFound(err) {
 		return nil, trace.Wrap(err)
 	}
 

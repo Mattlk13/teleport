@@ -1,13 +1,11 @@
 #!/bin/bash
 #
-# Example of how etcd must be started in the full TLS mode, i.e.
-#   - server cert is checked by clients
-#   - client cert is checked by the server
+# Example of how etcd must be started in an insecure mode, i.e.
+#   - server cert is NOT checked by clients
+#   - client cert is NOT checked by the server
 #
-# NOTE: this file is also used to run etcd tests. 
-#       
 HERE=$(readlink -f $0)
-cd $(dirname $HERE)
+cd "$(dirname $HERE)" || exit
 
 mkdir -p data
 etcd --name teleportstorage \

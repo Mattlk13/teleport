@@ -32,11 +32,13 @@ var (
 	listenerProxySSH   = listenerType(teleport.Component(teleport.ComponentProxy, "ssh"))
 	listenerDiagnostic = listenerType(teleport.ComponentDiagnostic)
 	listenerProxyKube  = listenerType(teleport.Component(teleport.ComponentProxy, "kube"))
+	listenerKube       = listenerType(teleport.ComponentKube)
 	// Proxy can use the same listener for tunnels and web interface
 	// (multiplexing the requests).
 	listenerProxyTunnelAndWeb = listenerType(teleport.Component(teleport.ComponentProxy, "tunnel", "web"))
 	listenerProxyWeb          = listenerType(teleport.Component(teleport.ComponentProxy, "web"))
 	listenerProxyTunnel       = listenerType(teleport.Component(teleport.ComponentProxy, "tunnel"))
+	listenerProxyMySQL        = listenerType(teleport.Component(teleport.ComponentProxy, "mysql"))
 )
 
 // AuthSSHAddr returns auth server SSH endpoint, if configured and started.

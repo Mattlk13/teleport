@@ -1,7 +1,9 @@
 package fixtures
 
 import (
+	"reflect"
 	"runtime/debug"
+	"testing"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/gravitational/trace"
@@ -39,11 +41,124 @@ func ExpectConnectionProblem(c *check.C, err error) {
 	c.Assert(trace.IsConnectionProblem(err), check.Equals, true, check.Commentf("expected ConnectionProblem, got %T %v at %v", trace.Unwrap(err), err, string(debug.Stack())))
 }
 
+// ExpectLimitExceeded expects limit exceeded error
+func ExpectLimitExceeded(c *check.C, err error) {
+	c.Assert(trace.IsLimitExceeded(err), check.Equals, true, check.Commentf("expected LimitExceeded, got %T %v at %v", trace.Unwrap(err), err, string(debug.Stack())))
+}
+
+// AssertNotFound expects not found error
+func AssertNotFound(t *testing.T, err error) {
+	if trace.IsNotFound(err) == false {
+		t.Fatalf("Expected NotFound, got %T %v at %v.", trace.Unwrap(err), err, string(debug.Stack()))
+	}
+}
+
+// AssertBadParameter expects bad parameter error
+func AssertBadParameter(t *testing.T, err error) {
+	if trace.IsBadParameter(err) == false {
+		t.Fatalf("Expected BadParameter, got %T %v at %v.", trace.Unwrap(err), err, string(debug.Stack()))
+	}
+}
+
+// AssertCompareFailed expects compare failed error
+func AssertCompareFailed(t *testing.T, err error) {
+	if trace.IsCompareFailed(err) == false {
+		t.Fatalf("Expected CompareFailed, got %T %v at %v.", trace.Unwrap(err), err, string(debug.Stack()))
+	}
+}
+
+// AssertAccessDenied expects error to be access denied
+func AssertAccessDenied(t *testing.T, err error) {
+	if trace.IsAccessDenied(err) == false {
+		t.Fatalf("Expected AccessDenied, got %T %v at %v.", trace.Unwrap(err), err, string(debug.Stack()))
+	}
+}
+
+// AssertAlreadyExists expects already exists error
+func AssertAlreadyExists(t *testing.T, err error) {
+	if trace.IsAlreadyExists(err) == false {
+		t.Fatalf("Expected AlreadyExists, got %T %v at %v.", trace.Unwrap(err), err, string(debug.Stack()))
+	}
+}
+
+// AssertConnectionProblem expects connection problem error
+func AssertConnectionProblem(t *testing.T, err error) {
+	if trace.IsConnectionProblem(err) == false {
+		t.Fatalf("Expected ConnectionProblem, got %T %v at %v.", trace.Unwrap(err), err, string(debug.Stack()))
+	}
+}
+
 // DeepCompare uses gocheck DeepEquals but provides nice diff if things are not equal
 func DeepCompare(c *check.C, a, b interface{}) {
 	d := &spew.ConfigState{Indent: " ", DisableMethods: true, DisablePointerMethods: true, DisablePointerAddresses: true}
 
-	c.Assert(a, check.DeepEquals, b, check.Commentf("%v\nStack:\n%v\n", diff.Diff(d.Sdump(a), d.Sdump(b)), string(debug.Stack())))
+	if !reflect.DeepEqual(a, b) {
+		c.Fatalf("Values are not equal\n%v\nStack:\n%v\n", diff.Diff(d.Sdump(a), d.Sdump(b)), string(debug.Stack()))
+	}
+}
+
+// DeepCompareSlices compares two slices
+func DeepCompareSlices(c *check.C, a, b interface{}) {
+	aval, bval := reflect.ValueOf(a), reflect.ValueOf(b)
+	if aval.Kind() != reflect.Slice {
+		c.Fatalf("%v is not a map, %T", a, a)
+	}
+
+	if bval.Kind() != reflect.Slice {
+		c.Fatalf("%v is not a map, %T", b, b)
+	}
+
+	if aval.Len() != bval.Len() {
+		c.Fatalf("slices have different length of %v and %v", aval.Len(), bval.Len())
+	}
+
+	for i := 0; i < aval.Len(); i++ {
+		DeepCompare(c, aval.Index(i).Interface(), bval.Index(i).Interface())
+	}
+}
+
+// DeepCompareMaps compares two maps
+func DeepCompareMaps(c *check.C, a, b interface{}) {
+	aval, bval := reflect.ValueOf(a), reflect.ValueOf(b)
+	if aval.Kind() != reflect.Map {
+		c.Fatalf("%v is not a map, %T", a, a)
+	}
+
+	if bval.Kind() != reflect.Map {
+		c.Fatalf("%v is not a map, %T", b, b)
+	}
+
+	for _, k := range aval.MapKeys() {
+		vala := aval.MapIndex(k)
+		valb := bval.MapIndex(k)
+
+		if !vala.IsValid() {
+			c.Fatalf("expected valid value for %v in %v", k.Interface(), a)
+		}
+
+		if !valb.IsValid() {
+			c.Fatalf("key %v is found in %v, but not in %v", k.Interface(), a, b)
+		}
+	}
+
+	for _, k := range bval.MapKeys() {
+		vala := aval.MapIndex(k)
+		valb := bval.MapIndex(k)
+
+		if !valb.IsValid() {
+			c.Fatalf("expected valid value for %v in %v", k.Interface(), a)
+		}
+
+		if !vala.IsValid() {
+			c.Fatalf("key %v is found in %v, but not in %v", k.Interface(), a, b)
+		}
+
+		if reflect.ValueOf(vala.Interface()).Kind() == reflect.Map {
+			DeepCompareMaps(c, vala.Interface(), valb.Interface())
+		} else {
+			DeepCompare(c, vala.Interface(), valb.Interface())
+		}
+	}
 }
 
 const SAMLOktaAuthRequestID = `_4d84cad1-1c61-4e4f-8ab6-1358b8d0da77`
@@ -131,7 +246,8 @@ spec:
     C7yZIZM0DuazwkaenExrncvPtF6KL7eccudcknNjhRjFD3Yx1nNXgbVRHvVaElm0YxLiLcl8l0Rn
     pHM7WKwFyW1dvEDax3BGj9/cbKvpvcwR</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:NameIDFormat>urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress</md:NameIDFormat><md:NameIDFormat>urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified</md:NameIDFormat><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://dev-813354.oktapreview.com/app/gravitationaldev813354_teleportsaml_1/exkafftca6RqPVgyZ0h7/sso/saml"/><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="https://dev-813354.oktapreview.com/app/gravitationaldev813354_teleportsaml_1/exkafftca6RqPVgyZ0h7/sso/saml"/></md:IDPSSODescriptor></md:EntityDescriptor>`
 
-const SigningCertPEM = `-----BEGIN CERTIFICATE-----
+const (
+	TLSCACertPEM = `-----BEGIN CERTIFICATE-----
 MIIDKjCCAhKgAwIBAgIQJtJDJZZBkg/afM8d2ZJCTjANBgkqhkiG9w0BAQsFADBA
 MRUwEwYDVQQKEwxUZWxlcG9ydCBPU1MxJzAlBgNVBAMTHnRlbGVwb3J0LmxvY2Fs
 aG9zdC5sb2NhbGRvbWFpbjAeFw0xNzA1MDkxOTQwMzZaFw0yNzA1MDcxOTQwMzZa
@@ -150,8 +266,7 @@ NxWsJKcZ5k+q4eMxci9mKRHHqsquWKXzQlURMNFI+mGaFwrKM4dmzaR0BEc+ilSx
 QqUvQ74smsLK+zhNikmgjlGC5ob9g8XkhVAkJMAh2rb9onDNiRl68iAgczP88mXu
 vN/o98dypzsPxXmw6tkDqIRPUAUbh465rlY5sKMmRgXi2rUfl/QV5nbozUo/HQ==
 -----END CERTIFICATE-----`
-
-const SigningKeyPEM = `-----BEGIN RSA PRIVATE KEY-----
+	TLSCAKeyPEM = `-----BEGIN RSA PRIVATE KEY-----
 MIIEowIBAAKCAQEAuKFLaf2iII/xDR+m2Yj6PnUEa+qzqwxsdLUjnunFZaAXG+hZ
 m4Ml80SCiBgIgTHQlJyLIkTtuRoH5aeMyz1ERUCtii4ZsTqDrjjUybxP4r+4HVX6
 m34s6hwEr8Fifts9pMp4iS3tQguRc28gPdDo/T6VrJTVYUfUUsNDRtIrlB5O9igq
@@ -178,6 +293,94 @@ k+vHAoGBAJyA+RtBF5m64/TqhZFcesTtnpWaRhQ50xXnNVF3W1eKGPtdTDKOaENA
 LJxgC1GdoEz2ilXW802H9QrdKf9GPqxwi2TVzfO6pzWkdZcmbItu+QCCFz+co+r8
 +ki49FmlfbR5YVPN+8X40aLQB4xDkCHwRwTkrigzWQhIOv8NAhDA
 -----END RSA PRIVATE KEY-----`
+	// Backwards-compatibility alias for teleport.e
+	SigningCertPEM = TLSCACertPEM
+)
+
+const EncryptionCertPEM = `-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIUDpXWZ8npv3sWeCQbB1WCwMoDe9QwDQYJKoZIhvcNAQEL
+BQAwRTELMAkGA1UEBhMCQVUxEzARBgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoM
+GEludGVybmV0IFdpZGdpdHMgUHR5IEx0ZDAeFw0yMTAyMTgyMTUyNTVaFw0yMjAy
+MTgyMTUyNTVaMEUxCzAJBgNVBAYTAkFVMRMwEQYDVQQIDApTb21lLVN0YXRlMSEw
+HwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwggIiMA0GCSqGSIb3DQEB
+AQUAA4ICDwAwggIKAoICAQDiEvFfAwgR8rfFPXVkJiWQGisFQNpQ5oq4ng5sD/3p
+hPBBzwx0TTn+V+XG5pBTlyVe0h9kLqZ3Dnavdk9VDC1DIrc0CSKUhP01JdV9TlC/
+tCek9a2IQEjEZ0pZPbU/gtXxEGyrs9JVFf0K8saMH6xB8jJwB4Eq9jB8rsWZJh4H
+eyX1VEdruPdwRkFjuNhBnIax//DQSZepAhtM+mtxP+cHtRzXPlXHTpYvxcP2LoXj
+SdCh/XEu8Ai33O4Ek14HIFmNQ63pmzmxhpcPm8ejDFchOEU67zeOz2RQNAefeHRg
+G1gvFIcgmVXcLM+VmC0JlzNuyMFY1XUygm1PYcFz93p4OGJBkYgKifNHPcMzTLQt
+PoY397WREd/kkMtvgxSDs6GQr2VwByHoo5IoQJ/OpridaDduL9NSc6YHEEXxSceM
+SdI+txuZvOAJJuLR1DQ5S5xjdHBj8uDsAnmX7oORVadEJ38Aj1UlM+Lk6qnmoBEG
+AXEfa3Fxyz0qgN9MrtutJO0S4BLqqmXgM9Kulp0B7e7gkRaAyNt/Y0+dAuzYva+u
+Td7Qm96EEYCTwd9LM4OghTLpDCXFm5EQI+D0zEyOGhDqwQDdx3MHJoPd6xg72Zko
+iADY235D/av/ZisF7acPucLvQ41gbWphQgsRTN81lRll/Wgd4EknznXq060RQBkN
+bwIDAQABo1MwUTAdBgNVHQ4EFgQUzpwOh72T7DyvsvkVV9Cu4YRKBTYwHwYDVR0j
+BBgwFoAUzpwOh72T7DyvsvkVV9Cu4YRKBTYwDwYDVR0TAQH/BAUwAwEB/zANBgkq
+hkiG9w0BAQsFAAOCAgEADSc0AEFgMcwArn9zvppOdMlF4GqyJa7mzeVAKHRyXiLm
+4TSUk8oBk8GgO9f32B5sEUVBnL5FnzEUm7hMAG5DUcMXANkHguIwoISpAZdFh1Vh
+H+13HIOmxre/UN9a1l829g1dANvYWcoGJc4uUtj3HF5UKcfEmrUwISimW0Mpuin+
+jDlRiLvpvImqxWUyFazucpE8Kj4jqmFNnoOLAQbEerR61W1wC3fpifM9cW5mKLsS
+pk9uG5PUTWKA1W7u+8AgLxvfdbFA9HnDc93JKWeWyBLX6GSeVL6y9pOY9MRBHqnp
+PVEPcjbZ3ZpX1EPWbniF+WRCIpjcye0obTTjipWJli5HqwGGauyXPGmevCkG96ji
+y8nf18HrQ3459SuRSZ1lQD5EoF+1QBL/O1Y6P7PVuOSQev376RD56tOLu1EWxZAm
+fDNNmlZSmZSn+h5JRcjSh1NFfktIVkHtNPKw8FXDp8098oqrJ3MoNTQgE0vpXiho
+1QIxWhfaEU5y/WynZFk1PssjBULWNxbeIpOFYk3paNyEpb9cOkOE8ZHOdi7WWJSw
+HaDmx6qizOQXO75QMLIMxkCdENFx6wWbNMvKCxOlPfgkNcBaAsybM+K0AHwwvyzl
+cpVfEdaCexGtecBoGkjFRCG+f9InppaaSzmgbIJvkSOMUWEDO/JlFizzWAG8koM=
+-----END CERTIFICATE-----`
+
+const EncryptionKeyPEM = `-----BEGIN PRIVATE KEY-----
+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
+T+zhBIl1qramlEnT1hYCydxx4ceziIo=
+-----END PRIVATE KEY-----`
 
 // UUID is the unique identifier used in tests
 const UUID = "11111111-1111-1111-1111-111111111111"
@@ -188,3 +391,72 @@ const UserCertificateStandard = `ssh-rsa-cert-v01@openssh.com AAAAHHNzaC1yc2EtY2
 
 // UserCertificateLegacy is a SSH user certificate in the old legacy format.
 const UserCertificateLegacy = `ssh-rsa-cert-v01@openssh.com AAAAHHNzaC1yc2EtY2VydC12MDFAb3BlbnNzaC5jb20AAAAgUTR740WMqrewurgb80LEYI4ePvOoDSS1PuG/fVOtd+UAAAADAQABAAABAQC4gxu87n0GfSqgTrcbDByLmWl2cpvJqHSfHtYTenfhfKoXyYqnVT6YMHSov13gT0l3RMVy/qFKJfbRREGjSQ/YW1zG/y0xCnjRmKgPLyHLzyc+yOrTbIwn9rHIJeuF1DlIJLzhUo/MMi4UZPHLtsLBiJ94MVQMj3R2fRC55gm0ZKcvpmk3H57wbbEze4gQLXI2Crl/JxG0h9CSV5YfRbvftbpoTOR9A4tYQUvNobBz8scdAGHpOYilBIkANwzwOmNw/CLikD6TtirWzwCq/GiO0oec5oeb2Anrq7uGHYzZzx+E+iNe+ebY/xiuN8anLYa9JGQ4YlLSC47xOM+8LviTAAAAAAAAAAAAAAABAAAAA2ZvbwAAAAcAAAADZm9vAAAAAF1CHqcAAAAAXUIfHwAAAAAAAAASAAAACnBlcm1pdC1wdHkAAAAAAAAAAAAAARcAAAAHc3NoLXJzYQAAAAMBAAEAAAEBAOrxHaRQxJKiZ/XZJMs+p4H8bai3aPVgavGIE9uB+1LGkGNzWy1QWmePLBcFred5aNnpoTjl3ZPRT5iRfnaK0ggl8P/4k1O+ZtUkDTDcbtVyjCH9raVzqOtQ/BEu5sXEokOHNRuySJSMJLUQZV94vGpIuXmRY6z8X4uwI4ui/ZUFLOLCcilWxxg87dKnUm9Tg1TzTDHE5M9QXCrUl/IOoV2491paoiUJRvFSQMCQfTCePrBcKne+f5S2gmV8KIMaL4ucFFMhxcP5rVPd/bNDquM46MW9TrESzl6XETKrOO5psgHWKUgCM44u+DOjvbqUOAWc6IIDQ7KonxToTSTehqcAAAEPAAAAB3NzaC1yc2EAAAEArj9BOUTTbPhv6MahtMa/oe9mnZI/R0c5kTtDplGFbfNSg2JI6UHbE/ijM4yR3X2f4tuj4eL4MJxFYKik+mJ7fhxuxlsYq42CILr/7uDu4YKLwdS5pYZtyIVF2KeYjdMZrdXBo/c1dfNgiAvQCyY4knjxnRNgGG7pRw1R2qDQjXlxqrdFiPLgLKAkY/gcBDio4iIlfe/bqNnlJTHDQ4+E8v1PQw1zHJ65WADd8iMT6+RyJ2B9h6B1b2Mtj17pf8DOT6snjmq/FUgYgN1n6wh8IuMMGOOF5orOWjYeXrqQeN1kNN95eQrSXsGEesDJgMeL2Km3KZOH1+ZTGnvoierzlA==`
+
+const (
+	SSHCAPrivateKey = `-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAvJGHcmQNWUjY2eKasmw171qZR0B5FOnzy/nAGB1JAE+QokFe
+Bjo8Gkk3L2TSuVNn0NI5uo5Jwp7GYtbfSbowo11E922Bwp0sFoVzeeUMyLud9EPz
+Hl8+VvE8WEa1lC4D4aqravAfTeeePrONIYoBttX5oYXQ7aZkM8N7yS7KWNOZpy9f
+n1vkSCpDOK29edLHWVyiDcXzULxEbXhPFl9Ly9shuEbqic2LRggxBnh3fhy53u8X
+5qj8bp+21GGsQJaZYZtc9ieNYamo/KQcA0hFfUgTmV74ehY0vZ7yQk+2dW22cFqw
+Dv+xNmnNHlfuYhHNCfk8rnztxfbqHfifgCArQQIDAQABAoIBADhq8jNva+8CtJ68
+BbzMU3bBjIqc550yQhcNKkQMvwKwy31AQXlrgv/6V+B+Me3w3mbD/zGp0LfB+Wkp
+ELVmV5cJGNFOmjw3+jDizKHzvddxCtlCW0MDDAvHMV7YCQvEmLSz84WTQkp0ugvY
+fKlEOS8S5hVFjDUOS3yRSD/xF+lrIlYUaR4gXnDAJZx9ttgfZlHOp8ehxk+1bn59
+3Fv1fCXcCKmKUlTk1kFasD8P+2M3MKP42Ih5ap9cfLSVPiBS/6JRBxIlZrHM9/2a
+w6vEp+qMwwgCmxLPMwZfem6LNHO/huTrWKf4ltVubb5bUXIe22udKp2WK4NWc3Ka
+uG8EleECgYEA4A9Mwd0QJs0j1kpuJDNIjfFx6IROv3QAb0QPq0+192ZF8P9AEj8B
+TNDQVzb/skM+2NDdvhZ5v4+OJQcUNpEskhX+5ikk8QHGAUY6vT8rO6oiIRMaxLuJ
+OEDc2Qms1OmctTmgSVyaxfXIK2/GDdvOizt0Z7Y7abza4bigEm49hyMCgYEA13MI
+H429Ua0tnVVmGJ/4OjnKbgtF7i02r50vDVktPruKWNy1bhRkRyaOoCH7Zt9WXF2j
+GapZZN1N/clO4vf9gikH0VCo4Tc2JR635dXdfISlt8NLXmR800Ms1UCAKlwIOQjz
+dgHcvEbvFwSe1MFgOJVGL82G2rUA/zDVOKdjXEsCgYAZxyjZlQlqrWdWHDIX0B6k
+1gZ47d/xfvMd2gLDfuQ8lnOtinBgqQcJQ2z028sHQ11TrJQWbpeLRoTgFbRposIx
+/H3bFRi+8alKND5Fz6K1tpk+nOgTglADPNMr1UUhKc9xujOKvTDBXcmt1ao/pe5Z
+bnmyBPFI9QVpusgP1scVaQKBgE5mJYaV5VZbVkXyVXyQeZt2fBsfLwtEmKm+4OhS
+kwxI4kcDyWGNOhBKD4xl0T3V928VA8zLGEyD22WGY5Zj93PtylJ4r3uEw8cuLm0M
+LdSp0EPWZQ6sMmAOCbpwBjNj2fonL7C5bMF2bnpJzCJPW9w7NZcfivr68qnp8yzy
+fE2RAoGBALWvlHVH/29KOVmM52sOk49tcyc3czjs/YANvbokiItxOB8VPY6QQQnS
+/CBsCZxUuWegYmkUnstHDmY1LYqjxW4goOqizIksaReivPmsTuQ1qd+aqXTfg2pt
+uy6c6X17xkP5q2Lq4i90ikyWm3Oc25aUEw48pRyK/6rABRUzpDLB
+-----END RSA PRIVATE KEY-----`
+	SSHCAPublicKey = `ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC8kYdyZA1ZSNjZ4pqybDXvWplHQHkU6fPL+cAYHUkAT5CiQV4GOjwaSTcvZNK5U2fQ0jm6jknCnsZi1t9JujCjXUT3bYHCnSwWhXN55QzIu530Q/MeXz5W8TxYRrWULgPhqqtq8B9N554+s40higG21fmhhdDtpmQzw3vJLspY05mnL1+fW+RIKkM4rb150sdZXKINxfNQvERteE8WX0vL2yG4RuqJzYtGCDEGeHd+HLne7xfmqPxun7bUYaxAlplhm1z2J41hqaj8pBwDSEV9SBOZXvh6FjS9nvJCT7Z1bbZwWrAO/7E2ac0eV+5iEc0J+TyufO3F9uod+J+AICtB`
+)
+
+const (
+	JWTSignerPrivateKey = `-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAt/ocQMUoUDIHkTlmmAGDpup20ucTMWeawzlRDs1KZP4aAUHg
+5rM5VE0CIPLAMeGFb/dCckEW+0X9V3bPLp+lnui+wrjG6T+O1mhFo1hJzr1R23p5
+upZk3InSZazGN04x2HUtZ+D9pSYYyxiWMAO2U6pEZtPdGwVybO51E46E3jvWL0po
+RsUdUGGRTCZmIHKPS83OiN+1XCAZ4qZFp5k9au9zUJkFd6ACTsQJ5EHReuO4Nts+
+RE61w2NsTlkvWRYL3Vd1xclkOEBkMmjEaJh98M2FwzvIWBS2qH1Ow78c7AvT8xXx
+OKmnPfCWIx6X7jHuteM37I2ItiiNAcAyuNBOzwIDAQABAoIBAAc8rXPWzZkp/qY1
+zdVY6ebc/kOZl2WwH6RiUs/0P2Lto/Q8tS4eCrlINjc5lVng9zDKVzDLYq4LuMWC
+BPBek1NG8IoUXq66M1I309VzGaQqSlgJ31P5qooKWd5qB3oRd2B+a4TUkuW2M+95
+Th8hZkCwR/SLjP0NH80tLCnSx2M+gjZmweI/oXIh60ylIcGgVUlJ/nRvZdWvHmld
+PoD4GzI+PStUFR3yzwF9SImoCGMLGcoJBBOccKBlG6384FEbR5RNHUZJeZvwj476
+jy3wj9m16GmGhOVZijPM84xIL2jfeQS8DPkBAXNHIdOiYCjgcsk1b1J5AdawvAz6
+FWLadIECgYEA6QR7P/engYAhyCMAOUJmvG6ss2KAdHe3G8Mjd3OormSVh1HkMa05
+FsidAMrD0fI2Em2qiuSk88AvgbIBNaTbo4PlfzDSpAYaxoOVucak3oj4/KP5SGa7
+TdvRSKBqxp/OfHuHZx0delDGW4VNW1He/x6/JnUV15qFX73lUStHIOECgYEAyh9k
+eqEv6RgCE5S/2sTQjJh75LCdY70wx0KyrpqOoXXS7gYhBaMV/lydmWQcR+rW390r
+U8h5eT2eXE0+hh5SkbNX/P8kcJ0taUwbUUkzmAe651EES4ZCN5x+zprqUDwQqqlM
+1K2F+ULnY3PkUrrZObQddir486uRbXFSZ4Rqda8CgYBm1R13O1nm4p8F7bxZiJ5C
+Ji189MlvnK1oSRPL0XTtkWIT1+X2rlV1Yo83HESS0GtgcplCtmi9UWElwWKbQ+fS
+H5EWMnui+zaxyLw4whtcQeJvzAVlGEEsuQeBH5o/kaLUeMdmkAjERAVlukxLMrRQ
+rkb5N86t2XlmqS0cRxcawQKBgQCJC4gBbdEiZtjhlfYPy2rsKWe3w9izi8/LC3pD
+0R/scgs2wIkbXVzIPtvM6YgTazOOTlPWVxOmFRWO2AEQxvaNO+Do9cYrZScpQiUz
+lEKbToJ33QLggoPbWQzR4VAGXvOeA3TIr28rdyWU1Tt2rKIk8e8X9EMgVLAiWLfa
+4HmemQKBgHEx08lXMDWpQRG7s7K+o05W66mjpogIn8/hsvLuc1UE1V/ZIKZL0jo5
+TON8GV/tU3F64uFowISnZOPOyBdm37UmiC+o3Ue5MFpH7wPsCMlpVi1WzPAj5W/o
+PEqXyCrHytbPuH88DitxbALCPFIAI12EefmJgO7i8UrqahYyI7Lo
+-----END RSA PRIVATE KEY-----`
+	JWTSignerPublicKey = `-----BEGIN RSA PUBLIC KEY-----
+MIIBCgKCAQEAt/ocQMUoUDIHkTlmmAGDpup20ucTMWeawzlRDs1KZP4aAUHg5rM5
+VE0CIPLAMeGFb/dCckEW+0X9V3bPLp+lnui+wrjG6T+O1mhFo1hJzr1R23p5upZk
+3InSZazGN04x2HUtZ+D9pSYYyxiWMAO2U6pEZtPdGwVybO51E46E3jvWL0poRsUd
+UGGRTCZmIHKPS83OiN+1XCAZ4qZFp5k9au9zUJkFd6ACTsQJ5EHReuO4Nts+RE61
+w2NsTlkvWRYL3Vd1xclkOEBkMmjEaJh98M2FwzvIWBS2qH1Ow78c7AvT8xXxOKmn
+PfCWIx6X7jHuteM37I2ItiiNAcAyuNBOzwIDAQAB
+-----END RSA PUBLIC KEY-----`
+)

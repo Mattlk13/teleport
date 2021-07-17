@@ -21,65 +21,71 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gravitational/teleport/lib/utils"
 
-	"gopkg.in/check.v1"
+	"github.com/stretchr/testify/require"
 )
 
-type Suite struct{}
-
-var _ = fmt.Printf
-var _ = check.Suite(&Suite{})
-
-func TestPAM(t *testing.T) { check.TestingT(t) }
-
-func (s *Suite) SetUpSuite(c *check.C) {
+func TestMain(m *testing.M) {
 	utils.InitLoggerForTests()
-}
-func (s *Suite) TearDownSuite(c *check.C) {}
-func (s *Suite) SetUpTest(c *check.C)     {}
-func (s *Suite) TearDownTest(c *check.C)  {}
 
-// TestEcho makes sure that the PAM_RUSER variable passed to a PAM module
-// is correctly set
-//
-// The PAM module used, pam_teleport.so is called from the policy file
-// teleport-session-echo-ruser. The policy file instructs pam_teleport.so to
-// echo the contents of PAM_RUSER to stdout where this test can read, parse,
-// and validate it's output.
-func (s *Suite) TestEcho(c *check.C) {
 	// Skip this test if the binary was not built with PAM support.
 	if !BuildHasPAM() || !SystemHasPAM() {
-		c.Skip("Skipping test: PAM support not enabled.")
+		fmt.Println("PAM support not enabled, skipping tests")
+		os.Exit(0)
 	}
 
-	local, err := user.Current()
-	c.Assert(err, check.IsNil)
+	_, err := os.Stat("../../build.assets/pam/pam_teleport.so")
+	if os.IsNotExist(err) {
+		fmt.Println("PAM test module is not installed, you can install it with 'sudo make -C build.assets/pam install'")
+		os.Exit(0)
+	}
 
-	os.Setenv("TELEPORT_USERNAME", local.Username+"@example.com")
-	os.Setenv("TELEPORT_LOGIN", local.Username)
-	os.Setenv("TELEPORT_ROLES", "bar baz qux")
+	os.Exit(m.Run())
+}
+
+// TestEcho makes sure that the teleport env variables passed to a PAM module
+// are correctly set
+//
+// The PAM module used, pam_teleport.so is called from the policy file
+// teleport-acct-echo. The policy file instructs pam_teleport.so to echo the
+// contents of TELEPORT_* to stdout where this test can read, parse, and
+// validate it's output.
+func TestEcho(t *testing.T) {
+	t.Parallel()
+	checkTestModule(t, "teleport-acct-echo")
+	username := currentUser(t)
 
 	var buf bytes.Buffer
 	pamContext, err := Open(&Config{
 		Enabled:     true,
 		ServiceName: "teleport-acct-echo",
-		Login:       local.Username,
-		Stdin:       &discardReader{},
-		Stdout:      &buf,
-		Stderr:      &buf,
+		Login:       username,
+		Env: map[string]string{
+			"TELEPORT_USERNAME": username + "@example.com",
+			"TELEPORT_LOGIN":    username,
+			"TELEPORT_ROLES":    "bar baz qux",
+		},
+		Stdin:      &discardReader{},
+		Stdout:     &buf,
+		Stderr:     &buf,
+		UsePAMAuth: true,
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 	defer pamContext.Close()
 
-	parts := strings.FieldsFunc(buf.String(), func(c rune) bool { return c == '\n' })
-	c.Assert(parts, check.HasLen, 3)
-	c.Assert(strings.TrimSpace(parts[0]), check.Equals, local.Username+"@example.com")
-	c.Assert(strings.TrimSpace(parts[1]), check.Equals, local.Username)
-	c.Assert(strings.TrimSpace(parts[2]), check.Equals, "bar baz qux")
+	assertOutput(t, buf.String(), []string{
+		username + "@example.com",
+		username,
+		"bar baz qux",
+		"pam_sm_acct_mgmt OK",
+		"pam_sm_authenticate OK",
+		"pam_sm_open_session OK",
+	})
 }
 
 // TestEnvironment makes sure that PAM environment variables (environment
@@ -90,29 +96,134 @@ func (s *Suite) TestEcho(c *check.C) {
 // teleport-session-environment. The policy file instructs pam_teleport.so to
 // read in the first argument and set it as a PAM environment variable. This
 // test then validates it matches what was set in the policy file.
-func (s *Suite) TestEnvironment(c *check.C) {
-	// Skip this test if the binary was not built with PAM support.
-	if !BuildHasPAM() || !SystemHasPAM() {
-		c.Skip("Skipping test: PAM support not enabled.")
-	}
-
-	local, err := user.Current()
-	c.Assert(err, check.IsNil)
+func TestEnvironment(t *testing.T) {
+	t.Parallel()
+	checkTestModule(t, "teleport-session-environment")
+	username := currentUser(t)
 
 	var buf bytes.Buffer
 	pamContext, err := Open(&Config{
 		Enabled:     true,
 		ServiceName: "teleport-session-environment",
-		Login:       local.Username,
+		Login:       username,
 		Stdin:       &discardReader{},
 		Stdout:      &buf,
 		Stderr:      &buf,
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 	defer pamContext.Close()
 
-	c.Assert(pamContext.Environment(), check.HasLen, 1)
-	c.Assert(pamContext.Environment()[0], check.Equals, "foo=bar")
+	require.ElementsMatch(t, pamContext.Environment(), []string{"foo=bar"})
+}
+
+func TestSuccess(t *testing.T) {
+	t.Parallel()
+	checkTestModule(t, "teleport-success")
+	username := currentUser(t)
+
+	var buf bytes.Buffer
+	pamContext, err := Open(&Config{
+		Enabled:     true,
+		ServiceName: "teleport-success",
+		Login:       username,
+		Stdin:       &discardReader{},
+		Stdout:      &buf,
+		Stderr:      &buf,
+		UsePAMAuth:  true,
+	})
+	require.NoError(t, err)
+	defer pamContext.Close()
+
+	assertOutput(t, buf.String(), []string{
+		"pam_sm_acct_mgmt OK",
+		"pam_sm_authenticate OK",
+		"pam_sm_open_session OK",
+	})
+}
+
+func TestAccountFailure(t *testing.T) {
+	t.Parallel()
+	checkTestModule(t, "teleport-acct-failure")
+	username := currentUser(t)
+
+	var buf bytes.Buffer
+	_, err := Open(&Config{
+		Enabled:     true,
+		ServiceName: "teleport-acct-failure",
+		Login:       username,
+		Stdin:       &discardReader{},
+		Stdout:      &buf,
+		Stderr:      &buf,
+	})
+	require.Error(t, err)
+}
+
+func TestAuthFailure(t *testing.T) {
+	t.Parallel()
+	checkTestModule(t, "teleport-auth-failure")
+	username := currentUser(t)
+
+	var buf bytes.Buffer
+	_, err := Open(&Config{
+		Enabled:     true,
+		ServiceName: "teleport-auth-failure",
+		Login:       username,
+		Stdin:       &discardReader{},
+		Stdout:      &buf,
+		Stderr:      &buf,
+		UsePAMAuth:  true,
+	})
+	require.Error(t, err)
+}
+
+func TestAuthDisabled(t *testing.T) {
+	t.Parallel()
+	checkTestModule(t, "teleport-auth-failure")
+	username := currentUser(t)
+
+	var buf bytes.Buffer
+	pamContext, err := Open(&Config{
+		Enabled:     true,
+		ServiceName: "teleport-auth-failure",
+		Login:       username,
+		Stdin:       &discardReader{},
+		Stdout:      &buf,
+		Stderr:      &buf,
+		UsePAMAuth:  false,
+	})
+	require.NoError(t, err)
+	defer pamContext.Close()
+
+	assertOutput(t, buf.String(), []string{
+		"pam_sm_acct_mgmt OK",
+		"pam_sm_open_session OK",
+	})
+}
+
+func TestSessionFailure(t *testing.T) {
+	t.Parallel()
+	checkTestModule(t, "teleport-session-failure")
+	username := currentUser(t)
+
+	var buf bytes.Buffer
+	_, err := Open(&Config{
+		Enabled:     true,
+		ServiceName: "teleport-session-failure",
+		Login:       username,
+		Stdin:       &discardReader{},
+		Stdout:      &buf,
+		Stderr:      &buf,
+	})
+	require.Error(t, err)
+}
+
+func assertOutput(t *testing.T, got string, want []string) {
+	got = strings.TrimSpace(got)
+	lines := strings.Split(got, "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimSpace(l)
+	}
+	require.ElementsMatch(t, lines, want)
 }
 
 type discardReader struct {
@@ -120,4 +231,17 @@ type discardReader struct {
 
 func (d *discardReader) Read(p []byte) (int, error) {
 	return len(p), nil
+}
+
+func checkTestModule(t *testing.T, name string) {
+	_, err := os.Stat(filepath.Join("/etc/pam.d", name))
+	if os.IsNotExist(err) {
+		t.Skipf("PAM test service %q is not installed, you can install it with 'sudo make -C build.assets/pam install'", name)
+	}
+}
+
+func currentUser(t *testing.T) string {
+	usr, err := user.Current()
+	require.NoError(t, err)
+	return usr.Username
 }

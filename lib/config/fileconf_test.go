@@ -17,34 +17,24 @@ limitations under the License.
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
-	"fmt"
+	"testing"
 
-	"gopkg.in/check.v1"
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v2"
 )
 
-type FileTestSuite struct {
-}
-
-var _ = check.Suite(&FileTestSuite{})
-var _ = fmt.Printf
-
-func (s *FileTestSuite) SetUpSuite(c *check.C) {
-}
-
-func (s *FileTestSuite) TearDownSuite(c *check.C) {
-}
-
-func (s *FileTestSuite) SetUpTest(c *check.C) {
-}
-
-func (s *FileTestSuite) TestAuthenticationSection(c *check.C) {
+func TestAuthenticationSection(t *testing.T) {
 	tests := []struct {
+		comment                 string
 		inConfigString          string
 		outAuthenticationConfig *AuthenticationConfig
 	}{
-		// 0 - local with otp
 		{
+			`0 - local with otp`,
+
 			`
 auth_service:
   authentication:
@@ -56,8 +46,9 @@ auth_service:
 				SecondFactor: "otp",
 			},
 		},
-		// 1 - local auth without otp
 		{
+			`1 - local auth without otp`,
+
 			`
 auth_service:
   authentication:
@@ -69,8 +60,9 @@ auth_service:
 				SecondFactor: "off",
 			},
 		},
-		// 2 - local auth with u2f
 		{
+			`2 - local auth with u2f`,
+
 			`
 auth_service:
    authentication:
@@ -80,6 +72,12 @@ auth_service:
            app_id: https://graviton:3080
            facets:
            - https://graviton:3080
+           device_attestation_cas:
+           - testdata/u2f_attestation_ca.pam
+           - |
+             -----BEGIN CERTIFICATE-----
+             fake certificate
+             -----END CERTIFICATE-----
 `,
 			&AuthenticationConfig{
 				Type:         "local",
@@ -89,43 +87,202 @@ auth_service:
 					Facets: []string{
 						"https://graviton:3080",
 					},
+					DeviceAttestationCAs: []string{
+						"testdata/u2f_attestation_ca.pam",
+						`-----BEGIN CERTIFICATE-----
+fake certificate
+-----END CERTIFICATE-----
+`,
+					},
 				},
 			},
 		},
 	}
 
 	// run tests
-	for i, tt := range tests {
-		comment := check.Commentf("Test %v", i)
+	for _, tt := range tests {
+		t.Run(tt.comment, func(t *testing.T) {
+			encodedConfigString := base64.StdEncoding.EncodeToString([]byte(tt.inConfigString))
 
-		encodedConfigString := base64.StdEncoding.EncodeToString([]byte(tt.inConfigString))
-
-		fc, err := ReadFromString(encodedConfigString)
-		c.Assert(err, check.IsNil, comment)
-
-		c.Assert(fc.Auth.Authentication, check.DeepEquals, tt.outAuthenticationConfig, comment)
+			fc, err := ReadFromString(encodedConfigString)
+			require.NoError(t, err)
+			require.Empty(t, cmp.Diff(fc.Auth.Authentication, tt.outAuthenticationConfig))
+		})
 	}
 }
 
-// TestLegacySection ensures we continue to parse and correctly load deprecated
-// OIDC connector and U2F authentication configuration.
-func (s *FileTestSuite) TestLegacyAuthenticationSection(c *check.C) {
-	encodedLegacyAuthenticationSection := base64.StdEncoding.EncodeToString([]byte(LegacyAuthenticationSection))
+// minimalConfigFile is a minimal subset of a teleport config file that can be
+// mutated programatically by test cases and then re-serialised to test the
+// config file loader
+const minimalConfigFile string = `
+teleport:
+  nodename: testing
 
-	// read config into struct
-	fc, err := ReadFromString(encodedLegacyAuthenticationSection)
-	c.Assert(err, check.IsNil)
+auth_service:
+  enabled: yes
 
-	// validate oidc connector
-	c.Assert(fc.Auth.OIDCConnectors, check.HasLen, 1)
-	c.Assert(fc.Auth.OIDCConnectors[0].ID, check.Equals, "google")
-	c.Assert(fc.Auth.OIDCConnectors[0].RedirectURL, check.Equals, "https://localhost:3080/v1/webapi/oidc/callback")
-	c.Assert(fc.Auth.OIDCConnectors[0].ClientID, check.Equals, "id-from-google.apps.googleusercontent.com")
-	c.Assert(fc.Auth.OIDCConnectors[0].ClientSecret, check.Equals, "secret-key-from-google")
-	c.Assert(fc.Auth.OIDCConnectors[0].IssuerURL, check.Equals, "https://accounts.google.com")
+ssh_service:
+  enabled: yes
+`
 
-	// validate u2f
-	c.Assert(fc.Auth.U2F.AppID, check.Equals, "https://graviton:3080")
-	c.Assert(fc.Auth.U2F.Facets, check.HasLen, 1)
-	c.Assert(fc.Auth.U2F.Facets[0], check.Equals, "https://graviton:3080")
+// cfgMap is a shorthand for a type that can hold the nested key-value
+// representation of a parsed YAML file.
+type cfgMap map[interface{}]interface{}
+
+// editConfig takes the minimal YAML configuration file, de-serialises it into a
+// nested key-value dictionary suitable for manipulation by a test case,
+// passes that dictionary to the caller-supplied mutator and then re-serialises
+// it ready to be injected into the config loader.
+func editConfig(t *testing.T, mutate func(cfg cfgMap)) []byte {
+	var cfg cfgMap
+	require.NoError(t, yaml.Unmarshal([]byte(minimalConfigFile), &cfg))
+	mutate(cfg)
+
+	text, err := yaml.Marshal(cfg)
+	require.NoError(t, err)
+
+	return text
+}
+
+// requireEqual creates an assertion function with a bound `expected` value
+// for use with table-driven tests
+func requireEqual(expected interface{}) require.ValueAssertionFunc {
+	return func(t require.TestingT, actual interface{}, msgAndArgs ...interface{}) {
+		require.Equal(t, expected, actual, msgAndArgs...)
+	}
+}
+
+// TestAuthSection tests the config parser for the `auth_service` config block
+func TestAuthSection(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		desc          string
+		mutate        func(cfgMap)
+		expectError   require.ErrorAssertionFunc
+		expectEnabled require.BoolAssertionFunc
+		expectIdleMsg require.ValueAssertionFunc
+	}{
+		{
+			desc:          "Default",
+			mutate:        func(cfg cfgMap) {},
+			expectError:   require.NoError,
+			expectEnabled: require.True,
+			expectIdleMsg: require.Empty,
+		}, {
+			desc: "Enabled",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["enabled"] = "yes"
+			},
+			expectError:   require.NoError,
+			expectEnabled: require.True,
+		}, {
+			desc: "Disabled",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["enabled"] = "no"
+			},
+			expectError:   require.NoError,
+			expectEnabled: require.False,
+		}, {
+			desc: "Idle timeout message",
+			mutate: func(cfg cfgMap) {
+				cfg["auth_service"].(cfgMap)["client_idle_timeout_message"] = "Are you pondering what I'm pondering?"
+			},
+			expectError:   require.NoError,
+			expectIdleMsg: requireEqual("Are you pondering what I'm pondering?"),
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.desc, func(t *testing.T) {
+			text := bytes.NewBuffer(editConfig(t, tt.mutate))
+
+			cfg, err := ReadConfig(text)
+			tt.expectError(t, err)
+
+			if tt.expectEnabled != nil {
+				tt.expectEnabled(t, cfg.Auth.Enabled())
+			}
+
+			if tt.expectIdleMsg != nil {
+				tt.expectIdleMsg(t, cfg.Auth.ClientIdleTimeoutMessage)
+			}
+		})
+	}
+}
+
+// TestSSHSection tests the config parser for the SSH config block
+func TestSSHSection(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		desc                      string
+		mutate                    func(cfgMap)
+		expectError               require.ErrorAssertionFunc
+		expectEnabled             require.BoolAssertionFunc
+		expectAllowsTCPForwarding require.BoolAssertionFunc
+	}{
+		{
+			desc:                      "default",
+			mutate:                    func(cfgMap) {},
+			expectError:               require.NoError,
+			expectEnabled:             require.True,
+			expectAllowsTCPForwarding: require.True,
+		}, {
+			desc: "explicitly enabled",
+			mutate: func(cfg cfgMap) {
+				cfg["ssh_service"].(cfgMap)["enabled"] = "yes"
+			},
+			expectError:               require.NoError,
+			expectEnabled:             require.True,
+			expectAllowsTCPForwarding: require.True,
+		}, {
+			desc: "diasbled",
+			mutate: func(cfg cfgMap) {
+				cfg["ssh_service"].(cfgMap)["enabled"] = "no"
+			},
+			expectError:               require.NoError,
+			expectEnabled:             require.False,
+			expectAllowsTCPForwarding: require.True,
+		}, {
+			desc: "Port forwarding is enabled",
+			mutate: func(cfg cfgMap) {
+				cfg["ssh_service"].(cfgMap)["port_forwarding"] = true
+			},
+			expectError:               require.NoError,
+			expectEnabled:             require.True,
+			expectAllowsTCPForwarding: require.True,
+		}, {
+			desc: "Port forwarding is disabled",
+			mutate: func(cfg cfgMap) {
+				cfg["ssh_service"].(cfgMap)["port_forwarding"] = false
+			},
+			expectError:               require.NoError,
+			expectEnabled:             require.True,
+			expectAllowsTCPForwarding: require.False,
+		}, {
+			desc: "Port forwarding invalid value",
+			mutate: func(cfg cfgMap) {
+				cfg["ssh_service"].(cfgMap)["port_forwarding"] = "banana"
+			},
+			expectError: require.Error,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.desc, func(t *testing.T) {
+			text := bytes.NewBuffer(editConfig(t, testCase.mutate))
+
+			cfg, err := ReadConfig(text)
+			testCase.expectError(t, err)
+
+			if testCase.expectEnabled != nil {
+				testCase.expectEnabled(t, cfg.SSH.Enabled())
+			}
+
+			if testCase.expectAllowsTCPForwarding != nil {
+				testCase.expectAllowsTCPForwarding(t, cfg.SSH.AllowTCPForwarding())
+			}
+		})
+	}
 }

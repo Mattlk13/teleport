@@ -18,232 +18,275 @@ package srv
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
+	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/require"
+
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/fixtures"
-	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
-	"github.com/jonboulle/clockwork"
-	"gopkg.in/check.v1"
 )
 
-// HeartbeatSuite also implements ssh.ConnMetadata
-type HeartbeatSuite struct {
-}
+// TestHeartbeatKeepAlive tests keep alive cycle used for nodes and apps.
+func TestHeartbeatKeepAlive(t *testing.T) {
+	var tests = []struct {
+		name       string
+		mode       HeartbeatMode
+		makeServer func() types.Resource
+	}{
+		{
+			name: "keep alive node",
+			mode: HeartbeatModeNode,
+			makeServer: func() types.Resource {
+				return &types.ServerV2{
+					Kind:    types.KindNode,
+					Version: types.V2,
+					Metadata: types.Metadata{
+						Namespace: apidefaults.Namespace,
+						Name:      "1",
+					},
+					Spec: types.ServerSpecV2{
+						Addr:     "127.0.0.1:1234",
+						Hostname: "2",
+					},
+				}
+			},
+		},
+		{
+			name: "keep alive app server",
+			mode: HeartbeatModeApp,
+			makeServer: func() types.Resource {
+				return &types.ServerV2{
+					Kind:    types.KindAppServer,
+					Version: types.V2,
+					Metadata: types.Metadata{
+						Namespace: apidefaults.Namespace,
+						Name:      "1",
+					},
+					Spec: types.ServerSpecV2{
+						Addr:     "127.0.0.1:1234",
+						Hostname: "2",
+					},
+				}
+			},
+		},
+		{
+			name: "keep alive database server",
+			mode: HeartbeatModeDB,
+			makeServer: func() types.Resource {
+				return &types.DatabaseServerV3{
+					Kind:    types.KindDatabaseServer,
+					Version: types.V3,
+					Metadata: types.Metadata{
+						Namespace: apidefaults.Namespace,
+						Name:      "1",
+					},
+					Spec: types.DatabaseServerSpecV3{
+						Protocol: defaults.ProtocolPostgres,
+						URI:      "127.0.0.1:1234",
+						Hostname: "2",
+					},
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.TODO())
+			defer cancel()
+			clock := clockwork.NewFakeClock()
+			announcer := newFakeAnnouncer(ctx)
 
-var _ = check.Suite(&HeartbeatSuite{})
-var _ = testing.Verbose
-var _ = fmt.Printf
+			server := tt.makeServer()
 
-func (s *HeartbeatSuite) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests(testing.Verbose())
+			hb, err := NewHeartbeat(HeartbeatConfig{
+				Context:         ctx,
+				Mode:            tt.mode,
+				Component:       "test",
+				Announcer:       announcer,
+				CheckPeriod:     time.Second,
+				AnnouncePeriod:  60 * time.Second,
+				KeepAlivePeriod: 10 * time.Second,
+				ServerTTL:       600 * time.Second,
+				Clock:           clock,
+				GetServerInfo: func() (types.Resource, error) {
+					server.SetExpiry(clock.Now().UTC().Add(apidefaults.ServerAnnounceTTL))
+					return server, nil
+				},
+			})
+			require.NoError(t, err)
+			require.Equal(t, HeartbeatStateInit, hb.state)
+
+			// on the first run, heartbeat will move to announce state,
+			// will call announce right away
+			err = hb.fetch()
+			require.NoError(t, err)
+			require.Equal(t, HeartbeatStateAnnounce, hb.state)
+
+			err = hb.announce()
+			require.NoError(t, err)
+			require.Equal(t, 1, announcer.upsertCalls[hb.Mode])
+			require.Equal(t, HeartbeatStateKeepAliveWait, hb.state)
+			require.Equal(t, clock.Now().UTC().Add(hb.KeepAlivePeriod), hb.nextKeepAlive)
+
+			// next call will not move to announce, because time is not up yet
+			err = hb.fetchAndAnnounce()
+			require.NoError(t, err)
+			require.Equal(t, HeartbeatStateKeepAliveWait, hb.state)
+
+			// advance time, and heartbeat will move to keep alive
+			clock.Advance(hb.KeepAlivePeriod + time.Second)
+			err = hb.fetch()
+			require.NoError(t, err)
+			require.Equal(t, HeartbeatStateKeepAlive, hb.state)
+
+			err = hb.announce()
+			require.NoError(t, err)
+			require.Len(t, announcer.keepAlivesC, 1)
+			require.Equal(t, HeartbeatStateKeepAliveWait, hb.state)
+			require.Equal(t, clock.Now().UTC().Add(hb.KeepAlivePeriod), hb.nextKeepAlive)
+
+			// update server info, system should switch to announce state
+			server = tt.makeServer()
+			server.SetName("2")
+
+			err = hb.fetch()
+			require.NoError(t, err)
+			require.Equal(t, HeartbeatStateAnnounce, hb.state)
+			err = hb.announce()
+			require.NoError(t, err)
+			require.Equal(t, HeartbeatStateKeepAliveWait, hb.state)
+			require.Equal(t, clock.Now().UTC().Add(hb.KeepAlivePeriod), hb.nextKeepAlive)
+
+			// in case of any error while sending keep alive, system should fail
+			// and go back to init state
+			announcer.keepAlivesC = make(chan types.KeepAlive)
+			announcer.err = trace.ConnectionProblem(nil, "ooops")
+			announcer.Close()
+			clock.Advance(hb.KeepAlivePeriod + time.Second)
+			err = hb.fetch()
+			require.NoError(t, err)
+			require.Equal(t, HeartbeatStateKeepAlive, hb.state)
+			err = hb.announce()
+			require.Error(t, err)
+			require.IsType(t, announcer.err, err)
+			require.Equal(t, HeartbeatStateInit, hb.state)
+			require.Equal(t, 2, announcer.upsertCalls[hb.Mode])
+
+			// on the next run, system will try to reannounce
+			announcer.err = nil
+			err = hb.fetch()
+			require.NoError(t, err)
+			require.Equal(t, HeartbeatStateAnnounce, hb.state)
+			err = hb.announce()
+			require.NoError(t, err)
+			require.Equal(t, HeartbeatStateKeepAliveWait, hb.state)
+			require.Equal(t, 3, announcer.upsertCalls[hb.Mode])
+		})
+	}
 }
 
 // TestHeartbeatAnnounce tests announce cycles used for proxies and auth servers
-func (s *HeartbeatSuite) TestHeartbeatAnnounce(c *check.C) {
-	s.heartbeatAnnounce(c, HeartbeatModeProxy, services.KindProxy)
-	s.heartbeatAnnounce(c, HeartbeatModeAuth, services.KindAuthServer)
-}
-
-// TestHeartbeatKeepAlive tests keep alive cycle used for nodes
-func (s *HeartbeatSuite) TestHeartbeatKeepAlive(c *check.C) {
-	ctx, cancel := context.WithCancel(context.TODO())
-	defer cancel()
-	clock := clockwork.NewFakeClock()
-	announcer := newFakeAnnouncer(ctx)
-
-	srv := &services.ServerV2{
-		Kind:    services.KindNode,
-		Version: services.V2,
-		Metadata: services.Metadata{
-			Namespace: defaults.Namespace,
-			Name:      "1",
-		},
-		Spec: services.ServerSpecV2{
-			Addr:     "127.0.0.1:1234",
-			Hostname: "2",
-		},
+func TestHeartbeatAnnounce(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		mode HeartbeatMode
+		kind string
+	}{
+		{mode: HeartbeatModeProxy, kind: types.KindProxy},
+		{mode: HeartbeatModeAuth, kind: types.KindAuthServer},
+		{mode: HeartbeatModeKube, kind: types.KindKubeService},
 	}
-	hb, err := NewHeartbeat(HeartbeatConfig{
-		Context:         ctx,
-		Mode:            HeartbeatModeNode,
-		Component:       "test",
-		Announcer:       announcer,
-		CheckPeriod:     time.Second,
-		AnnouncePeriod:  60 * time.Second,
-		KeepAlivePeriod: 10 * time.Second,
-		ServerTTL:       600 * time.Second,
-		Clock:           clock,
-		GetServerInfo: func() (services.Server, error) {
-			srv.SetTTL(clock, defaults.ServerAnnounceTTL)
-			return srv, nil
-		},
-	})
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateInit)
+	for _, tt := range tests {
+		t.Run(tt.mode.String(), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.TODO())
+			defer cancel()
+			clock := clockwork.NewFakeClock()
 
-	// on the first run, heartbeat will move to announce state,
-	// will call announce right away
-	err = hb.fetch()
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateAnnounce)
+			announcer := newFakeAnnouncer(ctx)
+			hb, err := NewHeartbeat(HeartbeatConfig{
+				Context:         ctx,
+				Mode:            tt.mode,
+				Component:       "test",
+				Announcer:       announcer,
+				CheckPeriod:     time.Second,
+				AnnouncePeriod:  60 * time.Second,
+				KeepAlivePeriod: 10 * time.Second,
+				ServerTTL:       600 * time.Second,
+				Clock:           clock,
+				GetServerInfo: func() (types.Resource, error) {
+					srv := &types.ServerV2{
+						Kind:    tt.kind,
+						Version: types.V2,
+						Metadata: types.Metadata{
+							Namespace: apidefaults.Namespace,
+							Name:      "1",
+						},
+						Spec: types.ServerSpecV2{
+							Addr:     "127.0.0.1:1234",
+							Hostname: "2",
+						},
+					}
+					srv.SetExpiry(clock.Now().UTC().Add(apidefaults.ServerAnnounceTTL))
+					return srv, nil
+				},
+			})
+			require.NoError(t, err)
+			require.Equal(t, hb.state, HeartbeatStateInit)
 
-	err = hb.announce()
-	c.Assert(err, check.IsNil)
-	c.Assert(announcer.upsertCalls[hb.Mode], check.Equals, 1)
-	c.Assert(hb.state, check.Equals, HeartbeatStateKeepAliveWait)
-	c.Assert(hb.nextKeepAlive, check.Equals, clock.Now().UTC().Add(hb.KeepAlivePeriod))
+			// on the first run, heartbeat will move to announce state,
+			// will call announce right away
+			err = hb.fetch()
+			require.NoError(t, err)
+			require.Equal(t, hb.state, HeartbeatStateAnnounce)
 
-	// next call will not move to announce, because time is not up yet
-	err = hb.fetchAndAnnounce()
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateKeepAliveWait)
+			err = hb.announce()
+			require.NoError(t, err)
+			require.Equal(t, announcer.upsertCalls[hb.Mode], 1)
+			require.Equal(t, hb.state, HeartbeatStateAnnounceWait)
+			require.Equal(t, hb.nextAnnounce, clock.Now().UTC().Add(hb.AnnouncePeriod))
 
-	// advance time, and heartbeat will move to keep alive
-	clock.Advance(hb.KeepAlivePeriod + time.Second)
-	err = hb.fetch()
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateKeepAlive)
-	err = hb.announce()
-	c.Assert(err, check.IsNil)
-	c.Assert(announcer.keepAlivesC, check.HasLen, 1)
-	c.Assert(hb.state, check.Equals, HeartbeatStateKeepAliveWait)
-	c.Assert(hb.nextKeepAlive, check.Equals, clock.Now().UTC().Add(hb.KeepAlivePeriod))
+			// next call will not move to announce, because time is not up yet
+			err = hb.fetchAndAnnounce()
+			require.NoError(t, err)
+			require.Equal(t, hb.state, HeartbeatStateAnnounceWait)
 
-	// update server info, system should switch to announce state
-	srv = &services.ServerV2{
-		Kind:    services.KindNode,
-		Version: services.V2,
-		Metadata: services.Metadata{
-			Namespace: defaults.Namespace,
-			Name:      "1",
-			Labels:    map[string]string{"a": "b"},
-		},
-		Spec: services.ServerSpecV2{
-			Addr:     "127.0.0.1:1234",
-			Hostname: "2",
-		},
+			// advance time, and heartbeat will move to announce
+			clock.Advance(hb.AnnouncePeriod * time.Second)
+			err = hb.fetch()
+			require.NoError(t, err)
+			require.Equal(t, hb.state, HeartbeatStateAnnounce)
+			err = hb.announce()
+			require.NoError(t, err)
+			require.Equal(t, announcer.upsertCalls[hb.Mode], 2)
+			require.Equal(t, hb.state, HeartbeatStateAnnounceWait)
+			require.Equal(t, hb.nextAnnounce, clock.Now().UTC().Add(hb.AnnouncePeriod))
+
+			// in case of error, system will move to announce wait state,
+			// with next attempt scheduled on the next keep alive period
+			announcer.err = trace.ConnectionProblem(nil, "boom")
+			clock.Advance(hb.AnnouncePeriod + time.Second)
+			err = hb.fetchAndAnnounce()
+			require.Error(t, err)
+			require.True(t, trace.IsConnectionProblem(err))
+			require.Equal(t, announcer.upsertCalls[hb.Mode], 3)
+			require.Equal(t, hb.state, HeartbeatStateAnnounceWait)
+			require.Equal(t, hb.nextAnnounce, clock.Now().UTC().Add(hb.KeepAlivePeriod))
+
+			// once announce is successful, next announce is set on schedule
+			announcer.err = nil
+			clock.Advance(hb.KeepAlivePeriod + time.Second)
+			err = hb.fetchAndAnnounce()
+			require.NoError(t, err)
+			require.Equal(t, announcer.upsertCalls[hb.Mode], 4)
+			require.Equal(t, hb.state, HeartbeatStateAnnounceWait)
+			require.Equal(t, hb.nextAnnounce, clock.Now().UTC().Add(hb.AnnouncePeriod))
+		})
 	}
-	err = hb.fetch()
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateAnnounce)
-	err = hb.announce()
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateKeepAliveWait)
-	c.Assert(hb.nextKeepAlive, check.Equals, clock.Now().UTC().Add(hb.KeepAlivePeriod))
-
-	// in case of any error while sending keep alive, system should fail
-	// and go back to init state
-	announcer.keepAlivesC = make(chan services.KeepAlive)
-	announcer.err = trace.ConnectionProblem(nil, "ooops")
-	announcer.Close()
-	clock.Advance(hb.KeepAlivePeriod + time.Second)
-	err = hb.fetch()
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateKeepAlive)
-	err = hb.announce()
-	fixtures.ExpectConnectionProblem(c, err)
-	c.Assert(hb.state, check.Equals, HeartbeatStateInit)
-	c.Assert(announcer.upsertCalls[hb.Mode], check.Equals, 2)
-
-	// on the next run, system will try to reannounce
-	announcer.err = nil
-	err = hb.fetch()
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateAnnounce)
-	err = hb.announce()
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateKeepAliveWait)
-	c.Assert(announcer.upsertCalls[hb.Mode], check.Equals, 3)
-}
-
-func (s *HeartbeatSuite) heartbeatAnnounce(c *check.C, mode HeartbeatMode, kind string) {
-	ctx, cancel := context.WithCancel(context.TODO())
-	defer cancel()
-	clock := clockwork.NewFakeClock()
-
-	announcer := newFakeAnnouncer(ctx)
-	hb, err := NewHeartbeat(HeartbeatConfig{
-		Context:         ctx,
-		Mode:            mode,
-		Component:       "test",
-		Announcer:       announcer,
-		CheckPeriod:     time.Second,
-		AnnouncePeriod:  60 * time.Second,
-		KeepAlivePeriod: 10 * time.Second,
-		ServerTTL:       600 * time.Second,
-		Clock:           clock,
-		GetServerInfo: func() (services.Server, error) {
-			srv := &services.ServerV2{
-				Kind:    kind,
-				Version: services.V2,
-				Metadata: services.Metadata{
-					Namespace: defaults.Namespace,
-					Name:      "1",
-				},
-				Spec: services.ServerSpecV2{
-					Addr:     "127.0.0.1:1234",
-					Hostname: "2",
-				},
-			}
-			srv.SetTTL(clock, defaults.ServerAnnounceTTL)
-			return srv, nil
-		},
-	})
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateInit)
-
-	// on the first run, heartbeat will move to announce state,
-	// will call announce right away
-	err = hb.fetch()
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateAnnounce)
-
-	err = hb.announce()
-	c.Assert(err, check.IsNil)
-	c.Assert(announcer.upsertCalls[hb.Mode], check.Equals, 1)
-	c.Assert(hb.state, check.Equals, HeartbeatStateAnnounceWait)
-	c.Assert(hb.nextAnnounce, check.Equals, clock.Now().UTC().Add(hb.AnnouncePeriod))
-
-	// next call will not move to announce, because time is not up yet
-	err = hb.fetchAndAnnounce()
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateAnnounceWait)
-
-	// advance time, and heartbeat will move to announce
-	clock.Advance(hb.AnnouncePeriod * time.Second)
-	err = hb.fetch()
-	c.Assert(err, check.IsNil)
-	c.Assert(hb.state, check.Equals, HeartbeatStateAnnounce)
-	err = hb.announce()
-	c.Assert(err, check.IsNil)
-	c.Assert(announcer.upsertCalls[hb.Mode], check.Equals, 2)
-	c.Assert(hb.state, check.Equals, HeartbeatStateAnnounceWait)
-	c.Assert(hb.nextAnnounce, check.Equals, clock.Now().UTC().Add(hb.AnnouncePeriod))
-
-	// in case of error, system will move to announce wait state,
-	// with next attempt scheduled on the next keep alive period
-	announcer.err = trace.ConnectionProblem(nil, "boom")
-	clock.Advance(hb.AnnouncePeriod + time.Second)
-	err = hb.fetchAndAnnounce()
-	c.Assert(announcer.upsertCalls[hb.Mode], check.Equals, 3)
-	fixtures.ExpectConnectionProblem(c, err)
-	c.Assert(hb.state, check.Equals, HeartbeatStateAnnounceWait)
-	c.Assert(hb.nextAnnounce, check.Equals, clock.Now().UTC().Add(hb.KeepAlivePeriod))
-
-	// once announce is successful, next announce is set on schedule
-	announcer.err = nil
-	clock.Advance(hb.KeepAlivePeriod + time.Second)
-	err = hb.fetchAndAnnounce()
-	c.Assert(err, check.IsNil)
-	c.Assert(announcer.upsertCalls[hb.Mode], check.Equals, 4)
-	c.Assert(hb.state, check.Equals, HeartbeatStateAnnounceWait)
-	c.Assert(hb.nextAnnounce, check.Equals, clock.Now().UTC().Add(hb.AnnouncePeriod))
 }
 
 func newFakeAnnouncer(ctx context.Context) *fakeAnnouncer {
@@ -252,7 +295,7 @@ func newFakeAnnouncer(ctx context.Context) *fakeAnnouncer {
 		upsertCalls: make(map[HeartbeatMode]int),
 		ctx:         ctx,
 		cancel:      cancel,
-		keepAlivesC: make(chan services.KeepAlive, 100),
+		keepAlivesC: make(chan types.KeepAlive, 100),
 	}
 }
 
@@ -262,33 +305,54 @@ type fakeAnnouncer struct {
 	closeCalls  int
 	ctx         context.Context
 	cancel      context.CancelFunc
-	keepAlivesC chan<- services.KeepAlive
+	keepAlivesC chan<- types.KeepAlive
 }
 
-func (f *fakeAnnouncer) UpsertNode(s services.Server) (*services.KeepAlive, error) {
-	f.upsertCalls[HeartbeatModeNode] += 1
+func (f *fakeAnnouncer) UpsertAppServer(ctx context.Context, s types.Server) (*types.KeepAlive, error) {
+	f.upsertCalls[HeartbeatModeApp]++
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &services.KeepAlive{}, nil
+	return &types.KeepAlive{}, nil
 }
 
-func (f *fakeAnnouncer) UpsertProxy(s services.Server) error {
-	f.upsertCalls[HeartbeatModeProxy] += 1
+func (f *fakeAnnouncer) UpsertDatabaseServer(ctx context.Context, s types.DatabaseServer) (*types.KeepAlive, error) {
+	f.upsertCalls[HeartbeatModeDB]++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &types.KeepAlive{}, nil
+}
+
+func (f *fakeAnnouncer) UpsertNode(ctx context.Context, s types.Server) (*types.KeepAlive, error) {
+	f.upsertCalls[HeartbeatModeNode]++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &types.KeepAlive{}, nil
+}
+
+func (f *fakeAnnouncer) UpsertProxy(s types.Server) error {
+	f.upsertCalls[HeartbeatModeProxy]++
 	return f.err
 }
 
-func (f *fakeAnnouncer) UpsertAuthServer(s services.Server) error {
-	f.upsertCalls[HeartbeatModeAuth] += 1
+func (f *fakeAnnouncer) UpsertAuthServer(s types.Server) error {
+	f.upsertCalls[HeartbeatModeAuth]++
 	return f.err
 }
 
-func (f *fakeAnnouncer) NewKeepAliver(ctx context.Context) (services.KeepAliver, error) {
+func (f *fakeAnnouncer) UpsertKubeService(ctx context.Context, s types.Server) error {
+	f.upsertCalls[HeartbeatModeKube]++
+	return f.err
+}
+
+func (f *fakeAnnouncer) NewKeepAliver(ctx context.Context) (types.KeepAliver, error) {
 	return f, f.err
 }
 
 // KeepAlives allows to receive keep alives
-func (f *fakeAnnouncer) KeepAlives() chan<- services.KeepAlive {
+func (f *fakeAnnouncer) KeepAlives() chan<- types.KeepAlive {
 	return f.keepAlivesC
 }
 
@@ -300,7 +364,7 @@ func (f *fakeAnnouncer) Done() <-chan struct{} {
 // Close closes the watcher and releases
 // all associated resources
 func (f *fakeAnnouncer) Close() error {
-	f.closeCalls += 1
+	f.closeCalls++
 	f.cancel()
 	return nil
 }

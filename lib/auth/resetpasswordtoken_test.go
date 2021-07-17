@@ -18,98 +18,83 @@ package auth
 
 import (
 	"context"
+	"testing"
 	"time"
 
-	authority "github.com/gravitational/teleport/lib/auth/testauthority"
-	"github.com/gravitational/teleport/lib/backend"
-	"github.com/gravitational/teleport/lib/backend/lite"
-	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/require"
 
-	"gopkg.in/check.v1"
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/types"
+	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/services"
 )
 
-type ResetPasswordTokenTest struct {
-	bk backend.Backend
-	a  *AuthServer
-}
+func TestCreateResetPasswordToken(t *testing.T) {
+	srv := newTestTLSServer(t)
+	mockEmitter := &events.MockEmitter{}
+	srv.Auth().emitter = mockEmitter
 
-var _ = check.Suite(&ResetPasswordTokenTest{})
-
-func (s *ResetPasswordTokenTest) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests()
-}
-
-func (s *ResetPasswordTokenTest) SetUpTest(c *check.C) {
-	var err error
-	c.Assert(err, check.IsNil)
-	s.bk, err = lite.New(context.TODO(), backend.Params{"path": c.MkDir()})
-	c.Assert(err, check.IsNil)
-
-	// set cluster name
-	clusterName, err := services.NewClusterName(services.ClusterNameSpecV2{
-		ClusterName: "me.localhost",
-	})
-	c.Assert(err, check.IsNil)
-	authConfig := &InitConfig{
-		ClusterName:            clusterName,
-		Backend:                s.bk,
-		Authority:              authority.New(),
-		SkipPeriodicOperations: true,
-	}
-	s.a, err = NewAuthServer(authConfig)
-	c.Assert(err, check.IsNil)
-
-	err = s.a.SetClusterName(clusterName)
-	c.Assert(err, check.IsNil)
-
-	// Set services.ClusterConfig to disallow local auth.
-	clusterConfig, err := services.NewClusterConfig(services.ClusterConfigSpecV3{
-		LocalAuth: services.NewBool(true),
-	})
-	c.Assert(err, check.IsNil)
-
-	err = s.a.SetClusterConfig(clusterConfig)
-	c.Assert(err, check.IsNil)
-}
-
-func (s *ResetPasswordTokenTest) TestCreateResetPasswordToken(c *check.C) {
 	username := "joe@example.com"
 	pass := "pass123"
-	_, _, err := CreateUserAndRole(s.a, username, []string{username})
-	c.Assert(err, check.IsNil)
+	_, _, err := CreateUserAndRole(srv.Auth(), username, []string{username})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// Add several MFA devices.
+	mfaDev, err := services.NewTOTPDevice("otp1", "secret", srv.Clock().Now())
+	require.NoError(t, err)
+	err = srv.Auth().UpsertMFADevice(ctx, username, mfaDev)
+	require.NoError(t, err)
+	mfaDev, err = services.NewTOTPDevice("otp2", "secret", srv.Clock().Now())
+	require.NoError(t, err)
+	err = srv.Auth().UpsertMFADevice(ctx, username, mfaDev)
+	require.NoError(t, err)
 
 	req := CreateResetPasswordTokenRequest{
 		Name: username,
 		TTL:  time.Hour,
 	}
 
-	token, err := s.a.CreateResetPasswordToken(context.TODO(), req)
-	c.Assert(err, check.IsNil)
-	c.Assert(token.GetUser(), check.Equals, username)
-	c.Assert(token.GetURL(), check.Equals, "https://<proxyhost>:3080/web/reset/"+token.GetName())
+	token, err := srv.Auth().CreateResetPasswordToken(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, token.GetUser(), username)
+	require.Equal(t, token.GetURL(), "https://<proxyhost>:3080/web/reset/"+token.GetName())
+
+	event := mockEmitter.LastEvent()
+	require.Equal(t, event.GetType(), events.ResetPasswordTokenCreateEvent)
+	require.Equal(t, event.(*apievents.ResetPasswordTokenCreate).Name, "joe@example.com")
+	require.Equal(t, event.(*apievents.ResetPasswordTokenCreate).User, teleport.UserSystem)
+
+	// verify that user has no MFA devices
+	devs, err := srv.Auth().GetMFADevices(ctx, username)
+	require.NoError(t, err)
+	require.Empty(t, devs)
 
 	// verify that password was reset
-	err = s.a.CheckPasswordWOToken(username, []byte(pass))
-	c.Assert(err, check.NotNil)
+	err = srv.Auth().checkPasswordWOToken(username, []byte(pass))
+	require.Error(t, err)
 
 	// create another reset token for the same user
-	token, err = s.a.CreateResetPasswordToken(context.TODO(), req)
-	c.Assert(err, check.IsNil)
+	token, err = srv.Auth().CreateResetPasswordToken(ctx, req)
+	require.NoError(t, err)
 
 	// previous token must be deleted
-	tokens, err := s.a.GetResetPasswordTokens(context.TODO())
-	c.Assert(err, check.IsNil)
-	c.Assert(len(tokens), check.Equals, 1)
-	c.Assert(tokens[0].GetName(), check.Equals, token.GetName())
+	tokens, err := srv.Auth().GetResetPasswordTokens(ctx)
+	require.NoError(t, err)
+	require.Len(t, tokens, 1)
+	require.Equal(t, tokens[0].GetName(), token.GetName())
 }
 
-func (s *ResetPasswordTokenTest) TestCreateResetPasswordTokenErrors(c *check.C) {
+func TestCreateResetPasswordTokenErrors(t *testing.T) {
+	srv := newTestTLSServer(t)
+
 	username := "joe@example.com"
-	_, _, err := CreateUserAndRole(s.a, username, []string{username})
-	c.Assert(err, check.IsNil)
+	_, _, err := CreateUserAndRole(srv.Auth(), username, []string{username})
+	require.NoError(t, err)
 
 	type testCase struct {
 		desc string
@@ -155,19 +140,21 @@ func (s *ResetPasswordTokenTest) TestCreateResetPasswordTokenErrors(c *check.C) 
 	}
 
 	for _, tc := range testCases {
-		_, err := s.a.CreateResetPasswordToken(context.TODO(), tc.req)
-		c.Assert(err, check.NotNil, check.Commentf("test case %q", tc.desc))
+		t.Run(tc.desc, func(t *testing.T) {
+			_, err := srv.Auth().CreateResetPasswordToken(context.TODO(), tc.req)
+			require.Error(t, err)
+		})
 	}
 }
 
 // TestFormatAccountName makes sure that the OTP account name fallback values
 // are correct. description
-func (s *ResetPasswordTokenTest) TestFormatAccountName(c *check.C) {
+func TestFormatAccountName(t *testing.T) {
 	tests := []struct {
 		description    string
 		inDebugAuth    *debugAuth
 		outAccountName string
-		outError       bool
+		outError       require.ErrorAssertionFunc
 	}{
 		{
 			description: "failed to fetch proxies",
@@ -175,14 +162,14 @@ func (s *ResetPasswordTokenTest) TestFormatAccountName(c *check.C) {
 				proxiesError: true,
 			},
 			outAccountName: "",
-			outError:       true,
+			outError:       require.Error,
 		},
 		{
 			description: "proxies with public address",
 			inDebugAuth: &debugAuth{
-				proxies: []services.Server{
-					&services.ServerV2{
-						Spec: services.ServerSpecV2{
+				proxies: []types.Server{
+					&types.ServerV2{
+						Spec: types.ServerSpecV2{
 							PublicAddr: "foo",
 							Version:    "bar",
 						},
@@ -190,14 +177,14 @@ func (s *ResetPasswordTokenTest) TestFormatAccountName(c *check.C) {
 				},
 			},
 			outAccountName: "foo@foo",
-			outError:       false,
+			outError:       require.NoError,
 		},
 		{
 			description: "proxies with no public address",
 			inDebugAuth: &debugAuth{
-				proxies: []services.Server{
-					&services.ServerV2{
-						Spec: services.ServerSpecV2{
+				proxies: []types.Server{
+					&types.ServerV2{
+						Spec: types.ServerSpecV2{
 							Hostname: "baz",
 							Version:  "quxx",
 						},
@@ -205,7 +192,7 @@ func (s *ResetPasswordTokenTest) TestFormatAccountName(c *check.C) {
 				},
 			},
 			outAccountName: "foo@baz:3080",
-			outError:       false,
+			outError:       require.NoError,
 		},
 		{
 			description: "no proxies, with domain name",
@@ -213,29 +200,31 @@ func (s *ResetPasswordTokenTest) TestFormatAccountName(c *check.C) {
 				clusterName: "example.com",
 			},
 			outAccountName: "foo@example.com",
-			outError:       false,
+			outError:       require.NoError,
 		},
 		{
 			description:    "no proxies, no domain name",
 			inDebugAuth:    &debugAuth{},
 			outAccountName: "foo@00000000-0000-0000-0000-000000000000",
-			outError:       false,
+			outError:       require.NoError,
 		},
 	}
 	for _, tt := range tests {
-		accountName, err := formatAccountName(tt.inDebugAuth, "foo", "00000000-0000-0000-0000-000000000000")
-		c.Assert(err != nil, check.Equals, tt.outError, check.Commentf("Test case: %q.", tt.description))
-		c.Assert(accountName, check.Equals, tt.outAccountName, check.Commentf("Test case: %q.", tt.description))
+		t.Run(tt.description, func(t *testing.T) {
+			accountName, err := formatAccountName(tt.inDebugAuth, "foo", "00000000-0000-0000-0000-000000000000")
+			tt.outError(t, err)
+			require.Equal(t, accountName, tt.outAccountName)
+		})
 	}
 }
 
 type debugAuth struct {
-	proxies      []services.Server
+	proxies      []types.Server
 	proxiesError bool
 	clusterName  string
 }
 
-func (s *debugAuth) GetProxies() ([]services.Server, error) {
+func (s *debugAuth) GetProxies() ([]types.Server, error) {
 	if s.proxiesError {
 		return nil, trace.BadParameter("failed to fetch proxies")
 	}

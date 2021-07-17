@@ -17,12 +17,8 @@ limitations under the License.
 package srv
 
 import (
-	"fmt"
 	"os"
 	"os/user"
-	"testing"
-
-	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
 
@@ -33,22 +29,13 @@ type TermSuite struct {
 }
 
 var _ = check.Suite(&TermSuite{})
-var _ = testing.Verbose
-var _ = fmt.Printf
-
-func (s *TermSuite) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests(testing.Verbose())
-}
-func (s *TermSuite) TearDownSuite(c *check.C) {}
-func (s *TermSuite) SetUpTest(c *check.C)     {}
-func (s *TermSuite) TearDownTest(c *check.C)  {}
 
 func (s *TermSuite) TestGetOwner(c *check.C) {
 	tests := []struct {
 		inUserLookup  LookupUser
 		inGroupLookup LookupGroup
-		outUid        int
-		outGid        int
+		outUID        int
+		outGID        int
 		outMode       os.FileMode
 	}{
 		// Group "tty" exists.
@@ -64,8 +51,8 @@ func (s *TermSuite) TestGetOwner(c *check.C) {
 					Gid: "5",
 				}, nil
 			},
-			outUid:  1000,
-			outGid:  5,
+			outUID:  1000,
+			outGID:  5,
 			outMode: 0600,
 		},
 		// Group "tty" does not exist.
@@ -79,8 +66,8 @@ func (s *TermSuite) TestGetOwner(c *check.C) {
 			inGroupLookup: func(s string) (*user.Group, error) {
 				return &user.Group{}, trace.BadParameter("")
 			},
-			outUid:  1000,
-			outGid:  1000,
+			outUID:  1000,
+			outGID:  1000,
 			outMode: 0620,
 		},
 	}
@@ -89,8 +76,8 @@ func (s *TermSuite) TestGetOwner(c *check.C) {
 		uid, gid, mode, err := getOwner("", tt.inUserLookup, tt.inGroupLookup)
 		c.Assert(err, check.IsNil)
 
-		c.Assert(uid, check.Equals, tt.outUid)
-		c.Assert(gid, check.Equals, tt.outGid)
+		c.Assert(uid, check.Equals, tt.outUID)
+		c.Assert(gid, check.Equals, tt.outGID)
 		c.Assert(mode, check.Equals, tt.outMode)
 	}
 }

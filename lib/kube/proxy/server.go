@@ -18,13 +18,20 @@ package proxy
 
 import (
 	"crypto/tls"
+	"math"
 	"net"
 	"net/http"
+	"sync"
 
 	"github.com/gravitational/teleport"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/limiter"
+	"github.com/gravitational/teleport/lib/multiplexer"
+	"github.com/gravitational/teleport/lib/srv"
+	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
 	log "github.com/sirupsen/logrus"
@@ -37,11 +44,11 @@ type TLSServerConfig struct {
 	// TLS is a base TLS configuration
 	TLS *tls.Config
 	// LimiterConfig is limiter config
-	LimiterConfig limiter.LimiterConfig
+	LimiterConfig limiter.Config
 	// AccessPoint is caching access point
 	AccessPoint auth.AccessPoint
-	// Component is used for debugging purposes
-	Component string
+	// OnHeartbeat is a callback for kubernetes_service heartbeats.
+	OnHeartbeat func(error)
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -73,6 +80,10 @@ type TLSServer struct {
 	*http.Server
 	// TLSServerConfig is TLS server configuration used for auth server
 	TLSServerConfig
+	fwd       *Forwarder
+	mu        sync.Mutex
+	listener  net.Listener
+	heartbeat *srv.Heartbeat
 }
 
 // NewTLSServer returns new unstarted TLS server
@@ -93,7 +104,7 @@ func NewTLSServer(cfg TLSServerConfig) (*TLSServer, error) {
 	// authMiddleware authenticates request assuming TLS client authentication
 	// adds authentication information to the context
 	// and passes it to the API server
-	authMiddleware := &auth.AuthMiddleware{
+	authMiddleware := &auth.Middleware{
 		AccessPoint:   cfg.AccessPoint,
 		AcceptedUsage: []string{teleport.UsageKubeOnly},
 	}
@@ -104,19 +115,81 @@ func NewTLSServer(cfg TLSServerConfig) (*TLSServer, error) {
 	cfg.TLS.ClientAuth = tls.VerifyClientCertIfGiven
 
 	server := &TLSServer{
+		fwd:             fwd,
 		TLSServerConfig: cfg,
 		Server: &http.Server{
 			Handler:           limiter,
-			ReadHeaderTimeout: defaults.DefaultDialTimeout * 2,
+			ReadHeaderTimeout: apidefaults.DefaultDialTimeout * 2,
 		},
 	}
 	server.TLS.GetConfigForClient = server.GetConfigForClient
+
+	// Start the heartbeat to announce kubernetes_service presence.
+	//
+	// Only announce when running in an actual kubernetes_service, or when
+	// running in proxy_service with local kube credentials. This means that
+	// proxy_service will pretend to also be kubernetes_service.
+	if cfg.KubeServiceType == KubeService ||
+		(cfg.KubeServiceType == LegacyProxyService && len(fwd.kubeClusters()) > 0) {
+		log.Debugf("Starting kubernetes_service heartbeats for %q", cfg.Component)
+		server.heartbeat, err = srv.NewHeartbeat(srv.HeartbeatConfig{
+			Mode:            srv.HeartbeatModeKube,
+			Context:         cfg.Context,
+			Component:       cfg.Component,
+			Announcer:       cfg.AuthClient,
+			GetServerInfo:   server.GetServerInfo,
+			KeepAlivePeriod: apidefaults.ServerKeepAliveTTL,
+			AnnouncePeriod:  apidefaults.ServerAnnounceTTL/2 + utils.RandomDuration(apidefaults.ServerAnnounceTTL/10),
+			ServerTTL:       apidefaults.ServerAnnounceTTL,
+			CheckPeriod:     defaults.HeartbeatCheckPeriod,
+			Clock:           cfg.Clock,
+			OnHeartbeat:     cfg.OnHeartbeat,
+		})
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+	} else {
+		log.Debug("No local kube credentials on proxy, will not start kubernetes_service heartbeats")
+	}
+
 	return server, nil
 }
 
 // Serve takes TCP listener, upgrades to TLS using config and starts serving
 func (t *TLSServer) Serve(listener net.Listener) error {
-	return t.Server.Serve(tls.NewListener(listener, t.TLS))
+	// Wrap listener with a multiplexer to get Proxy Protocol support.
+	mux, err := multiplexer.New(multiplexer.Config{
+		Context:             t.Context,
+		Listener:            listener,
+		Clock:               t.Clock,
+		EnableProxyProtocol: true,
+		DisableSSH:          true,
+		ID:                  t.Component,
+	})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	go mux.Serve()
+	defer mux.Close()
+
+	t.mu.Lock()
+	t.listener = mux.TLS()
+	t.mu.Unlock()
+
+	if t.heartbeat != nil {
+		go t.heartbeat.Run()
+	}
+
+	return t.Server.Serve(tls.NewListener(mux.TLS(), t.TLS))
+}
+
+// Close closes the server and cleans up all resources.
+func (t *TLSServer) Close() error {
+	errs := []error{t.Server.Close()}
+	if t.heartbeat != nil {
+		errs = append(errs, t.heartbeat.Close())
+	}
+	return trace.NewAggregate(errs...)
 }
 
 // GetConfigForClient is getting called on every connection
@@ -126,6 +199,7 @@ func (t *TLSServer) GetConfigForClient(info *tls.ClientHelloInfo) (*tls.Config, 
 	var clusterName string
 	var err error
 	if info.ServerName != "" {
+		// Newer clients will set SNI that encodes the cluster name.
 		clusterName, err = auth.DecodeClusterName(info.ServerName)
 		if err != nil {
 			if !trace.IsNotFound(err) {
@@ -140,7 +214,75 @@ func (t *TLSServer) GetConfigForClient(info *tls.ClientHelloInfo) (*tls.Config, 
 		// this falls back to the default config
 		return nil, nil
 	}
+
+	// Per https://tools.ietf.org/html/rfc5246#section-7.4.4 the total size of
+	// the known CA subjects sent to the client can't exceed 2^16-1 (due to
+	// 2-byte length encoding). The crypto/tls stack will panic if this
+	// happens.
+	//
+	// This usually happens on the root cluster with a very large (>500) number
+	// of leaf clusters. In these cases, the client cert will be signed by the
+	// current (root) cluster.
+	//
+	// If the number of CAs turns out too large for the handshake, drop all but
+	// the current cluster CA. In the unlikely case where it's wrong, the
+	// client will be rejected.
+	var totalSubjectsLen int64
+	for _, s := range pool.Subjects() {
+		// Each subject in the list gets a separate 2-byte length prefix.
+		totalSubjectsLen += 2
+		totalSubjectsLen += int64(len(s))
+	}
+	if totalSubjectsLen >= int64(math.MaxUint16) {
+		log.Debugf("number of CAs in client cert pool is too large (%d) and cannot be encoded in a TLS handshake; this is due to a large number of trusted clusters; will use only the CA of the current cluster to validate", len(pool.Subjects()))
+
+		pool, err = auth.ClientCertPool(t.AccessPoint, t.ClusterName)
+		if err != nil {
+			log.Errorf("failed to retrieve client pool: %v", trace.DebugReport(err))
+			// this falls back to the default config
+			return nil, nil
+		}
+	}
+
 	tlsCopy := t.TLS.Clone()
 	tlsCopy.ClientCAs = pool
 	return tlsCopy, nil
+}
+
+// GetServerInfo returns a services.Server object for heartbeats (aka
+// presence).
+func (t *TLSServer) GetServerInfo() (types.Resource, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var addr string
+	if t.listener != nil {
+		addr = t.listener.Addr().String()
+	}
+
+	// Both proxy and kubernetes services can run in the same instance (same
+	// ServerID). Add a name suffix to make them distinct.
+	//
+	// Note: we *don't* want to add suffix for kubernetes_service!
+	// This breaks reverse tunnel routing, which uses server.Name.
+	name := t.ServerID
+	if t.KubeServiceType != KubeService {
+		name += "-proxy_service"
+	}
+
+	srv := &types.ServerV2{
+		Kind:    types.KindKubeService,
+		Version: types.V2,
+		Metadata: types.Metadata{
+			Name:      name,
+			Namespace: t.Namespace,
+		},
+		Spec: types.ServerSpecV2{
+			Addr:               addr,
+			Version:            teleport.Version,
+			KubernetesClusters: t.fwd.kubeClusters(),
+		},
+	}
+	srv.SetExpiry(t.Clock.Now().UTC().Add(apidefaults.ServerAnnounceTTL))
+	return srv, nil
 }

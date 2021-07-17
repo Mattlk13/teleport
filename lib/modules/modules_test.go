@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Gravitational, Inc.
+Copyright 2017-2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,101 +14,83 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package modules
+package modules_test
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
-	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/modules"
 
-	"github.com/gravitational/trace"
-	check "gopkg.in/check.v1"
+	"github.com/stretchr/testify/require"
 )
 
-func TestModules(t *testing.T) { check.TestingT(t) }
+func TestOSSModules(t *testing.T) {
+	require.False(t, modules.GetModules().IsBoringBinary())
+	require.Equal(t, modules.BuildOSS, modules.GetModules().BuildType())
+}
 
-type ModulesSuite struct{}
-
-var _ = check.Suite(&ModulesSuite{})
-
-func (s *ModulesSuite) TestDefaultModules(c *check.C) {
-	err := GetModules().EmptyRolesHandler()
-	c.Assert(err, check.IsNil)
-
-	logins := GetModules().DefaultAllowedLogins()
-	c.Assert(logins, check.DeepEquals, []string{teleport.TraitInternalLoginsVariable})
-
-	kubeGroups := GetModules().DefaultKubeGroups()
-	c.Assert(kubeGroups, check.DeepEquals, []string{teleport.TraitInternalKubeGroupsVariable})
-
-	kubeUsers := GetModules().DefaultKubeUsers()
-	c.Assert(kubeUsers, check.DeepEquals, []string{teleport.TraitInternalKubeUsersVariable})
-
-	roles := GetModules().RolesFromLogins([]string{"root"})
-	c.Assert(roles, check.DeepEquals, []string{teleport.AdminRoleName})
-
-	traits := GetModules().TraitsFromLogins("alice", []string{"root"}, []string{"system:masters"}, []string{"alice@example.com"})
-	c.Assert(traits, check.DeepEquals, map[string][]string{
-		teleport.TraitLogins:     []string{"root"},
-		teleport.TraitKubeGroups: []string{"system:masters"},
-		teleport.TraitKubeUsers:  []string{"alice@example.com"},
+func TestValidateAuthPreferenceOnCloud(t *testing.T) {
+	ctx := context.Background()
+	testServer, err := auth.NewTestAuthServer(auth.TestAuthServerConfig{
+		Dir: t.TempDir(),
 	})
+	require.NoError(t, err)
 
-	isBoring := GetModules().IsBoringBinary()
-	c.Assert(isBoring, check.Equals, false)
+	setCloudFeatureFlag(t)
+
+	authPref := types.DefaultAuthPreference()
+	err = testServer.AuthServer.SetAuthPreference(ctx, authPref)
+	require.NoError(t, err)
+
+	authPref.SetSecondFactor(constants.SecondFactorOff)
+	err = testServer.AuthServer.SetAuthPreference(ctx, authPref)
+	require.EqualError(t, err, "cannot disable two-factor authentication on Cloud")
 }
 
-func (s *ModulesSuite) TestTestModules(c *check.C) {
-	SetModules(&testModules{})
+func TestValidateSessionRecordingConfigOnCloud(t *testing.T) {
+	ctx := context.Background()
 
-	err := GetModules().EmptyRolesHandler()
-	c.Assert(trace.IsNotFound(err), check.Equals, true)
+	testServer, err := auth.NewTestAuthServer(auth.TestAuthServerConfig{
+		Dir: t.TempDir(),
+	})
+	require.NoError(t, err)
 
-	logins := GetModules().DefaultAllowedLogins()
-	c.Assert(logins, check.DeepEquals, []string{"a", "b"})
+	setCloudFeatureFlag(t)
 
-	roles := GetModules().RolesFromLogins([]string{"root"})
-	c.Assert(roles, check.DeepEquals, []string{"root"})
+	recConfig := types.DefaultSessionRecordingConfig()
+	err = testServer.AuthServer.SetSessionRecordingConfig(ctx, recConfig)
+	require.NoError(t, err)
 
-	traits := GetModules().TraitsFromLogins("alice", []string{"root"}, []string{"system:masters"}, []string{"alice@example.com"})
-	c.Assert(traits, check.IsNil)
-
-	isBoring := GetModules().IsBoringBinary()
-	c.Assert(isBoring, check.Equals, true)
+	recConfig.SetMode(types.RecordAtProxy)
+	err = testServer.AuthServer.SetSessionRecordingConfig(ctx, recConfig)
+	require.EqualError(t, err, "cannot set proxy recording mode on Cloud")
 }
 
-type testModules struct{}
-
-func (p *testModules) EmptyRolesHandler() error {
-	return trace.NotFound("no roles specified")
+func setCloudFeatureFlag(t *testing.T) {
+	oldModules := modules.GetModules()
+	t.Cleanup(func() { modules.SetModules(oldModules) })
+	modules.SetModules(&cloudModules{})
 }
 
-func (p *testModules) DefaultAllowedLogins() []string {
-	return []string{"a", "b"}
+type cloudModules struct{}
+
+func (m cloudModules) Features() modules.Features {
+	return modules.Features{Cloud: true}
 }
 
-func (p *testModules) DefaultKubeUsers() []string {
-	return []string{"c", "d"}
+func (m *cloudModules) BuildType() string {
+	return modules.BuildEnterprise
 }
 
-func (p *testModules) DefaultKubeGroups() []string {
-	return []string{"kube:test"}
+func (m *cloudModules) PrintVersion() {
+	fmt.Println("Teleport Cloud")
 }
 
-func (p *testModules) SupportsKubernetes() bool {
-	return true
-}
-
-func (p *testModules) PrintVersion() {}
-
-func (p *testModules) RolesFromLogins(logins []string) []string {
-	return logins
-}
-
-func (p *testModules) TraitsFromLogins(user string, logins, kubeGroups, kubeUsers []string) map[string][]string {
-	return nil
-}
-
-func (p *testModules) IsBoringBinary() bool {
-	return true
+func (m *cloudModules) IsBoringBinary() bool {
+	return false
 }

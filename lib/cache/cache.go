@@ -18,10 +18,12 @@ package cache
 
 import (
 	"context"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/gravitational/teleport"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/services"
@@ -31,24 +33,44 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	log "github.com/sirupsen/logrus"
+	"go.uber.org/atomic"
 )
+
+func tombstoneKey() []byte {
+	return backend.Key("cache", teleport.Version, "tombstone", "ok")
+}
 
 // ForAuth sets up watch configuration for the auth server
 func ForAuth(cfg Config) Config {
-	cfg.Watches = []services.WatchKind{
-		{Kind: services.KindCertAuthority, LoadSecrets: true},
-		{Kind: services.KindClusterName},
-		{Kind: services.KindClusterConfig},
-		{Kind: services.KindStaticTokens},
-		{Kind: services.KindToken},
-		{Kind: services.KindUser},
-		{Kind: services.KindRole},
-		{Kind: services.KindNamespace},
-		{Kind: services.KindNode},
-		{Kind: services.KindProxy},
-		{Kind: services.KindReverseTunnel},
-		{Kind: services.KindTunnelConnection},
-		{Kind: services.KindAccessRequest},
+	cfg.target = "auth"
+	cfg.Watches = []types.WatchKind{
+		{Kind: types.KindCertAuthority, LoadSecrets: true},
+		{Kind: types.KindClusterName},
+		{Kind: types.KindClusterConfig},
+		{Kind: types.KindClusterAuditConfig},
+		{Kind: types.KindClusterNetworkingConfig},
+		{Kind: types.KindClusterAuthPreference},
+		{Kind: types.KindSessionRecordingConfig},
+		{Kind: types.KindStaticTokens},
+		{Kind: types.KindToken},
+		{Kind: types.KindUser},
+		{Kind: types.KindRole},
+		{Kind: types.KindNamespace},
+		{Kind: types.KindNode},
+		{Kind: types.KindProxy},
+		{Kind: types.KindAuthServer},
+		{Kind: types.KindReverseTunnel},
+		{Kind: types.KindTunnelConnection},
+		{Kind: types.KindAccessRequest},
+		{Kind: types.KindAppServer},
+		{Kind: types.KindWebSession, SubKind: types.KindAppSession},
+		{Kind: types.KindWebSession, SubKind: types.KindWebSession},
+		{Kind: types.KindWebToken},
+		{Kind: types.KindRemoteCluster},
+		{Kind: types.KindKubeService},
+		{Kind: types.KindDatabaseServer},
+		{Kind: types.KindLock},
+		{Kind: types.KindNetworkRestrictions},
 	}
 	cfg.QueueSize = defaults.AuthQueueSize
 	return cfg
@@ -56,18 +78,88 @@ func ForAuth(cfg Config) Config {
 
 // ForProxy sets up watch configuration for proxy
 func ForProxy(cfg Config) Config {
-	cfg.Watches = []services.WatchKind{
-		{Kind: services.KindCertAuthority, LoadSecrets: false},
-		{Kind: services.KindClusterName},
-		{Kind: services.KindClusterConfig},
-		{Kind: services.KindUser},
-		{Kind: services.KindRole},
-		{Kind: services.KindNamespace},
-		{Kind: services.KindNode},
-		{Kind: services.KindProxy},
-		{Kind: services.KindAuthServer},
-		{Kind: services.KindReverseTunnel},
-		{Kind: services.KindTunnelConnection},
+	cfg.target = "proxy"
+	cfg.Watches = []types.WatchKind{
+		{Kind: types.KindCertAuthority, LoadSecrets: false},
+		{Kind: types.KindClusterName},
+		{Kind: types.KindClusterConfig},
+		{Kind: types.KindClusterAuditConfig},
+		{Kind: types.KindClusterNetworkingConfig},
+		{Kind: types.KindClusterAuthPreference},
+		{Kind: types.KindSessionRecordingConfig},
+		{Kind: types.KindUser},
+		{Kind: types.KindRole},
+		{Kind: types.KindNamespace},
+		{Kind: types.KindNode},
+		{Kind: types.KindProxy},
+		{Kind: types.KindAuthServer},
+		{Kind: types.KindReverseTunnel},
+		{Kind: types.KindTunnelConnection},
+		{Kind: types.KindAppServer},
+		{Kind: types.KindWebSession, SubKind: types.KindAppSession},
+		{Kind: types.KindWebSession, SubKind: types.KindWebSession},
+		{Kind: types.KindWebToken},
+		{Kind: types.KindRemoteCluster},
+		{Kind: types.KindKubeService},
+		{Kind: types.KindDatabaseServer},
+		{Kind: types.KindLock},
+	}
+	cfg.QueueSize = defaults.ProxyQueueSize
+	return cfg
+}
+
+// ForRemoteProxy sets up watch configuration for remote proxies.
+func ForRemoteProxy(cfg Config) Config {
+	cfg.target = "remote-proxy"
+	cfg.Watches = []types.WatchKind{
+		{Kind: types.KindCertAuthority, LoadSecrets: false},
+		{Kind: types.KindClusterName},
+		{Kind: types.KindClusterConfig},
+		{Kind: types.KindClusterAuditConfig},
+		{Kind: types.KindClusterNetworkingConfig},
+		{Kind: types.KindClusterAuthPreference},
+		{Kind: types.KindSessionRecordingConfig},
+		{Kind: types.KindUser},
+		{Kind: types.KindRole},
+		{Kind: types.KindNamespace},
+		{Kind: types.KindNode},
+		{Kind: types.KindProxy},
+		{Kind: types.KindAuthServer},
+		{Kind: types.KindReverseTunnel},
+		{Kind: types.KindTunnelConnection},
+		{Kind: types.KindAppServer},
+		{Kind: types.KindRemoteCluster},
+		{Kind: types.KindKubeService},
+		{Kind: types.KindDatabaseServer},
+	}
+	cfg.QueueSize = defaults.ProxyQueueSize
+	return cfg
+}
+
+// DELETE IN: 7.0
+//
+// ForOldRemoteProxy sets up watch configuration for older remote proxies.
+func ForOldRemoteProxy(cfg Config) Config {
+	cfg.target = "remote-proxy-old"
+	cfg.Watches = []types.WatchKind{
+		{Kind: types.KindCertAuthority, LoadSecrets: false},
+		{Kind: types.KindClusterName},
+		{Kind: types.KindClusterConfig},
+		{Kind: types.KindClusterAuditConfig},
+		{Kind: types.KindClusterNetworkingConfig},
+		{Kind: types.KindClusterAuthPreference},
+		{Kind: types.KindSessionRecordingConfig},
+		{Kind: types.KindUser},
+		{Kind: types.KindRole},
+		{Kind: types.KindNamespace},
+		{Kind: types.KindNode},
+		{Kind: types.KindProxy},
+		{Kind: types.KindAuthServer},
+		{Kind: types.KindReverseTunnel},
+		{Kind: types.KindTunnelConnection},
+		{Kind: types.KindAppServer},
+		{Kind: types.KindRemoteCluster},
+		{Kind: types.KindKubeService},
 	}
 	cfg.QueueSize = defaults.ProxyQueueSize
 	return cfg
@@ -75,18 +167,88 @@ func ForProxy(cfg Config) Config {
 
 // ForNode sets up watch configuration for node
 func ForNode(cfg Config) Config {
-	cfg.Watches = []services.WatchKind{
-		{Kind: services.KindCertAuthority, LoadSecrets: false},
-		{Kind: services.KindClusterName},
-		{Kind: services.KindClusterConfig},
-		{Kind: services.KindUser},
-		{Kind: services.KindRole},
+	cfg.target = "node"
+	cfg.Watches = []types.WatchKind{
+		{Kind: types.KindCertAuthority, LoadSecrets: false},
+		{Kind: types.KindClusterName},
+		{Kind: types.KindClusterConfig},
+		{Kind: types.KindClusterAuditConfig},
+		{Kind: types.KindClusterNetworkingConfig},
+		{Kind: types.KindClusterAuthPreference},
+		{Kind: types.KindSessionRecordingConfig},
+		{Kind: types.KindUser},
+		{Kind: types.KindRole},
+		{Kind: types.KindLock},
 		// Node only needs to "know" about default
 		// namespace events to avoid matching too much
 		// data about other namespaces or node events
-		{Kind: services.KindNamespace, Name: defaults.Namespace},
+		{Kind: types.KindNamespace, Name: apidefaults.Namespace},
+		{Kind: types.KindNetworkRestrictions},
 	}
 	cfg.QueueSize = defaults.NodeQueueSize
+	return cfg
+}
+
+// ForKubernetes sets up watch configuration for a kubernetes service.
+func ForKubernetes(cfg Config) Config {
+	cfg.target = "kube"
+	cfg.Watches = []types.WatchKind{
+		{Kind: types.KindCertAuthority, LoadSecrets: false},
+		{Kind: types.KindClusterName},
+		{Kind: types.KindClusterConfig},
+		{Kind: types.KindClusterAuditConfig},
+		{Kind: types.KindClusterNetworkingConfig},
+		{Kind: types.KindClusterAuthPreference},
+		{Kind: types.KindSessionRecordingConfig},
+		{Kind: types.KindUser},
+		{Kind: types.KindRole},
+		{Kind: types.KindNamespace, Name: apidefaults.Namespace},
+		{Kind: types.KindKubeService},
+	}
+	cfg.QueueSize = defaults.KubernetesQueueSize
+	return cfg
+}
+
+// ForApps sets up watch configuration for apps.
+func ForApps(cfg Config) Config {
+	cfg.target = "apps"
+	cfg.Watches = []types.WatchKind{
+		{Kind: types.KindCertAuthority, LoadSecrets: false},
+		{Kind: types.KindClusterName},
+		{Kind: types.KindClusterConfig},
+		{Kind: types.KindClusterAuditConfig},
+		{Kind: types.KindClusterNetworkingConfig},
+		{Kind: types.KindClusterAuthPreference},
+		{Kind: types.KindSessionRecordingConfig},
+		{Kind: types.KindUser},
+		{Kind: types.KindRole},
+		{Kind: types.KindProxy},
+		// Applications only need to "know" about default namespace events to avoid
+		// matching too much data about other namespaces or events.
+		{Kind: types.KindNamespace, Name: apidefaults.Namespace},
+	}
+	cfg.QueueSize = defaults.AppsQueueSize
+	return cfg
+}
+
+// ForDatabases sets up watch configuration for database proxy servers.
+func ForDatabases(cfg Config) Config {
+	cfg.Watches = []types.WatchKind{
+		{Kind: types.KindCertAuthority, LoadSecrets: false},
+		{Kind: types.KindClusterName},
+		{Kind: types.KindClusterConfig},
+		{Kind: types.KindClusterAuditConfig},
+		{Kind: types.KindClusterNetworkingConfig},
+		{Kind: types.KindClusterAuthPreference},
+		{Kind: types.KindSessionRecordingConfig},
+		{Kind: types.KindUser},
+		{Kind: types.KindRole},
+		{Kind: types.KindProxy},
+		// Databases only need to "know" about default namespace events to
+		// avoid matching too much data about other namespaces or events.
+		{Kind: types.KindNamespace, Name: apidefaults.Namespace},
+	}
+	cfg.QueueSize = defaults.DatabasesQueueSize
 	return cfg
 }
 
@@ -100,8 +262,39 @@ type SetupConfigFn func(c Config) Config
 // This which can be used if the upstream AccessPoint goes offline
 type Cache struct {
 	Config
+
 	// Entry is a logging entry
 	*log.Entry
+
+	// rw is used to prevent reads of invalid cache states.  From a
+	// memory-safety perspective, this RWMutex is just used to protect
+	// the `ok` field.  *However*, cache reads must hold the read lock
+	// for the duration of the read, not just when checking the `ok`
+	// field.  Since the write lock must be held in order to modify
+	// the `ok` field, this serves to ensure that all in-progress reads
+	// complete *before* a reset can begin.
+	rw sync.RWMutex
+	// ok indicates whether the cache is in a valid state for reads.
+	// If `ok` is `false`, reads are forwarded directly to the backend.
+	ok bool
+
+	// generation is a counter that is incremented each time a healthy
+	// state is established.  A generation of zero means that a healthy
+	// state was never established.  Note that a generation of zero does
+	// not preclude `ok` being true in the case that we have loaded a
+	// previously healthy state from the backend.
+	generation *atomic.Uint64
+
+	// initOnce protects initC and initErr.
+	initOnce sync.Once
+	// initC is closed on the first attempt to initialize the
+	// cache, whether or not it is successful.  Once initC
+	// has returned, initErr is safe to read.
+	initC chan struct{}
+	// initErr is set if the first attempt to initialize the cache
+	// fails.
+	initErr error
+
 	// wrapper is a wrapper around cache backend that
 	// allows to set backend into failure mode,
 	// intercepting all calls and returning errors instead
@@ -111,8 +304,8 @@ type Cache struct {
 	// cancel triggers exit context closure
 	cancel context.CancelFunc
 
-	// collections is a map of registered collections by resource Kind
-	collections map[string]collection
+	// collections is a map of registered collections by resource Kind/SubKind
+	collections map[resourceKind]collection
 
 	trustCache         services.Trust
 	clusterConfigCache services.ClusterConfiguration
@@ -121,21 +314,127 @@ type Cache struct {
 	accessCache        services.Access
 	dynamicAccessCache services.DynamicAccessExt
 	presenceCache      services.Presence
+	restrictionsCache  services.Restrictions
+	appSessionCache    services.AppSession
+	webSessionCache    types.WebSessionInterface
+	webTokenCache      types.WebTokenInterface
 	eventsFanout       *services.Fanout
 
-	// closedFlag is set to indicate that the services are closed
-	closedFlag int32
+	// closed indicates that the cache has been closed
+	closed *atomic.Bool
+}
+
+func (c *Cache) setInitError(err error) {
+	c.initOnce.Do(func() {
+		c.initErr = err
+		close(c.initC)
+	})
+}
+
+// setReadOK updates Cache.ok, which determines whether the
+// cache is accessible for reads.
+func (c *Cache) setReadOK(ok bool) {
+	if ok == c.getReadOK() {
+		return
+	}
+	c.rw.Lock()
+	defer c.rw.Unlock()
+	c.ok = ok
+}
+
+func (c *Cache) getReadOK() (ok bool) {
+	c.rw.RLock()
+	defer c.rw.RUnlock()
+	return c.ok
+}
+
+// read acquires the cache read lock and selects the appropriate
+// target for read operations.  The returned guard *must* be
+// released to prevent deadlocks.
+func (c *Cache) read() (readGuard, error) {
+	if c.closed.Load() {
+		return readGuard{}, trace.Errorf("cache is closed")
+	}
+	c.rw.RLock()
+	if c.ok {
+		return readGuard{
+			trust:         c.trustCache,
+			clusterConfig: c.clusterConfigCache,
+			provisioner:   c.provisionerCache,
+			users:         c.usersCache,
+			access:        c.accessCache,
+			dynamicAccess: c.dynamicAccessCache,
+			presence:      c.presenceCache,
+			restrictions:  c.restrictionsCache,
+			appSession:    c.appSessionCache,
+			webSession:    c.webSessionCache,
+			webToken:      c.webTokenCache,
+			release:       c.rw.RUnlock,
+		}, nil
+	}
+	c.rw.RUnlock()
+	return readGuard{
+		trust:         c.Config.Trust,
+		clusterConfig: c.Config.ClusterConfig,
+		provisioner:   c.Config.Provisioner,
+		users:         c.Config.Users,
+		access:        c.Config.Access,
+		dynamicAccess: c.Config.DynamicAccess,
+		presence:      c.Config.Presence,
+		restrictions:  c.Config.Restrictions,
+		appSession:    c.Config.AppSession,
+		webSession:    c.Config.WebSession,
+		webToken:      c.Config.WebToken,
+		release:       nil,
+	}, nil
+}
+
+// readGuard holds references to a "backend".  if the referenced
+// backed is the cache, then readGuard also holds the release
+// function for the read lock, and ensures that it is not
+// double-called.
+type readGuard struct {
+	trust         services.Trust
+	clusterConfig services.ClusterConfiguration
+	provisioner   services.Provisioner
+	users         services.UsersService
+	access        services.Access
+	dynamicAccess services.DynamicAccessCore
+	presence      services.Presence
+	appSession    services.AppSession
+	restrictions  services.Restrictions
+	webSession    types.WebSessionInterface
+	webToken      types.WebTokenInterface
+	release       func()
+	released      bool
+}
+
+// Release releases the read lock if it is held.  This method
+// can be called multiple times, but is not thread-safe.
+func (r *readGuard) Release() {
+	if r.release != nil && !r.released {
+		r.release()
+		r.released = true
+	}
+}
+
+// IsCacheRead checks if this readGuard holds a cache reference.
+func (r *readGuard) IsCacheRead() bool {
+	return r.release != nil
 }
 
 // Config defines cache configuration parameters
 type Config struct {
+	// target is an identifying string that allows errors to
+	// indicate the target presets used (e.g. "auth").
+	target string
 	// Context is context for parent operations
 	Context context.Context
 	// Watches provides a list of resources
 	// for the cache to watch
-	Watches []services.WatchKind
+	Watches []types.WatchKind
 	// Events provides events watchers
-	Events services.Events
+	Events types.Events
 	// Trust is a service providing information about certificate
 	// authorities
 	Trust services.Trust
@@ -148,16 +447,30 @@ type Config struct {
 	// Access is an access service
 	Access services.Access
 	// DynamicAccess is a dynamic access service
-	DynamicAccess services.DynamicAccess
+	DynamicAccess services.DynamicAccessCore
 	// Presence is a presence service
 	Presence services.Presence
+	// Restrictions is a restrictions service
+	Restrictions services.Restrictions
+	// AppSession holds application sessions.
+	AppSession services.AppSession
+	// WebSession holds regular web sessions.
+	WebSession types.WebSessionInterface
+	// WebToken holds web tokens.
+	WebToken types.WebTokenInterface
 	// Backend is a backend for local cache
 	Backend backend.Backend
 	// RetryPeriod is a period between cache retries on failures
 	RetryPeriod time.Duration
+	// WatcherInitTimeout is the maximum acceptable delay for an
+	// OpInit after a watcher has been started (default=1m).
+	WatcherInitTimeout time.Duration
+	// CacheInitTimeout is the maximum amount of time that cache.New
+	// will block, waiting for initialization (default=20s).
+	CacheInitTimeout time.Duration
 	// EventsC is a channel for event notifications,
 	// used in tests
-	EventsC chan CacheEvent
+	EventsC chan Event
 	// OnlyRecent configures cache behavior that always uses
 	// recent values, see OnlyRecent for details
 	OnlyRecent OnlyRecent
@@ -232,19 +545,25 @@ func (c *Config) CheckAndSetDefaults() error {
 	if c.RetryPeriod == 0 {
 		c.RetryPeriod = defaults.HighResPollingPeriod
 	}
+	if c.WatcherInitTimeout == 0 {
+		c.WatcherInitTimeout = time.Minute
+	}
+	if c.CacheInitTimeout == 0 {
+		c.CacheInitTimeout = time.Second * 20
+	}
 	if c.Component == "" {
 		c.Component = teleport.ComponentCache
 	}
 	return nil
 }
 
-// CacheEvent is event used in tests
-type CacheEvent struct {
+// Event is event used in tests
+type Event struct {
 	// Type is event type
 	Type string
 	// Event is event processed
 	// by the event cycle
-	Event services.Event
+	Event types.Event
 }
 
 const (
@@ -254,6 +573,9 @@ const (
 	WatcherStarted = "watcher_started"
 	// WatcherFailed is emitted when event watcher has failed
 	WatcherFailed = "watcher_failed"
+	// TombstoneWritten is emitted if cache is closed in a healthy
+	// state and successfully writes its tombstone.
+	TombstoneWritten = "tombstone_written"
 )
 
 // New creates a new instance of Cache
@@ -261,41 +583,102 @@ func New(config Config) (*Cache, error) {
 	if err := config.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	wrapper := backend.NewWrapper(config.Backend)
+
+	clusterConfigCache, err := local.NewClusterConfigurationService(wrapper)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	ctx, cancel := context.WithCancel(config.Context)
 	cs := &Cache{
 		wrapper:            wrapper,
 		ctx:                ctx,
 		cancel:             cancel,
 		Config:             config,
+		generation:         atomic.NewUint64(0),
+		initC:              make(chan struct{}),
 		trustCache:         local.NewCAService(wrapper),
-		clusterConfigCache: local.NewClusterConfigurationService(wrapper),
+		clusterConfigCache: clusterConfigCache,
 		provisionerCache:   local.NewProvisioningService(wrapper),
 		usersCache:         local.NewIdentityService(wrapper),
 		accessCache:        local.NewAccessService(wrapper),
 		dynamicAccessCache: local.NewDynamicAccessService(wrapper),
 		presenceCache:      local.NewPresenceService(wrapper),
+		restrictionsCache:  local.NewRestrictionsService(wrapper),
+		appSessionCache:    local.NewIdentityService(wrapper),
+		webSessionCache:    local.NewIdentityService(wrapper).WebSessions(),
+		webTokenCache:      local.NewIdentityService(wrapper).WebTokens(),
 		eventsFanout:       services.NewFanout(),
 		Entry: log.WithFields(log.Fields{
 			trace.Component: config.Component,
 		}),
+		closed: atomic.NewBool(false),
 	}
 	collections, err := setupCollections(cs, config.Watches)
 	if err != nil {
+		cs.Close()
 		return nil, trace.Wrap(err)
 	}
 	cs.collections = collections
 
-	err = cs.fetch(ctx)
-	if err != nil {
-		// "only recent" behavior does not tolerate
-		// stale data, so it has to initialize itself
-		// with recent data on startup or fail
-		if cs.OnlyRecent.Enabled {
-			return nil, trace.Wrap(err)
+	// if the ok tombstone is present, set the initial read state of the cache
+	// to ok. this tombstone's presence indicates that we are dealing with an
+	// on-disk cache produced by the same teleport version which gracefully shutdown
+	// while in an ok state.  We delete the tombstone rather than check for its
+	// presence to ensure self-healing in the event that the tombstone wasn't actually
+	// valid.  Note that setting the cache's read state to ok does not cause us to skip
+	// our normal init logic, it just means that reads against the local cache will
+	// be allowed in the event the init step fails before it starts applying.
+	// Note also that we aren't setting our event fanout system to an initialized state
+	// or incrementing the generation counter; this cache isn't so much "healthy" as it is
+	// "slightly preferable to an unreachable auth server".
+	err = cs.wrapper.Delete(ctx, tombstoneKey())
+	switch {
+	case err == nil:
+		if !cs.OnlyRecent.Enabled {
+			cs.setReadOK(true)
 		}
+	case trace.IsNotFound(err):
+		// do nothing
+	default:
+		cs.Close()
+		return nil, trace.Wrap(err)
 	}
-	go cs.update(ctx)
+
+	retry, err := utils.NewLinear(utils.LinearConfig{
+		Step: cs.Config.RetryPeriod / 10,
+		Max:  cs.Config.RetryPeriod,
+	})
+	if err != nil {
+		cs.Close()
+		return nil, trace.Wrap(err)
+	}
+
+	go cs.update(ctx, retry)
+
+	select {
+	case <-cs.initC:
+		if cs.initErr != nil && cs.OnlyRecent.Enabled {
+			cs.Close()
+			return nil, trace.Wrap(cs.initErr)
+		}
+		if cs.initErr == nil {
+			cs.Infof("Cache %q first init succeeded.", cs.Config.target)
+		} else {
+			cs.WithError(cs.initErr).Warnf("Cache %q first init failed, continuing re-init attempts in background.", cs.Config.target)
+		}
+	case <-ctx.Done():
+		cs.Close()
+		return nil, trace.Wrap(ctx.Err(), "context closed during cache init")
+	case <-time.After(cs.Config.CacheInitTimeout):
+		if cs.OnlyRecent.Enabled {
+			cs.Close()
+			return nil, trace.ConnectionProblem(nil, "timeout waiting for cache init")
+		}
+		cs.Warningf("Cache init is taking too long, will continue in background.")
+	}
 	return cs, nil
 }
 
@@ -304,65 +687,69 @@ func New(config Config) (*Cache, error) {
 // not the backend. This feature allows auth server
 // to handle subscribers connected to the in-memory caches
 // instead of reading from the backend.
-func (c *Cache) NewWatcher(ctx context.Context, watch services.Watch) (services.Watcher, error) {
+func (c *Cache) NewWatcher(ctx context.Context, watch types.Watch) (types.Watcher, error) {
+Outer:
+	for _, requested := range watch.Kinds {
+		for _, configured := range c.Config.Watches {
+			if requested.Kind == configured.Kind {
+				continue Outer
+			}
+		}
+		return nil, trace.BadParameter("cache %q does not support watching resource %q", c.Config.target, requested.Kind)
+	}
 	return c.eventsFanout.NewWatcher(ctx, watch)
 }
 
-func (c *Cache) isClosed() bool {
-	return atomic.LoadInt32(&c.closedFlag) == 1
-}
-
-func (c *Cache) setClosed() {
-	atomic.StoreInt32(&c.closedFlag, 1)
-}
-
-func (c *Cache) update(ctx context.Context) {
-	retry, err := utils.NewLinear(utils.LinearConfig{
-		Step: c.RetryPeriod / 10,
-		Max:  c.RetryPeriod,
-	})
-	if err != nil {
-		c.Errorf("Bad retry parameters: %v", err)
-		return
-	}
+func (c *Cache) update(ctx context.Context, retry utils.Retry) {
+	defer func() {
+		c.Debugf("Cache is closing, returning from update loop.")
+		// ensure that close operations have been run
+		c.Close()
+		// run tombstone operations in an orphaned context
+		tombCtx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		defer cancel()
+		c.writeTombstone(tombCtx)
+	}()
+	timer := time.NewTimer(c.Config.WatcherInitTimeout)
 	for {
-		err := c.fetchAndWatch(ctx, retry)
+		err := c.fetchAndWatch(ctx, retry, timer)
+		c.setInitError(err)
+		if c.isClosing() {
+			return
+		}
 		if err != nil {
-			c.setCacheState(err)
-			if !c.isClosed() {
-				c.Warningf("Re-init the cache on error: %v.", trace.Unwrap(err))
+			c.WithError(err).Warning("Re-init the cache on error.")
+			if c.OnlyRecent.Enabled {
+				c.setReadOK(false)
 			}
 		}
-		// if cache is reloading,
-		// all watchers will be out of sync, because
-		// cache will reload its own watcher to the backend,
-		// so signal closure to reset the watchers
-		c.eventsFanout.CloseWatchers()
 		// events cache should be closed as well
 		c.Debugf("Reloading %v.", retry)
 		select {
 		case <-retry.After():
 			retry.Inc()
 		case <-c.ctx.Done():
-			c.Debugf("Closed, returning from update loop.")
 			return
 		}
 	}
 }
 
-// setCacheState for "only recent" cache behavior will erase
-// the cache and set error mode to refuse to serve stale data,
-// otherwise does nothing
-func (c *Cache) setCacheState(err error) {
-	if !c.OnlyRecent.Enabled {
+// writeTombstone writes the cache tombstone.
+func (c *Cache) writeTombstone(ctx context.Context) {
+	if !c.getReadOK() || c.generation.Load() == 0 {
+		// state is unhealthy or was loaded from a previously
+		// entombed state; do nothing.
 		return
 	}
-	if err := c.eraseAll(); err != nil {
-		if !c.isClosed() {
-			c.Warningf("Failed to erase the data: %v.", err)
-		}
+	item := backend.Item{
+		Key:   tombstoneKey(),
+		Value: []byte("{}"),
 	}
-	c.wrapper.SetReadError(trace.ConnectionProblem(err, "cache is unavailable"))
+	if _, err := c.wrapper.Create(ctx, item); err != nil {
+		c.Warningf("Failed to set tombstone: %v", err)
+	} else {
+		c.notify(ctx, Event{Type: TombstoneWritten})
+	}
 }
 
 // setTTL overrides TTL supplied by the resource
@@ -370,7 +757,7 @@ func (c *Cache) setCacheState(err error) {
 // - for "only recent", does nothing
 // - for "prefer recent", honors TTL set on the resource, otherwise
 //   sets TTL to max TTL
-func (c *Cache) setTTL(r services.Resource) {
+func (c *Cache) setTTL(r types.Resource) {
 	if c.OnlyRecent.Enabled || (c.PreferRecent.Enabled && c.PreferRecent.NeverExpires) {
 		return
 	}
@@ -379,17 +766,17 @@ func (c *Cache) setTTL(r services.Resource) {
 		return
 	}
 	// set max TTL on the resources
-	r.SetTTL(c.Clock, c.PreferRecent.MaxTTL)
+	r.SetExpiry(c.Clock.Now().UTC().Add(c.PreferRecent.MaxTTL))
 }
 
-func (c *Cache) notify(event CacheEvent) {
+func (c *Cache) notify(ctx context.Context, event Event) {
 	if c.EventsC == nil {
 		return
 	}
 	select {
 	case c.EventsC <- event:
 		return
-	case <-c.ctx.Done():
+	case <-ctx.Done():
 		return
 	}
 }
@@ -429,18 +816,28 @@ func (c *Cache) notify(event CacheEvent) {
 //   we assume that this cache will eventually end up in a correct state
 //   potentially lagging behind the state of the database.
 //
-func (c *Cache) fetchAndWatch(ctx context.Context, retry utils.Retry) error {
-	watcher, err := c.Events.NewWatcher(c.ctx, services.Watch{
+func (c *Cache) fetchAndWatch(ctx context.Context, retry utils.Retry, timer *time.Timer) error {
+	watcher, err := c.Events.NewWatcher(c.ctx, types.Watch{
 		QueueSize:       c.QueueSize,
 		Name:            c.Component,
 		Kinds:           c.watchKinds(),
 		MetricComponent: c.MetricComponent,
 	})
 	if err != nil {
-		c.notify(CacheEvent{Type: WatcherFailed})
+		c.notify(c.ctx, Event{Type: WatcherFailed})
 		return trace.Wrap(err)
 	}
 	defer watcher.Close()
+
+	// ensure that the timer is stopped and drained
+	timer.Stop()
+	select {
+	case <-timer.C:
+	default:
+	}
+	// set timer to watcher init timeout
+	timer.Reset(c.Config.WatcherInitTimeout)
+
 	// before fetch, make sure watcher is synced by receiving init event,
 	// to avoid the scenario:
 	// 1. Cache process:   w = NewWatcher()
@@ -461,17 +858,42 @@ func (c *Cache) fetchAndWatch(ctx context.Context, retry utils.Retry) error {
 	case <-c.ctx.Done():
 		return trace.ConnectionProblem(c.ctx.Err(), "context is closing")
 	case event := <-watcher.Events():
-		if event.Type != backend.OpInit {
+		if event.Type != types.OpInit {
 			return trace.BadParameter("expected init event, got %v instead", event.Type)
 		}
+	case <-timer.C:
+		return trace.ConnectionProblem(nil, "timeout waiting for watcher init")
 	}
-	err = c.fetch(ctx)
+	apply, err := c.fetch(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
+	// apply will mutate cache, and possibly leave it in an invalid state
+	// if an error occurs, so ensure that cache is not read.
+	c.setReadOK(false)
+	err = apply(ctx)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	// apply was successful; cache is now readable.
+	c.generation.Inc()
+	c.setReadOK(true)
+	c.setInitError(nil)
+
+	// watchers have been queuing up since the last time
+	// the cache was in a healthy state; broadcast OpInit.
+	// It is very important that OpInit is not broadcast until
+	// after we've placed the cache into a readable state.  This ensures
+	// that any derivative caches do not peform their fetch operations
+	// until this cache has finished its apply operations.
+	c.eventsFanout.SetInit()
+	defer c.eventsFanout.Reset()
+
 	retry.Reset()
-	c.wrapper.SetReadError(nil)
-	c.notify(CacheEvent{Type: WatcherStarted})
+
+	c.notify(c.ctx, Event{Type: WatcherStarted})
 	for {
 		select {
 		case <-watcher.Done():
@@ -483,48 +905,69 @@ func (c *Cache) fetchAndWatch(ctx context.Context, retry utils.Retry) error {
 			if err != nil {
 				return trace.Wrap(err)
 			}
-			c.notify(CacheEvent{Event: event, Type: EventProcessed})
+			c.notify(c.ctx, Event{Event: event, Type: EventProcessed})
 		}
 	}
 }
 
-// eraseAll erases all the data from cache collections
-func (c *Cache) eraseAll() error {
-	var errors []error
-	for _, collection := range c.collections {
-		errors = append(errors, collection.erase())
-	}
-	return trace.NewAggregate(errors...)
-}
-
-func (c *Cache) watchKinds() []services.WatchKind {
-	out := make([]services.WatchKind, 0, len(c.collections))
+func (c *Cache) watchKinds() []types.WatchKind {
+	out := make([]types.WatchKind, 0, len(c.collections))
 	for _, collection := range c.collections {
 		out = append(out, collection.watchKind())
 	}
 	return out
 }
 
+// isClosing checks if the cache has begun closing.
+func (c *Cache) isClosing() bool {
+	if c.closed.Load() {
+		// closing due to Close being called
+		return true
+	}
+
+	select {
+	case <-c.ctx.Done():
+		// closing due to context cancellation
+		return true
+	default:
+		// not closing
+		return false
+	}
+}
+
 // Close closes all outstanding and active cache operations
 func (c *Cache) Close() error {
+	c.closed.Store(true)
 	c.cancel()
-	c.setClosed()
+	c.eventsFanout.Close()
 	return nil
 }
 
-func (c *Cache) fetch(ctx context.Context) error {
+func (c *Cache) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	applyfns := make([]func(ctx context.Context) error, 0, len(c.collections))
 	for _, collection := range c.collections {
-		if err := collection.fetch(ctx); err != nil {
-			return trace.Wrap(err)
+		applyfn, err := collection.fetch(ctx)
+		if err != nil {
+			return nil, trace.Wrap(err)
 		}
+		applyfns = append(applyfns, applyfn)
 	}
-	return nil
+	return func(ctx context.Context) error {
+		for _, applyfn := range applyfns {
+			if err := applyfn(ctx); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
 }
 
-func (c *Cache) processEvent(ctx context.Context, event services.Event) error {
-	collection, ok := c.collections[event.Resource.GetKind()]
+func (c *Cache) processEvent(ctx context.Context, event types.Event) error {
+	resourceKind := resourceKindFromResource(event.Resource)
+	collection, ok := c.collections[resourceKind]
 	if !ok {
-		c.Warningf("Skipping unsupported event %v.", event.Resource.GetKind())
+		c.Warningf("Skipping unsupported event %v/%v",
+			event.Resource.GetKind(), event.Resource.GetSubKind())
 		return nil
 	}
 	if err := collection.processEvent(ctx, event); err != nil {
@@ -536,128 +979,426 @@ func (c *Cache) processEvent(ctx context.Context, event services.Event) error {
 
 // GetCertAuthority returns certificate authority by given id. Parameter loadSigningKeys
 // controls if signing keys are loaded
-func (c *Cache) GetCertAuthority(id services.CertAuthID, loadSigningKeys bool, opts ...services.MarshalOption) (services.CertAuthority, error) {
-	ca, err := c.trustCache.GetCertAuthority(id, loadSigningKeys, services.AddOptions(opts, services.SkipValidation())...)
-	// this is to prevent unexpected situations during cache reload
-	if trace.IsNotFound(err) {
-		return c.Trust.GetCertAuthority(id, loadSigningKeys, services.AddOptions(opts, services.SkipValidation())...)
+func (c *Cache) GetCertAuthority(id types.CertAuthID, loadSigningKeys bool, opts ...services.MarshalOption) (types.CertAuthority, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
-	return ca, err
+	defer rg.Release()
+	ca, err := rg.trust.GetCertAuthority(id, loadSigningKeys, opts...)
+	if trace.IsNotFound(err) && rg.IsCacheRead() {
+		// release read lock early
+		rg.Release()
+		// fallback is sane because method is never used
+		// in construction of derivative caches.
+		if ca, err := c.Config.Trust.GetCertAuthority(id, loadSigningKeys, opts...); err == nil {
+			return ca, nil
+		}
+	}
+	return ca, trace.Wrap(err)
 }
 
 // GetCertAuthorities returns a list of authorities of a given type
 // loadSigningKeys controls whether signing keys should be loaded or not
-func (c *Cache) GetCertAuthorities(caType services.CertAuthType, loadSigningKeys bool, opts ...services.MarshalOption) ([]services.CertAuthority, error) {
-	return c.trustCache.GetCertAuthorities(caType, loadSigningKeys, services.AddOptions(opts, services.SkipValidation())...)
+func (c *Cache) GetCertAuthorities(caType types.CertAuthType, loadSigningKeys bool, opts ...services.MarshalOption) ([]types.CertAuthority, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.trust.GetCertAuthorities(caType, loadSigningKeys, opts...)
 }
 
 // GetStaticTokens gets the list of static tokens used to provision nodes.
-func (c *Cache) GetStaticTokens() (services.StaticTokens, error) {
-	return c.clusterConfigCache.GetStaticTokens()
+func (c *Cache) GetStaticTokens() (types.StaticTokens, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.clusterConfig.GetStaticTokens()
 }
 
 // GetTokens returns all active (non-expired) provisioning tokens
-func (c *Cache) GetTokens(opts ...services.MarshalOption) ([]services.ProvisionToken, error) {
-	return c.provisionerCache.GetTokens(services.AddOptions(opts, services.SkipValidation())...)
+func (c *Cache) GetTokens(ctx context.Context, opts ...services.MarshalOption) ([]types.ProvisionToken, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.provisioner.GetTokens(ctx, opts...)
 }
 
 // GetToken finds and returns token by ID
-func (c *Cache) GetToken(token string) (services.ProvisionToken, error) {
-	return c.provisionerCache.GetToken(token)
+func (c *Cache) GetToken(ctx context.Context, name string) (types.ProvisionToken, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+
+	token, err := rg.provisioner.GetToken(ctx, name)
+	if trace.IsNotFound(err) && rg.IsCacheRead() {
+		// release read lock early
+		rg.Release()
+		// fallback is sane because method is never used
+		// in construction of derivative caches.
+		if token, err := c.Config.Provisioner.GetToken(ctx, name); err == nil {
+			return token, nil
+		}
+	}
+	return token, trace.Wrap(err)
 }
 
 // GetClusterConfig gets services.ClusterConfig from the backend.
-func (c *Cache) GetClusterConfig(opts ...services.MarshalOption) (services.ClusterConfig, error) {
-	config, err := c.clusterConfigCache.GetClusterConfig(services.AddOptions(opts, services.SkipValidation())...)
-	if trace.IsNotFound(err) {
-		return c.ClusterConfig.GetClusterConfig(opts...)
+func (c *Cache) GetClusterConfig(opts ...services.MarshalOption) (types.ClusterConfig, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
-	return config, err
+	defer rg.Release()
+	return rg.clusterConfig.GetClusterConfig(opts...)
+}
+
+// GetClusterAuditConfig gets ClusterAuditConfig from the backend.
+func (c *Cache) GetClusterAuditConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterAuditConfig, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.clusterConfig.GetClusterAuditConfig(ctx, opts...)
+}
+
+// GetClusterNetworkingConfig gets ClusterNetworkingConfig from the backend.
+func (c *Cache) GetClusterNetworkingConfig(ctx context.Context, opts ...services.MarshalOption) (types.ClusterNetworkingConfig, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.clusterConfig.GetClusterNetworkingConfig(ctx, opts...)
 }
 
 // GetClusterName gets the name of the cluster from the backend.
-func (c *Cache) GetClusterName(opts ...services.MarshalOption) (services.ClusterName, error) {
-	clusterName, err := c.clusterConfigCache.GetClusterName(services.AddOptions(opts, services.SkipValidation())...)
-	if trace.IsNotFound(err) {
-		return c.ClusterConfig.GetClusterName(opts...)
+func (c *Cache) GetClusterName(opts ...services.MarshalOption) (types.ClusterName, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
-	return clusterName, err
+	defer rg.Release()
+	return rg.clusterConfig.GetClusterName(opts...)
 }
 
 // GetRoles is a part of auth.AccessPoint implementation
-func (c *Cache) GetRoles() ([]services.Role, error) {
-	return c.accessCache.GetRoles()
+func (c *Cache) GetRoles(ctx context.Context) ([]types.Role, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.access.GetRoles(ctx)
 }
 
 // GetRole is a part of auth.AccessPoint implementation
-func (c *Cache) GetRole(name string) (services.Role, error) {
-	role, err := c.accessCache.GetRole(name)
-	if trace.IsNotFound(err) {
-		return c.Access.GetRole(name)
+func (c *Cache) GetRole(ctx context.Context, name string) (types.Role, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	role, err := rg.access.GetRole(ctx, name)
+	if trace.IsNotFound(err) && rg.IsCacheRead() {
+		// release read lock early
+		rg.Release()
+		// fallback is sane because method is never used
+		// in construction of derivative caches.
+		if role, err := c.Config.Access.GetRole(ctx, name); err == nil {
+			return role, nil
+		}
 	}
 	return role, err
 }
 
 // GetNamespace returns namespace
-func (c *Cache) GetNamespace(name string) (*services.Namespace, error) {
-	return c.presenceCache.GetNamespace(name)
+func (c *Cache) GetNamespace(name string) (*types.Namespace, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetNamespace(name)
 }
 
 // GetNamespaces is a part of auth.AccessPoint implementation
-func (c *Cache) GetNamespaces() ([]services.Namespace, error) {
-	return c.presenceCache.GetNamespaces()
+func (c *Cache) GetNamespaces() ([]types.Namespace, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetNamespaces()
+}
+
+// GetNode finds and returns a node by name and namespace.
+func (c *Cache) GetNode(ctx context.Context, namespace, name string) (types.Server, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetNode(ctx, namespace, name)
 }
 
 // GetNodes is a part of auth.AccessPoint implementation
-func (c *Cache) GetNodes(namespace string, opts ...services.MarshalOption) ([]services.Server, error) {
-	return c.presenceCache.GetNodes(namespace, opts...)
+func (c *Cache) GetNodes(ctx context.Context, namespace string, opts ...services.MarshalOption) ([]types.Server, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetNodes(ctx, namespace, opts...)
+}
+
+// ListNodes is a part of auth.AccessPoint implementation
+func (c *Cache) ListNodes(ctx context.Context, namespace string, limit int, startKey string) ([]types.Server, string, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, "", trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.ListNodes(ctx, namespace, limit, startKey)
 }
 
 // GetAuthServers returns a list of registered servers
-func (c *Cache) GetAuthServers() ([]services.Server, error) {
-	return c.presenceCache.GetAuthServers()
+func (c *Cache) GetAuthServers() ([]types.Server, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetAuthServers()
 }
 
 // GetReverseTunnels is a part of auth.AccessPoint implementation
-func (c *Cache) GetReverseTunnels(opts ...services.MarshalOption) ([]services.ReverseTunnel, error) {
-	return c.presenceCache.GetReverseTunnels(services.AddOptions(opts, services.SkipValidation())...)
+func (c *Cache) GetReverseTunnels(opts ...services.MarshalOption) ([]types.ReverseTunnel, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetReverseTunnels(opts...)
 }
 
 // GetProxies is a part of auth.AccessPoint implementation
-func (c *Cache) GetProxies() ([]services.Server, error) {
-	return c.presenceCache.GetProxies()
+func (c *Cache) GetProxies() ([]types.Server, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetProxies()
+}
+
+// GetRemoteClusters returns a list of remote clusters
+func (c *Cache) GetRemoteClusters(opts ...services.MarshalOption) ([]types.RemoteCluster, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetRemoteClusters(opts...)
+}
+
+// GetRemoteCluster returns a remote cluster by name
+func (c *Cache) GetRemoteCluster(clusterName string) (types.RemoteCluster, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetRemoteCluster(clusterName)
 }
 
 // GetUser is a part of auth.AccessPoint implementation.
-func (c *Cache) GetUser(name string, withSecrets bool) (user services.User, err error) {
+func (c *Cache) GetUser(name string, withSecrets bool) (user types.User, err error) {
 	if withSecrets { // cache never tracks user secrets
-		return c.Users.GetUser(name, withSecrets)
+		return c.Config.Users.GetUser(name, withSecrets)
 	}
-	u, err := c.usersCache.GetUser(name, withSecrets)
-	if trace.IsNotFound(err) {
-		return c.Users.GetUser(name, withSecrets)
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
-	return u, err
+	defer rg.Release()
+
+	user, err = rg.users.GetUser(name, withSecrets)
+	if trace.IsNotFound(err) && rg.IsCacheRead() {
+		// release read lock early
+		rg.Release()
+		// fallback is sane because method is never used
+		// in construction of derivative caches.
+		if user, err := c.Config.Users.GetUser(name, withSecrets); err == nil {
+			return user, nil
+		}
+	}
+	return user, trace.Wrap(err)
 }
 
 // GetUsers is a part of auth.AccessPoint implementation
-func (c *Cache) GetUsers(withSecrets bool) (users []services.User, err error) {
+func (c *Cache) GetUsers(withSecrets bool) (users []types.User, err error) {
 	if withSecrets { // cache never tracks user secrets
 		return c.Users.GetUsers(withSecrets)
 	}
-	return c.usersCache.GetUsers(withSecrets)
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.users.GetUsers(withSecrets)
 }
 
 // GetTunnelConnections is a part of auth.AccessPoint implementation
 // GetTunnelConnections are not using recent cache as they are designed
 // to be called periodically and always return fresh data
-func (c *Cache) GetTunnelConnections(clusterName string, opts ...services.MarshalOption) ([]services.TunnelConnection, error) {
-	return c.presenceCache.GetTunnelConnections(clusterName, opts...)
+func (c *Cache) GetTunnelConnections(clusterName string, opts ...services.MarshalOption) ([]types.TunnelConnection, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetTunnelConnections(clusterName, opts...)
 }
 
 // GetAllTunnelConnections is a part of auth.AccessPoint implementation
 // GetAllTunnelConnections are not using recent cache, as they are designed
 // to be called periodically and always return fresh data
-func (c *Cache) GetAllTunnelConnections(opts ...services.MarshalOption) (conns []services.TunnelConnection, err error) {
-	return c.presenceCache.GetAllTunnelConnections(opts...)
+func (c *Cache) GetAllTunnelConnections(opts ...services.MarshalOption) (conns []types.TunnelConnection, err error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetAllTunnelConnections(opts...)
+}
+
+// GetKubeServices is a part of auth.AccessPoint implementation
+func (c *Cache) GetKubeServices(ctx context.Context) ([]types.Server, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetKubeServices(ctx)
+}
+
+// GetAppServers gets all application servers.
+func (c *Cache) GetAppServers(ctx context.Context, namespace string, opts ...services.MarshalOption) ([]types.Server, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetAppServers(ctx, namespace, opts...)
+}
+
+// GetAppSession gets an application web session.
+func (c *Cache) GetAppSession(ctx context.Context, req types.GetAppSessionRequest) (types.WebSession, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.appSession.GetAppSession(ctx, req)
+}
+
+// GetDatabaseServers returns all registered database proxy servers.
+func (c *Cache) GetDatabaseServers(ctx context.Context, namespace string, opts ...services.MarshalOption) ([]types.DatabaseServer, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.presence.GetDatabaseServers(ctx, namespace, opts...)
+}
+
+// GetWebSession gets a regular web session.
+func (c *Cache) GetWebSession(ctx context.Context, req types.GetWebSessionRequest) (types.WebSession, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.webSession.Get(ctx, req)
+}
+
+// GetWebToken gets a web token.
+func (c *Cache) GetWebToken(ctx context.Context, req types.GetWebTokenRequest) (types.WebToken, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.webToken.Get(ctx, req)
+}
+
+// GetAuthPreference gets the cluster authentication config.
+func (c *Cache) GetAuthPreference(ctx context.Context) (types.AuthPreference, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.clusterConfig.GetAuthPreference(ctx)
+}
+
+// GetSessionRecordingConfig gets session recording configuration.
+func (c *Cache) GetSessionRecordingConfig(ctx context.Context, opts ...services.MarshalOption) (types.SessionRecordingConfig, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.clusterConfig.GetSessionRecordingConfig(ctx, opts...)
+}
+
+// GetLock gets a lock by name.
+func (c *Cache) GetLock(ctx context.Context, name string) (types.Lock, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+
+	lock, err := rg.access.GetLock(ctx, name)
+	if trace.IsNotFound(err) && rg.IsCacheRead() {
+		// release read lock early
+		rg.Release()
+		// fallback is sane because method is never used
+		// in construction of derivative caches.
+		if lock, err := c.Config.Access.GetLock(ctx, name); err == nil {
+			return lock, nil
+		}
+	}
+	return lock, trace.Wrap(err)
+}
+
+// GetLocks gets all locks, matching at least one of the targets when specified.
+func (c *Cache) GetLocks(ctx context.Context, targets ...types.LockTarget) ([]types.Lock, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+	return rg.access.GetLocks(ctx, targets...)
+}
+
+// GetNetworkRestrictions gets the network restrictions.
+func (c *Cache) GetNetworkRestrictions(ctx context.Context) (types.NetworkRestrictions, error) {
+	rg, err := c.read()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer rg.Release()
+
+	return rg.restrictions.GetNetworkRestrictions(ctx)
 }

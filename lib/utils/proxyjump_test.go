@@ -28,8 +28,8 @@ func (s *UtilsSuite) TestProxyJumpParsing(c *check.C) {
 	}
 	testCases := []tc{
 		{
-			in:  "host:port",
-			out: []JumpHost{{Addr: NetAddr{Addr: "host:port", AddrNetwork: "tcp"}}},
+			in:  "host:12345",
+			out: []JumpHost{{Addr: NetAddr{Addr: "host:12345", AddrNetwork: "tcp"}}},
 		},
 		{
 			in:  "host",
@@ -50,6 +50,10 @@ func (s *UtilsSuite) TestProxyJumpParsing(c *check.C) {
 		{
 			in:  "alice@[::1]:7777, bob@localhost",
 			out: []JumpHost{{Username: "alice", Addr: NetAddr{Addr: "[::1]:7777", AddrNetwork: "tcp"}}, {Username: "bob", Addr: NetAddr{Addr: "localhost", AddrNetwork: "tcp"}}},
+		},
+		{
+			in:  "alice@domain.com@[::1]:7777, bob@localhost@localhost",
+			out: []JumpHost{{Username: "alice@domain.com", Addr: NetAddr{Addr: "[::1]:7777", AddrNetwork: "tcp"}}, {Username: "bob@localhost", Addr: NetAddr{Addr: "localhost", AddrNetwork: "tcp"}}},
 		},
 	}
 	for i, tc := range testCases {

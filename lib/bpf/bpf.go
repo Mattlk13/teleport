@@ -32,16 +32,50 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	apievents "github.com/gravitational/teleport/api/types/events"
 	controlgroup "github.com/gravitational/teleport/lib/cgroup"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
 
 	"github.com/gravitational/trace"
 	"github.com/gravitational/ttlmap"
-
-	"github.com/iovisor/gobpf/bcc"
 )
+
+// SessionWatch is a map of cgroup IDs that the BPF service is watching and
+// emitting events for.
+type SessionWatch struct {
+	watch map[uint64]*SessionContext
+	mu    sync.Mutex
+}
+
+func NewSessionWatch() SessionWatch {
+	return SessionWatch{
+		watch: make(map[uint64]*SessionContext),
+	}
+}
+
+func (w *SessionWatch) Get(cgoupID uint64) (ctx *SessionContext, ok bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	ctx, ok = w.watch[cgoupID]
+	return
+}
+
+func (w *SessionWatch) Add(cgroupID uint64, ctx *SessionContext) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.watch[cgroupID] = ctx
+}
+
+func (w *SessionWatch) Remove(cgroupID uint64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	delete(w.watch, cgroupID)
+}
+
 
 // Service manages BPF and control groups orchestration.
 type Service struct {
@@ -49,8 +83,7 @@ type Service struct {
 
 	// watch is a map of cgroup IDs that the BPF service is watching and
 	// emitting events for.
-	watch   map[uint64]*SessionContext
-	watchMu sync.Mutex
+	watch SessionWatch
 
 	// argsCache holds the arguments to execve because they come a different
 	// event than the result.
@@ -107,7 +140,7 @@ func New(config *Config) (BPF, error) {
 	s := &Service{
 		Config: config,
 
-		watch: make(map[uint64]*SessionContext),
+		watch: NewSessionWatch(),
 
 		closeContext: closeContext,
 		closeFunc:    closeFunc,
@@ -125,15 +158,15 @@ func New(config *Config) (BPF, error) {
 	log.Debugf("Starting enhanced session recording.")
 
 	// Compile and start BPF programs if they are enabled (buffer size given).
-	s.exec, err = startExec(closeContext, *config.CommandBufferSize)
+	s.exec, err = startExec(*config.CommandBufferSize)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	s.open, err = startOpen(closeContext, *config.DiskBufferSize)
+	s.open, err = startOpen(*config.DiskBufferSize)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	s.conn, err = startConn(closeContext, *config.NetworkBufferSize)
+	s.conn, err = startConn(*config.NetworkBufferSize)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -182,7 +215,7 @@ func (s *Service) OpenSession(ctx *SessionContext) (uint64, error) {
 	}
 
 	// Start watching for any events that come from this cgroup.
-	s.addWatch(cgroupID, ctx)
+	s.watch.Add(cgroupID, ctx)
 
 	// Place requested PID into cgroup.
 	err = s.cgroup.Place(ctx.SessionID, ctx.PID)
@@ -202,7 +235,7 @@ func (s *Service) CloseSession(ctx *SessionContext) error {
 	}
 
 	// Stop watching for events from this PID.
-	s.removeWatch(cgroupID)
+	s.watch.Remove(cgroupID)
 
 	// Move all PIDs to the root cgroup and remove the cgroup created for this
 	// session.
@@ -248,13 +281,13 @@ func (s *Service) emitCommandEvent(eventBytes []byte) {
 	}
 
 	// If the event comes from a unmonitored process/cgroup, don't process it.
-	ctx, ok := s.getWatch(event.CgroupID)
+	ctx, ok := s.watch.Get(event.CgroupID)
 	if !ok {
 		return
 	}
 
 	// If the command event is not being monitored, don't process it.
-	_, ok = ctx.Events[teleport.EnhancedRecordingCommand]
+	_, ok = ctx.Events[constants.EnhancedRecordingCommand]
 	if !ok {
 		return
 	}
@@ -286,23 +319,35 @@ func (s *Service) emitCommandEvent(eventBytes []byte) {
 		argv := args.([]string)
 
 		// Emit "command" event.
-		eventFields := events.EventFields{
-			// Common fields.
-			events.EventNamespace:  ctx.Namespace,
-			events.SessionEventID:  ctx.SessionID,
-			events.SessionServerID: ctx.ServerID,
-			events.EventLogin:      ctx.Login,
-			events.EventUser:       ctx.User,
-			// Command fields.
-			events.PID:        event.PID,
-			events.PPID:       event.PPID,
-			events.CgroupID:   event.CgroupID,
-			events.Program:    convertString(unsafe.Pointer(&event.Command)),
-			events.Path:       argv[0],
-			events.Argv:       argv[1:],
-			events.ReturnCode: event.ReturnCode,
+		sessionCommandEvent := &apievents.SessionCommand{
+			Metadata: apievents.Metadata{
+				Type: events.SessionCommandEvent,
+				Code: events.SessionCommandCode,
+			},
+			ServerMetadata: apievents.ServerMetadata{
+				ServerID:        ctx.ServerID,
+				ServerNamespace: ctx.Namespace,
+			},
+			SessionMetadata: apievents.SessionMetadata{
+				SessionID: ctx.SessionID,
+			},
+			UserMetadata: apievents.UserMetadata{
+				User:  ctx.User,
+				Login: ctx.Login,
+			},
+			BPFMetadata: apievents.BPFMetadata{
+				CgroupID: event.CgroupID,
+				Program:  ConvertString(unsafe.Pointer(&event.Command)),
+				PID:      event.PID,
+			},
+			PPID:       event.PPID,
+			ReturnCode: event.ReturnCode,
+			Path:       argv[0],
+			Argv:       argv[1:],
 		}
-		ctx.AuditLog.EmitAuditEvent(events.SessionCommand, eventFields)
+		if err := ctx.Emitter.EmitAuditEvent(ctx.Context, sessionCommandEvent); err != nil {
+			log.WithError(err).Warn("Failed to emit command event.")
+		}
 
 		// Now that the event has been processed, remove from cache.
 		s.argsCache.Remove(strconv.FormatUint(event.PID, 10))
@@ -320,33 +365,44 @@ func (s *Service) emitDiskEvent(eventBytes []byte) {
 	}
 
 	// If the event comes from a unmonitored process/cgroup, don't process it.
-	ctx, ok := s.getWatch(event.CgroupID)
+	ctx, ok := s.watch.Get(event.CgroupID)
 	if !ok {
 		return
 	}
 
 	// If the network event is not being monitored, don't process it.
-	_, ok = ctx.Events[teleport.EnhancedRecordingDisk]
+	_, ok = ctx.Events[constants.EnhancedRecordingDisk]
 	if !ok {
 		return
 	}
 
-	eventFields := events.EventFields{
-		// Common fields.
-		events.EventNamespace:  ctx.Namespace,
-		events.SessionEventID:  ctx.SessionID,
-		events.SessionServerID: ctx.ServerID,
-		events.EventLogin:      ctx.Login,
-		events.EventUser:       ctx.User,
-		// Disk fields.
-		events.PID:        event.PID,
-		events.CgroupID:   event.CgroupID,
-		events.Program:    convertString(unsafe.Pointer(&event.Command)),
-		events.Path:       convertString(unsafe.Pointer(&event.Path)),
-		events.Flags:      event.Flags,
-		events.ReturnCode: event.ReturnCode,
+	sessionDiskEvent := &apievents.SessionDisk{
+		Metadata: apievents.Metadata{
+			Type: events.SessionDiskEvent,
+			Code: events.SessionDiskCode,
+		},
+		ServerMetadata: apievents.ServerMetadata{
+			ServerID:        ctx.ServerID,
+			ServerNamespace: ctx.Namespace,
+		},
+		SessionMetadata: apievents.SessionMetadata{
+			SessionID: ctx.SessionID,
+		},
+		UserMetadata: apievents.UserMetadata{
+			User:  ctx.User,
+			Login: ctx.Login,
+		},
+		BPFMetadata: apievents.BPFMetadata{
+			CgroupID: event.CgroupID,
+			Program:  ConvertString(unsafe.Pointer(&event.Command)),
+			PID:      event.PID,
+		},
+		Flags:      event.Flags,
+		Path:       ConvertString(unsafe.Pointer(&event.Path)),
+		ReturnCode: event.ReturnCode,
 	}
-	ctx.AuditLog.EmitAuditEvent(events.SessionDisk, eventFields)
+	// Logs can be DoS by event failures here
+	_ = ctx.Emitter.EmitAuditEvent(ctx.Context, sessionDiskEvent)
 }
 
 // emit4NetworkEvent will parse and emit IPv4 events to the Audit Log.
@@ -360,13 +416,13 @@ func (s *Service) emit4NetworkEvent(eventBytes []byte) {
 	}
 
 	// If the event comes from a unmonitored process/cgroup, don't process it.
-	ctx, ok := s.getWatch(event.CgroupID)
+	ctx, ok := s.watch.Get(event.CgroupID)
 	if !ok {
 		return
 	}
 
 	// If the network event is not being monitored, don't process it.
-	_, ok = ctx.Events[teleport.EnhancedRecordingNetwork]
+	_, ok = ctx.Events[constants.EnhancedRecordingNetwork]
 	if !ok {
 		return
 	}
@@ -381,23 +437,35 @@ func (s *Service) emit4NetworkEvent(eventBytes []byte) {
 	binary.LittleEndian.PutUint32(dst, uint32(event.DstAddr))
 	dstAddr := net.IP(dst)
 
-	eventFields := events.EventFields{
-		// Common fields.
-		events.EventNamespace:  ctx.Namespace,
-		events.SessionEventID:  ctx.SessionID,
-		events.SessionServerID: ctx.ServerID,
-		events.EventLogin:      ctx.Login,
-		events.EventUser:       ctx.User,
-		// Network fields.
-		events.PID:        event.PID,
-		events.CgroupID:   event.CgroupID,
-		events.Program:    convertString(unsafe.Pointer(&event.Command)),
-		events.SrcAddr:    srcAddr,
-		events.DstAddr:    dstAddr,
-		events.DstPort:    event.DstPort,
-		events.TCPVersion: 4,
+	sessionNetworkEvent := &apievents.SessionNetwork{
+		Metadata: apievents.Metadata{
+			Type: events.SessionNetworkEvent,
+			Code: events.SessionNetworkCode,
+		},
+		ServerMetadata: apievents.ServerMetadata{
+			ServerID:        ctx.ServerID,
+			ServerNamespace: ctx.Namespace,
+		},
+		SessionMetadata: apievents.SessionMetadata{
+			SessionID: ctx.SessionID,
+		},
+		UserMetadata: apievents.UserMetadata{
+			User:  ctx.User,
+			Login: ctx.Login,
+		},
+		BPFMetadata: apievents.BPFMetadata{
+			CgroupID: event.CgroupID,
+			Program:  ConvertString(unsafe.Pointer(&event.Command)),
+			PID:      uint64(event.PID),
+		},
+		DstPort:    int32(event.DstPort),
+		DstAddr:    dstAddr.String(),
+		SrcAddr:    srcAddr.String(),
+		TCPVersion: 4,
 	}
-	ctx.AuditLog.EmitAuditEvent(events.SessionNetwork, eventFields)
+	if err := ctx.Emitter.EmitAuditEvent(ctx.Context, sessionNetworkEvent); err != nil {
+		log.WithError(err).Warn("Failed to emit network event.")
+	}
 }
 
 // emit6NetworkEvent will parse and emit IPv6 events to the Audit Log.
@@ -411,13 +479,13 @@ func (s *Service) emit6NetworkEvent(eventBytes []byte) {
 	}
 
 	// If the event comes from a unmonitored process/cgroup, don't process it.
-	ctx, ok := s.getWatch(event.CgroupID)
+	ctx, ok := s.watch.Get(event.CgroupID)
 	if !ok {
 		return
 	}
 
 	// If the network event is not being monitored, don't process it.
-	_, ok = ctx.Events[teleport.EnhancedRecordingNetwork]
+	_, ok = ctx.Events[constants.EnhancedRecordingNetwork]
 	if !ok {
 		return
 	}
@@ -438,57 +506,48 @@ func (s *Service) emit6NetworkEvent(eventBytes []byte) {
 	binary.LittleEndian.PutUint32(dst[12:], event.DstAddr[3])
 	dstAddr := net.IP(dst)
 
-	eventFields := events.EventFields{
-		// Common fields.
-		events.EventNamespace:  ctx.Namespace,
-		events.SessionEventID:  ctx.SessionID,
-		events.SessionServerID: ctx.ServerID,
-		events.EventLogin:      ctx.Login,
-		events.EventUser:       ctx.User,
-		// Connect fields.
-		events.PID:        event.PID,
-		events.CgroupID:   event.CgroupID,
-		events.Program:    convertString(unsafe.Pointer(&event.Command)),
-		events.SrcAddr:    srcAddr,
-		events.DstAddr:    dstAddr,
-		events.DstPort:    event.DstPort,
-		events.TCPVersion: 6,
+	sessionNetworkEvent := &apievents.SessionNetwork{
+		Metadata: apievents.Metadata{
+			Type: events.SessionNetworkEvent,
+			Code: events.SessionNetworkCode,
+		},
+		ServerMetadata: apievents.ServerMetadata{
+			ServerID:        ctx.ServerID,
+			ServerNamespace: ctx.Namespace,
+		},
+		SessionMetadata: apievents.SessionMetadata{
+			SessionID: ctx.SessionID,
+		},
+		UserMetadata: apievents.UserMetadata{
+			User:  ctx.User,
+			Login: ctx.Login,
+		},
+		BPFMetadata: apievents.BPFMetadata{
+			CgroupID: event.CgroupID,
+			Program:  ConvertString(unsafe.Pointer(&event.Command)),
+			PID:      uint64(event.PID),
+		},
+		DstPort:    int32(event.DstPort),
+		DstAddr:    dstAddr.String(),
+		SrcAddr:    srcAddr.String(),
+		TCPVersion: 6,
 	}
-	ctx.AuditLog.EmitAuditEvent(events.SessionNetwork, eventFields)
-}
-
-func (s *Service) getWatch(cgoupID uint64) (ctx *SessionContext, ok bool) {
-	s.watchMu.Lock()
-	defer s.watchMu.Unlock()
-	ctx, ok = s.watch[cgoupID]
-	return
-}
-
-func (s *Service) addWatch(cgroupID uint64, ctx *SessionContext) {
-	s.watchMu.Lock()
-	defer s.watchMu.Unlock()
-
-	s.watch[cgroupID] = ctx
-}
-
-func (s *Service) removeWatch(cgroupID uint64) {
-	s.watchMu.Lock()
-	defer s.watchMu.Unlock()
-
-	delete(s.watch, cgroupID)
+	if err := ctx.Emitter.EmitAuditEvent(ctx.Context, sessionNetworkEvent); err != nil {
+		log.WithError(err).Warn("Failed to emit network event.")
+	}
 }
 
 // unmarshalEvent will unmarshal the perf event.
 func unmarshalEvent(data []byte, v interface{}) error {
-	err := binary.Read(bytes.NewBuffer(data), bcc.GetHostByteOrder(), v)
+	err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, v)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	return nil
 }
 
-// convertString converts a C string to a Go string.
-func convertString(s unsafe.Pointer) string {
+// ConvertString converts a C string to a Go string.
+func ConvertString(s unsafe.Pointer) string {
 	return C.GoString((*C.char)(s))
 }
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-usage() { echo "Usage: $(basename $0) [-t <oss/ent>] [-v <version>] [-p <package type>] <-a [amd64/x86_64]|[386/i386]> <-r go1.9.7|fips> <-s tarball source dir> <-m tsh>" 1>&2; exit 1; }
+usage() { echo "Usage: $(basename $0) [-t <oss/ent>] [-v <version>] [-p <package type>] <-a [amd64/x86_64]|[386/i386]|arm|arm64> <-r fips> <-s tarball source dir> <-m tsh>" 1>&2; exit 1; }
 while getopts ":t:v:p:a:r:s:m:" o; do
     case "${o}" in
         t)
@@ -17,11 +17,11 @@ while getopts ":t:v:p:a:r:s:m:" o; do
             ;;
         a)
             a=${OPTARG}
-            if [[ ${a} != "amd64" && ${a} != "x86_64" && ${a} != "386" && ${a} != "i386" ]]; then usage; fi
+            if [[ ${a} != "amd64" && ${a} != "x86_64" && ${a} != "386" && ${a} != "i386" && ${a} != "arm" && ${a} != "arm64" ]]; then usage; fi
             ;;
         r)
             r=${OPTARG}
-            if [[ ${r} != "go1.9.7" && ${r} != "fips" ]]; then usage; fi
+            if [[ ${r} != "fips" ]]; then usage; fi
             ;;
         s)
             s=${OPTARG}
@@ -49,6 +49,7 @@ RUNTIME=${r}
 BUILD_MODE=${m}
 TARBALL_DIRECTORY=/tmp/teleport-tarballs
 DOWNLOAD_IF_NEEDED=true
+GNUPG_DIR=${GNUPG_DIR:-/tmp/gnupg}
 if [[ "${s}" != "" ]]; then
     DOWNLOAD_IF_NEEDED=false
     TARBALL_DIRECTORY=${s}
@@ -61,11 +62,11 @@ LINUX_CONFIG_DIR=/etc
 LINUX_DATA_DIR=/var/lib/teleport
 
 # extra package information for linux
-MAINTAINER="info@gravitational.com"
+MAINTAINER="info@goteleport.com"
 LICENSE="Apache-2.0"
 VENDOR="Gravitational"
-DESCRIPTION="Gravitational Teleport is a gateway for managing access to clusters of Linux servers via SSH or the Kubernetes API"
-DOCS_URL="https://gravitational.com/teleport/docs"
+DESCRIPTION="Teleport is a gateway for managing access to clusters of Linux servers via SSH or the Kubernetes API"
+DOCS_URL="https://goteleport.com/docs"
 
 # signing IDs to use for mac (must be pre-loaded into the keychain on the build box)
 DEVELOPER_ID_APPLICATION="Developer ID Application: Gravitational Inc." # used for signing binaries
@@ -75,14 +76,20 @@ DEVELOPER_ID_INSTALLER="Developer ID Installer: Gravitational Inc." # used for s
 DOWNLOAD_ROOT="https://get.gravitational.com"
 
 # check that curl is installed
-if [ ! $(command -v curl) ]; then
+if [[ ! $(type curl) ]]; then
     echo "curl must be installed"
     exit 2
 fi
 
+# check that tar is installed
+if [[ ! $(type tar) ]]; then
+    echo "tar must be installed"
+    exit 11
+fi
+
 # check that docker is installed when fpm is needed to build
 if [[ "${PACKAGE_TYPE}" != "pkg" ]]; then
-    if [ ! $(command -v docker) ]; then
+    if [[ ! $(type docker) ]]; then
         echo "docker must be installed to build non-OSX packages"
         exit 3
     fi
@@ -104,26 +111,26 @@ if [[ "${PACKAGE_TYPE}" == "pkg" ]]; then
     fi
     PLATFORM="darwin"
     ARCH="amd64"
-    if [ ! $(command -v pkgbuild) ]; then
+    if [[ ! $(type pkgbuild) ]]; then
         echo "You need to install pkgbuild"
         echo "Run: xcode-select --install"
         exit 5
     fi
 
     if [[ "${BUILD_MODE}" == "tsh" ]]; then
-        if [ ! $(command -v codesign) ]; then
+        if [[ ! $(type codesign) ]]; then
             echo "You need to install codesign"
             echo "Run: xcode-select --install or sudo xcode-select --reset"
             exit 6
         fi
 
-        if [ ! $(command -v productsign) ]; then
+        if [[ ! $(type productsign) ]]; then
             echo "You need to install productsign"
             echo "Run: xcode-select --install or sudo xcode-select --reset"
             exit 7
         fi
 
-        if [ ! $(command -v gon) ]; then
+        if [[ ! $(type gon) ]]; then
             echo "You need to install gon"
             echo "Install a binary from https://github.com/mitchellh/gon and make sure it's present in the system PATH"
             exit 8
@@ -148,9 +155,9 @@ else
 
     # set docker image appropriately
     if [[ "${PACKAGE_TYPE}" == "deb" ]]; then
-        DOCKER_IMAGE="cdrx/fpm-debian:8"
+        DOCKER_IMAGE="quay.io/gravitational/fpm-debian:8"
     elif [[ "${PACKAGE_TYPE}" == "rpm" ]]; then
-        DOCKER_IMAGE="cdrx/fpm-centos:7"
+        DOCKER_IMAGE="quay.io/gravitational/fpm-centos:8"
     fi
 
     # if client-only build is requested for a non-Mac platform, unset it
@@ -179,12 +186,14 @@ elif [[ "${ARCH}" == "amd64" ]]; then
         ARCH="x86_64"
     fi
     TEXT_ARCH="64-bit"
+elif [[ "${ARCH}" == "arm" ]]; then
+    TEXT_ARCH="ARMv7"
+elif [[ "${ARCH}" == "arm64" ]]; then
+    TEXT_ARCH="ARMv8/ARM64"
 fi
 
 # set optional runtime section for filename
-if [[ "${RUNTIME}" == "go1.9.7" ]]; then
-    OPTIONAL_RUNTIME_SECTION="-go1.9.7"
-elif [[ "${RUNTIME}" == "fips" ]]; then
+if [[ "${RUNTIME}" == "fips" ]]; then
     OPTIONAL_RUNTIME_SECTION="-fips"
 fi
 
@@ -193,10 +202,10 @@ if [[ "${TELEPORT_TYPE}" == "ent" ]]; then
     TARBALL_FILENAME="teleport-ent-v${TELEPORT_VERSION}-${PLATFORM}-${FILENAME_ARCH}${OPTIONAL_RUNTIME_SECTION}-bin.tar.gz"
     URL="${DOWNLOAD_ROOT}/${TARBALL_FILENAME}"
     TAR_PATH="teleport-ent"
-    if [[ "${RUNTIME}" == "go1.9.7" ]]; then
-        TYPE_DESCRIPTION="[${TEXT_ARCH} Enterprise edition, built with Go 1.9.7]"
-    elif [[ "${RUNTIME}" == "fips" ]]; then
+    RPM_NAME="teleport-ent"
+    if [[ "${RUNTIME}" == "fips" ]]; then
         TYPE_DESCRIPTION="[${TEXT_ARCH} Enterprise edition, built with FIPS support]"
+        RPM_NAME="teleport-ent-fips"
     else
         TYPE_DESCRIPTION="[${TEXT_ARCH} Enterprise edition]"
     fi
@@ -204,10 +213,10 @@ else
     TARBALL_FILENAME="teleport-v${TELEPORT_VERSION}-${PLATFORM}-${FILENAME_ARCH}${OPTIONAL_RUNTIME_SECTION}-bin.tar.gz"
     URL="${DOWNLOAD_ROOT}/${TARBALL_FILENAME}"
     TAR_PATH="teleport"
-    if [[ "${RUNTIME}" == "go1.9.7" ]]; then
-        TYPE_DESCRIPTION="[${TEXT_ARCH} Open source edition, built with Go 1.9.7]"
-    elif [[ "${RUNTIME}" == "fips" ]]; then
+    RPM_NAME="teleport"
+    if [[ "${RUNTIME}" == "fips" ]]; then
         TYPE_DESCRIPTION="[${TEXT_ARCH} Open source edition, built with FIPS support]"
+        RPM_NAME="teleport-fips"
     else
         TYPE_DESCRIPTION="[${TEXT_ARCH} Open source edition]"
     fi
@@ -215,20 +224,16 @@ fi
 
 # set file list
 if [[ "${PACKAGE_TYPE}" == "pkg" ]]; then
+    SIGN_PKG="true"
+    NOTARIZE_PKG="true"
     # handle mac client-only builds
     if [[ "${BUILD_MODE}" == "tsh" ]]; then
         FILE_LIST="${TAR_PATH}/tsh"
         BUNDLE_ID="com.gravitational.teleport.tsh"
-        SIGN_PKG="true"
-        NOTARIZE_PKG="true"
         PKG_FILENAME="tsh-${TELEPORT_VERSION}.${PACKAGE_TYPE}"
     else
         FILE_LIST="${TAR_PATH}/tsh ${TAR_PATH}/tctl ${TAR_PATH}/teleport"
         BUNDLE_ID="com.gravitational.teleport"
-        # we can't sign/notarize full Teleport packages on Mac yet due to https://github.com/gravitational/teleport/issues/3158
-        # TODO(gus): uncomment/fix this when the teleport binary is fixed
-        SIGN_PKG="false"
-        NOTARIZE_PKG="false"
         if [[ "${TELEPORT_TYPE}" == "ent" ]]; then
             PKG_FILENAME="teleport-ent-${TELEPORT_VERSION}.${PACKAGE_TYPE}"
         else
@@ -239,10 +244,25 @@ else
     FILE_LIST="${TAR_PATH}/tsh ${TAR_PATH}/tctl ${TAR_PATH}/teleport ${TAR_PATH}/examples/systemd/teleport.service"
     LINUX_BINARY_FILE_LIST="${TAR_PATH}/tsh ${TAR_PATH}/tctl ${TAR_PATH}/teleport"
     LINUX_SYSTEMD_FILE_LIST="${TAR_PATH}/examples/systemd/teleport.service"
-    LINUX_CONFIG_FILE_LIST=""
+    EXTRA_DOCKER_OPTIONS=""
+    RPM_SIGN_STANZA=""
     if [[ "${PACKAGE_TYPE}" == "rpm" ]]; then
         OUTPUT_FILENAME="${TAR_PATH}-${TELEPORT_VERSION}-1${OPTIONAL_RUNTIME_SECTION}.${ARCH}.rpm"
         FILE_PERMISSIONS_STANZA="--rpm-user root --rpm-group root --rpm-use-file-permissions "
+        # the rpm/rpmmacros file suppresses the creation of .build-id files (see https://github.com/gravitational/teleport/issues/7040)
+        EXTRA_DOCKER_OPTIONS="-v $(pwd)/rpm/rpmmacros:/root/.rpmmacros"
+        # if we set this environment variable, don't sign RPMs (can be useful for building test RPMs
+        # without having the signing keys)
+        if [ "${UNSIGNED_RPM}" == "true" ]; then
+            echo "RPMs will not be signed as requested"
+        else
+            # the GNUPG_DIR location here is assumed to contain a complete ~/.gnupg directory structure
+            # with pubring.kbx and trustdb.gpg files, plus a private-keys-v1.d directory with signing keys
+            # it needs to contain the "Gravitational, Inc" private key and signing key.
+            # we also use the rpm-sign/rpmmacros file instead which contains extra directives used for signing.
+            EXTRA_DOCKER_OPTIONS="-v $(pwd)/rpm-sign/rpmmacros:/root/.rpmmacros -v $(pwd)/rpm-sign/popt-override:/etc/popt.d/rpmsign-override -v ${GNUPG_DIR}:/root/.gnupg"
+            RPM_SIGN_STANZA="--rpm-sign"
+        fi
     elif [[ "${PACKAGE_TYPE}" == "deb" ]]; then
         OUTPUT_FILENAME="${TAR_PATH}_${TELEPORT_VERSION}${OPTIONAL_RUNTIME_SECTION}_${ARCH}.deb"
         FILE_PERMISSIONS_STANZA="--deb-user root --deb-group root "
@@ -250,11 +270,11 @@ else
 fi
 
 # create a temporary directory and download specified Teleport version
-pushd $(mktemp -d)
-TMPDIR=$(pwd)
+pushd "$(mktemp -d)"
+PACKAGE_TEMPDIR=$(pwd)
 # automatically clean up on exit
-trap "rm -rf ${TMPDIR}" EXIT
-mkdir -p ${TMPDIR}/buildroot
+trap 'rm -rf ${PACKAGE_TEMPDIR}' EXIT
+mkdir -p ${PACKAGE_TEMPDIR}/buildroot
 
 # implement a rudimentary download cache for repeat builds on the same host
 mkdir -p ${TARBALL_DIRECTORY}
@@ -272,25 +292,26 @@ else
 fi
 
 # extract necessary files from tarball
-tar -C $(pwd) -xvzf ${TARBALL_DIRECTORY}/${TARBALL_FILENAME} ${FILE_LIST}
+tar -C "$(pwd)" -xvzf ${TARBALL_DIRECTORY}/${TARBALL_FILENAME} ${FILE_LIST}
 
 # move files into correct locations before building the package
 if [[ "${PACKAGE_TYPE}" != "pkg" ]]; then
     if [[ "${LINUX_BINARY_FILE_LIST}" != "" ]]; then
-        mkdir -p ${TMPDIR}/buildroot${LINUX_BINARY_DIR}
-        mv -v ${LINUX_BINARY_FILE_LIST} ${TMPDIR}/buildroot${LINUX_BINARY_DIR}
+        mkdir -p ${PACKAGE_TEMPDIR}/buildroot${LINUX_BINARY_DIR}
+        mv -v ${LINUX_BINARY_FILE_LIST} ${PACKAGE_TEMPDIR}/buildroot${LINUX_BINARY_DIR}
     fi
     if [[ "${LINUX_SYSTEMD_FILE_LIST}" != "" ]]; then
-        mkdir -p ${TMPDIR}/buildroot${LINUX_SYSTEMD_DIR}
-        mv -v ${LINUX_SYSTEMD_FILE_LIST} ${TMPDIR}/buildroot${LINUX_SYSTEMD_DIR}
+        mkdir -p ${PACKAGE_TEMPDIR}/buildroot${LINUX_SYSTEMD_DIR}
+        mv -v ${LINUX_SYSTEMD_FILE_LIST} ${PACKAGE_TEMPDIR}/buildroot${LINUX_SYSTEMD_DIR}
     fi
     if [[ "${LINUX_CONFIG_FILE}" != "" ]]; then
-        mkdir -p ${TMPDIR}/buildroot${LINUX_CONFIG_DIR}
-        mv -v ${LINUX_CONFIG_FILE} ${TMPDIR}/buildroot${LINUX_CONFIG_DIR}
+        mkdir -p ${PACKAGE_TEMPDIR}/buildroot${LINUX_CONFIG_DIR}
+        mv -v ${LINUX_CONFIG_FILE} ${PACKAGE_TEMPDIR}/buildroot${LINUX_CONFIG_DIR}
         CONFIG_FILE_STANZA="--config-files /src/buildroot${LINUX_CONFIG_DIR}/${LINUX_CONFIG_FILE} "
     fi
     # /var/lib/teleport
-    mkdir -p -m0700 ${TMPDIR}/buildroot${LINUX_DATA_DIR}
+    # shellcheck disable=SC2174
+    mkdir -p -m0700 ${PACKAGE_TEMPDIR}/buildroot${LINUX_DATA_DIR}
 fi
 popd
 
@@ -306,13 +327,13 @@ if [[ "${PACKAGE_TYPE}" == "pkg" ]]; then
                 -v \
                 --timestamp \
                 --options runtime \
-                ${TMPDIR}/${FILE}
+                ${PACKAGE_TEMPDIR}/${FILE}
         done
     fi
 
     # build the package for OS X
     pkgbuild \
-        --root ${TMPDIR}/${TAR_PATH} \
+        --root ${PACKAGE_TEMPDIR}/${TAR_PATH} \
         --identifier ${BUNDLE_ID} \
         --version ${TELEPORT_VERSION} \
         --install-location /usr/local/bin \
@@ -345,14 +366,14 @@ if [[ "${PACKAGE_TYPE}" == "pkg" ]]; then
                 \"username\": \"${APPLE_USERNAME}\",
                 \"password\": \"${APPLE_PASSWORD}\"
             }
-        }" > ${TMPDIR}/gon-config.json
+        }" > ${PACKAGE_TEMPDIR}/gon-config.json
 
         # notarise built package using gon
-        gon ${TMPDIR}/gon-config.json
+        gon ${PACKAGE_TEMPDIR}/gon-config.json
     fi
 
     # checksum created packages
-    for PACKAGE in *.${PACKAGE_TYPE}; do
+    for PACKAGE in *."${PACKAGE_TYPE}"; do
         shasum -a 256 ${PACKAGE} > ${PACKAGE}.sha256
     done
 else
@@ -360,11 +381,11 @@ else
     rm -vf ${OUTPUT_FILENAME}
 
     # build for other platforms
-    docker run -v ${TMPDIR}:/src --rm ${DOCKER_IMAGE} \
+    docker run -v ${PACKAGE_TEMPDIR}:/src --rm ${EXTRA_DOCKER_OPTIONS} ${DOCKER_IMAGE} \
         fpm \
         --input-type dir \
         --output-type ${PACKAGE_TYPE} \
-        --name ${TAR_PATH} \
+        --name ${RPM_NAME} \
         --version "${TELEPORT_VERSION}" \
         --maintainer "${MAINTAINER}" \
         --url "${DOCS_URL}" \
@@ -379,13 +400,14 @@ else
         --prefix / \
         --verbose \
         ${CONFIG_FILE_STANZA} \
-        ${FILE_PERMISSIONS_STANZA} .
+        ${FILE_PERMISSIONS_STANZA} \
+        ${RPM_SIGN_STANZA} .
 
     # copy created package back to current directory
-    cp ${TMPDIR}/*.${PACKAGE_TYPE} .
+    cp ${PACKAGE_TEMPDIR}/*."${PACKAGE_TYPE}" .
 
     # checksum created packages
-    for FILE in *.${PACKAGE_TYPE}; do
+    for FILE in *."${PACKAGE_TYPE}"; do
         sha256sum ${FILE} > ${FILE}.sha256
     done
 fi

@@ -19,25 +19,33 @@ package backend
 import (
 	"bytes"
 	"context"
+	"math"
 	"time"
 
 	"github.com/gravitational/teleport"
-	"github.com/gravitational/trace"
-	"github.com/jonboulle/clockwork"
+	"github.com/gravitational/teleport/api/types"
+	apiutils "github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/lib/utils"
 
+	"github.com/gravitational/trace"
+	lru "github.com/hashicorp/golang-lru"
+	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 )
+
+const reporterDefaultCacheSize = 1000
 
 // ReporterConfig configures reporter wrapper
 type ReporterConfig struct {
 	// Backend is a backend to wrap
 	Backend Backend
-	// TrackTopRequests turns on tracking of top
-	// requests on
-	TrackTopRequests bool
 	// Component is a component name to report
 	Component string
+	// Number of the most recent backend requests to preserve for top requests
+	// metric. Higher value means higher memory usage but fewer infrequent
+	// requests forgotten.
+	TopRequestsCount int
 }
 
 // CheckAndSetDefaults checks and sets
@@ -48,6 +56,9 @@ func (r *ReporterConfig) CheckAndSetDefaults() error {
 	if r.Component == "" {
 		r.Component = teleport.ComponentBackend
 	}
+	if r.TopRequestsCount == 0 {
+		r.TopRequestsCount = reporterDefaultCacheSize
+	}
 	return nil
 }
 
@@ -56,15 +67,42 @@ func (r *ReporterConfig) CheckAndSetDefaults() error {
 type Reporter struct {
 	// ReporterConfig contains reporter wrapper configuration
 	ReporterConfig
+
+	// topRequestsCache is an LRU cache to track the most frequent recent
+	// backend keys. All keys in this cache map to existing labels in the
+	// requests metric. Any evicted keys are also deleted from the metric.
+	//
+	// This will keep an upper limit on our memory usage while still always
+	// reporting the most active keys.
+	topRequestsCache *lru.Cache
 }
 
 // NewReporter returns a new Reporter.
 func NewReporter(cfg ReporterConfig) (*Reporter, error) {
+	err := utils.RegisterPrometheusCollectors(prometheusCollectors...)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
+
+	cache, err := lru.NewWithEvict(cfg.TopRequestsCount, func(key interface{}, value interface{}) {
+		labels, ok := key.(topRequestsCacheKey)
+		if !ok {
+			log.Errorf("BUG: invalid cache key type: %T", key)
+			return
+		}
+		// Evict the key from requests metric.
+		requests.DeleteLabelValues(labels.component, labels.key, labels.isRange)
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 	r := &Reporter{
-		ReporterConfig: cfg,
+		ReporterConfig:   cfg,
+		topRequestsCache: cache,
 	}
 	return r, nil
 }
@@ -78,7 +116,7 @@ func (s *Reporter) GetRange(ctx context.Context, startKey []byte, endKey []byte,
 	if err != nil {
 		batchReadRequestsFailed.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(OpGet, startKey, endKey)
+	s.trackRequest(types.OpGet, startKey, endKey)
 	return res, err
 }
 
@@ -91,7 +129,7 @@ func (s *Reporter) Create(ctx context.Context, i Item) (*Lease, error) {
 	if err != nil {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(OpPut, i.Key, nil)
+	s.trackRequest(types.OpPut, i.Key, nil)
 	return lease, err
 }
 
@@ -105,7 +143,7 @@ func (s *Reporter) Put(ctx context.Context, i Item) (*Lease, error) {
 	if err != nil {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(OpPut, i.Key, nil)
+	s.trackRequest(types.OpPut, i.Key, nil)
 	return lease, err
 }
 
@@ -118,7 +156,7 @@ func (s *Reporter) Update(ctx context.Context, i Item) (*Lease, error) {
 	if err != nil {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(OpPut, i.Key, nil)
+	s.trackRequest(types.OpPut, i.Key, nil)
 	return lease, err
 }
 
@@ -131,7 +169,7 @@ func (s *Reporter) Get(ctx context.Context, key []byte) (*Item, error) {
 	if err != nil && !trace.IsNotFound(err) {
 		readRequestsFailed.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(OpGet, key, nil)
+	s.trackRequest(types.OpGet, key, nil)
 	return item, err
 }
 
@@ -145,7 +183,7 @@ func (s *Reporter) CompareAndSwap(ctx context.Context, expected Item, replaceWit
 	if err != nil && !trace.IsNotFound(err) && !trace.IsCompareFailed(err) {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(OpPut, expected.Key, nil)
+	s.trackRequest(types.OpPut, expected.Key, nil)
 	return lease, err
 }
 
@@ -158,7 +196,7 @@ func (s *Reporter) Delete(ctx context.Context, key []byte) error {
 	if err != nil && !trace.IsNotFound(err) {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(OpDelete, key, nil)
+	s.trackRequest(types.OpDelete, key, nil)
 	return err
 }
 
@@ -171,7 +209,7 @@ func (s *Reporter) DeleteRange(ctx context.Context, startKey []byte, endKey []by
 	if err != nil && !trace.IsNotFound(err) {
 		batchWriteRequestsFailed.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(OpDelete, startKey, endKey)
+	s.trackRequest(types.OpDelete, startKey, endKey)
 	return err
 }
 
@@ -187,7 +225,7 @@ func (s *Reporter) KeepAlive(ctx context.Context, lease Lease, expires time.Time
 	if err != nil && !trace.IsNotFound(err) {
 		writeRequestsFailed.WithLabelValues(s.Component).Inc()
 	}
-	s.trackRequest(OpPut, lease.Key, nil)
+	s.trackRequest(types.OpPut, lease.Key, nil)
 	return err
 }
 
@@ -219,31 +257,66 @@ func (s *Reporter) Clock() clockwork.Clock {
 // Migrate runs the necessary data migrations for this backend.
 func (s *Reporter) Migrate(ctx context.Context) error { return s.Backend.Migrate(ctx) }
 
+type topRequestsCacheKey struct {
+	component string
+	key       string
+	isRange   string
+}
+
 // trackRequests tracks top requests, endKey is supplied for ranges
-func (s *Reporter) trackRequest(opType OpType, key []byte, endKey []byte) {
-	if !s.TrackTopRequests {
-		return
-	}
+func (s *Reporter) trackRequest(opType types.OpType, key []byte, endKey []byte) {
 	if len(key) == 0 {
 		return
 	}
-	// take just the first two parts, otherwise too many distinct requests
-	// can end up in the map
-	parts := bytes.Split(key, []byte{Separator})
-	if len(parts) > 3 {
-		parts = parts[:3]
-	}
+	keyLabel := buildKeyLabel(key, sensitiveBackendPrefixes)
 	rangeSuffix := teleport.TagFalse
 	if len(endKey) != 0 {
 		// Range denotes range queries in stat entry
 		rangeSuffix = teleport.TagTrue
 	}
-	counter, err := requests.GetMetricWithLabelValues(s.Component, string(bytes.Join(parts, []byte{Separator})), rangeSuffix)
+
+	s.topRequestsCache.Add(topRequestsCacheKey{
+		component: s.Component,
+		key:       keyLabel,
+		isRange:   rangeSuffix,
+	}, struct{}{})
+	counter, err := requests.GetMetricWithLabelValues(s.Component, keyLabel, rangeSuffix)
 	if err != nil {
 		log.Warningf("Failed to get counter: %v", err)
 		return
 	}
 	counter.Inc()
+}
+
+// buildKeyLabel builds the key label for storing to the backend. The last
+// portion of the key is scrambled if it is determined to be sensitive based
+// on sensitivePrefixes.
+func buildKeyLabel(key []byte, sensitivePrefixes []string) string {
+	// Take just the first two parts, otherwise too many distinct requests
+	// can end up in the map.
+	parts := bytes.Split(key, []byte{Separator})
+	if len(parts) > 3 {
+		parts = parts[:3]
+	}
+	if len(parts) < 3 || len(parts[0]) != 0 {
+		return string(bytes.Join(parts, []byte{Separator}))
+	}
+
+	if apiutils.SliceContainsStr(sensitivePrefixes, string(parts[1])) {
+		hiddenBefore := int(math.Floor(0.75 * float64(len(parts[2]))))
+		asterisks := bytes.Repeat([]byte("*"), hiddenBefore)
+		parts[2] = append(asterisks, parts[2][hiddenBefore:]...)
+	}
+	return string(bytes.Join(parts, []byte{Separator}))
+}
+
+// sensitiveBackendPrefixes is a list of backend request prefixes preceding
+// sensitive values.
+var sensitiveBackendPrefixes = []string{
+	"tokens",
+	"resetpasswordtokens",
+	"adduseru2fchallenges",
+	"access_requests",
 }
 
 // ReporterWatcher is a wrapper around backend
@@ -392,23 +465,11 @@ var (
 		},
 		[]string{teleport.ComponentLabel},
 	)
-)
 
-func init() {
-	// Metrics have to be registered to be exposed:
-	prometheus.MustRegister(watchers)
-	prometheus.MustRegister(watcherQueues)
-	prometheus.MustRegister(requests)
-	prometheus.MustRegister(writeRequests)
-	prometheus.MustRegister(writeRequestsFailed)
-	prometheus.MustRegister(batchWriteRequests)
-	prometheus.MustRegister(batchWriteRequestsFailed)
-	prometheus.MustRegister(readRequests)
-	prometheus.MustRegister(readRequestsFailed)
-	prometheus.MustRegister(batchReadRequests)
-	prometheus.MustRegister(batchReadRequestsFailed)
-	prometheus.MustRegister(writeLatencies)
-	prometheus.MustRegister(batchWriteLatencies)
-	prometheus.MustRegister(batchReadLatencies)
-	prometheus.MustRegister(readLatencies)
-}
+	prometheusCollectors = []prometheus.Collector{
+		watchers, watcherQueues, requests, writeRequests,
+		writeRequestsFailed, batchWriteRequests, batchWriteRequestsFailed, readRequests,
+		readRequestsFailed, batchReadRequests, batchReadRequestsFailed, writeLatencies,
+		batchWriteLatencies, batchReadLatencies, readLatencies,
+	}
+)

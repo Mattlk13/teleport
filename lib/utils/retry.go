@@ -17,22 +17,37 @@ limitations under the License.
 package utils
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
+	log "github.com/sirupsen/logrus"
 )
+
+// HalfJitter is a global jitter instance used for one-off jitters.
+// Prefer instantiating a new jitter instance for operations that require
+// repeated calls.
+var HalfJitter = NewHalfJitter()
 
 // Jitter is a function which applies random jitter to a
 // duration.  Used to randomize backoff values.  Must be
 // safe for concurrent usage.
 type Jitter func(time.Duration) time.Duration
 
-// NewJitter returns the default jitter (currently jitters on
+// NewJitter builds a new default jitter (currently jitters on
 // the range [n/2,n), but this is subject to change).
 func NewJitter() Jitter {
+	return NewHalfJitter()
+}
+
+// NewHalfJitter returns a new jitter on the range [n/2,n).  This is
+// a large range and most suitable for jittering things like backoff
+// operations where breaking cycles quickly is a priority.
+func NewHalfJitter() Jitter {
 	var mu sync.Mutex
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	return func(d time.Duration) time.Duration {
@@ -44,6 +59,24 @@ func NewJitter() Jitter {
 		mu.Lock()
 		defer mu.Unlock()
 		return (d / 2) + time.Duration(rng.Int63n(int64(d))/2)
+	}
+}
+
+// NewSeventhJitter builds a new jitter on the range [6n/7,n). Prefer smaller
+// jitters such as this when jittering periodic operations (e.g. cert rotation
+// checks) since large jitters result in significantly increased load.
+func NewSeventhJitter() Jitter {
+	var mu sync.Mutex
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	return func(d time.Duration) time.Duration {
+		// values less than 1 cause rng to panic, and some logic
+		// relies on treating zero duration as non-blocking case.
+		if d < 1 {
+			return 0
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return (6 * d / 7) + time.Duration(rng.Int63n(int64(d))/7)
 	}
 }
 
@@ -83,6 +116,8 @@ type LinearConfig struct {
 	// AutoReset, if greater than zero, causes the linear retry to automatically
 	// reset after Max * AutoReset has elapsed since the last call to Incr.
 	AutoReset int64
+	// Clock to override clock in tests
+	Clock clockwork.Clock
 }
 
 // CheckAndSetDefaults checks and sets defaults
@@ -92,6 +127,9 @@ func (c *LinearConfig) CheckAndSetDefaults() error {
 	}
 	if c.Max == 0 {
 		return trace.BadParameter("missing parameter Max")
+	}
+	if c.Clock == nil {
+		c.Clock = clockwork.NewRealClock()
 	}
 	return nil
 }
@@ -112,6 +150,11 @@ func newLinear(cfg LinearConfig) *Linear {
 	return &Linear{LinearConfig: cfg, closedChan: closedChan}
 }
 
+// NewConstant returns a new linear retry with constant interval.
+func NewConstant(interval time.Duration) (*Linear, error) {
+	return NewLinear(LinearConfig{Step: interval, Max: interval})
+}
+
 // Linear is used to calculate retry period
 // that follows the following logic:
 // On the first error there is no delay
@@ -125,9 +168,16 @@ type Linear struct {
 	closedChan chan time.Time
 }
 
-// Reset resetes retry period to initial state
+// Reset resets retry period to initial state
 func (r *Linear) Reset() {
 	r.attempt = 0
+}
+
+// ResetToDelay resetes retry period to initial and increments to the next attempt
+// similar to Reset() and Inc()
+func (r *Linear) ResetToDelay() {
+	r.Reset()
+	r.Inc()
 }
 
 // Clone creates an identical copy of Linear with fresh state.
@@ -149,7 +199,7 @@ func (r *Linear) Inc() {
 	// Linear to function like as a long-lived rate-limiting
 	// device.
 	prev := r.lastIncr
-	r.lastIncr = time.Now()
+	r.lastIncr = r.Clock.Now()
 	if prev.IsZero() {
 		return
 	}
@@ -181,10 +231,65 @@ func (r *Linear) After() <-chan time.Time {
 	if d < 1 {
 		return r.closedChan
 	}
-	return time.After(d)
+	return r.Clock.After(d)
 }
 
 // String returns user-friendly representation of the LinearPeriod
 func (r *Linear) String() string {
 	return fmt.Sprintf("Linear(attempt=%v, duration=%v)", r.attempt, r.Duration())
+}
+
+// For retries the provided function until it succeeds or the context expires.
+// Only errors matching retryIf filter are retried.
+func (r *Linear) For(ctx context.Context, retryFn func() error) error {
+	for {
+		err := retryFn()
+		if err == nil {
+			return nil
+		}
+		if _, ok := trace.Unwrap(err).(*permanentRetryError); ok {
+			return trace.Wrap(err)
+		}
+		log.Debugf("Will retry in %v: %v.", r.Duration(), err)
+		select {
+		case <-r.After():
+			r.Inc()
+		case <-ctx.Done():
+			return trace.LimitExceeded(ctx.Err().Error())
+		}
+	}
+}
+
+// PermanentRetryError returns a new instance of a permanent retry error.
+func PermanentRetryError(err error) error {
+	return &permanentRetryError{err: err}
+}
+
+// permanentRetryError indicates that retry loop should stop.
+type permanentRetryError struct {
+	err error
+}
+
+// Error returns the original error message.
+func (e *permanentRetryError) Error() string {
+	return e.err.Error()
+}
+
+// RetryFastFor retries a function repeatedly for a set amount of
+// time before returning an error.
+//
+// Intended mostly for tests.
+func RetryStaticFor(d time.Duration, w time.Duration, f func() error) error {
+	start := time.Now()
+	var err error
+
+	for time.Since(start) < d {
+		if err = f(); err == nil {
+			break
+		}
+
+		time.Sleep(w)
+	}
+
+	return err
 }

@@ -1,3 +1,5 @@
+// +build linux
+
 /*
 Copyright 2015-2018 Gravitational, Inc.
 
@@ -33,21 +35,27 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/types"
+	apievents "github.com/gravitational/teleport/api/types/events"
+	apisshutils "github.com/gravitational/teleport/api/utils/sshutils"
 	"github.com/gravitational/teleport/lib/auth"
 	authority "github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/backend/lite"
 	"github.com/gravitational/teleport/lib/bpf"
 	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/fixtures"
 	"github.com/gravitational/teleport/lib/pam"
+	restricted "github.com/gravitational/teleport/lib/restrictedsession"
 	"github.com/gravitational/teleport/lib/services"
 	rsession "github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/sshutils"
 	"github.com/gravitational/teleport/lib/utils"
 
-	"github.com/docker/docker/pkg/term"
-	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/moby/term"
 	"gopkg.in/check.v1"
+
+	"github.com/gravitational/trace"
 )
 
 // ExecSuite also implements ssh.ConnMetadata
@@ -56,15 +64,15 @@ type ExecSuite struct {
 	ctx        *ServerContext
 	localAddr  net.Addr
 	remoteAddr net.Addr
-	a          *auth.AuthServer
+	a          *auth.Server
 }
 
 var _ = check.Suite(&ExecSuite{})
-var _ = fmt.Printf
 
 // TestMain will re-execute Teleport to run a command if "exec" is passed to
 // it as an argument. Otherwise it will run tests as normal.
 func TestMain(m *testing.M) {
+	utils.InitLoggerForTests()
 	// If the test is re-executing itself, execute the command that comes over
 	// the pipe.
 	if len(os.Args) == 2 && os.Args[1] == teleport.ExecSubCommand {
@@ -78,18 +86,17 @@ func TestMain(m *testing.M) {
 }
 
 func (s *ExecSuite) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests(testing.Verbose())
-
-	bk, err := lite.NewWithConfig(context.TODO(), lite.Config{Path: c.MkDir()})
+	ctx := context.TODO()
+	bk, err := lite.NewWithConfig(ctx, lite.Config{Path: c.MkDir()})
 	c.Assert(err, check.IsNil)
 
-	clusterName, err := services.NewClusterName(services.ClusterNameSpecV2{
+	clusterName, err := services.NewClusterNameWithRandomID(types.ClusterNameSpecV2{
 		ClusterName: "localhost",
 	})
 	c.Assert(err, check.IsNil)
 
 	c.Assert(err, check.IsNil)
-	s.a, err = auth.NewAuthServer(&auth.InitConfig{
+	s.a, err = auth.NewServer(&auth.InitConfig{
 		Backend:     bk,
 		Authority:   authority.New(),
 		ClusterName: clusterName,
@@ -99,8 +106,8 @@ func (s *ExecSuite) SetUpSuite(c *check.C) {
 	c.Assert(err, check.IsNil)
 
 	// set static tokens
-	staticTokens, err := services.NewStaticTokens(services.StaticTokensSpecV2{
-		StaticTokens: []services.ProvisionTokenV1{},
+	staticTokens, err := types.NewStaticTokens(types.StaticTokensSpecV2{
+		StaticTokens: []types.ProvisionTokenV1{},
 	})
 	c.Assert(err, check.IsNil)
 	err = s.a.SetStaticTokens(staticTokens)
@@ -111,23 +118,29 @@ func (s *ExecSuite) SetUpSuite(c *check.C) {
 	c.Assert(err, check.IsNil)
 
 	s.usr, _ = user.Current()
+	cert, err := apisshutils.ParseCertificate([]byte(fixtures.UserCertificateStandard))
+	c.Assert(err, check.IsNil)
 	s.ctx = &ServerContext{
-		ConnectionContext: &sshutils.ConnectionContext{},
-		IsTestStub:        true,
-		ClusterName:       "localhost",
+		ConnectionContext: &sshutils.ConnectionContext{
+			ServerConn: &ssh.ServerConn{Conn: s},
+		},
+		IsTestStub:  true,
+		ClusterName: "localhost",
 		srv: &fakeServer{
 			accessPoint: s.a,
 			auditLog:    &fakeLog{},
 			id:          "00000000-0000-0000-0000-000000000000",
 		},
-	}
-	s.ctx.Identity.Login = s.usr.Username
-	s.ctx.session = &session{id: "xxx", term: &fakeTerminal{f: f}}
-	s.ctx.Identity.TeleportUser = "galt"
-	s.ctx.ServerConn = &ssh.ServerConn{Conn: s}
-	s.ctx.ExecRequest = &localExec{Ctx: s.ctx}
-	s.ctx.request = &ssh.Request{
-		Type: sshutils.ExecRequest,
+		Identity: IdentityContext{
+			Login:        s.usr.Username,
+			TeleportUser: "galt",
+			Certificate:  cert,
+		},
+		session:     &session{id: "xxx", term: &fakeTerminal{f: f}},
+		ExecRequest: &localExec{Ctx: s.ctx},
+		request: &ssh.Request{
+			Type: sshutils.ExecRequest,
+		},
 	}
 
 	term, err := newLocalTerminal(s.ctx)
@@ -209,7 +222,7 @@ func (s *ExecSuite) TestLoginDefsParser(c *check.C) {
 // TestEmitExecAuditEvent make sure the full command and exit code for a
 // command is always recorded.
 func (s *ExecSuite) TestEmitExecAuditEvent(c *check.C) {
-	fakeLog, ok := s.ctx.srv.GetAuditLog().(*fakeLog)
+	fakeServer, ok := s.ctx.srv.(*fakeServer)
 	c.Assert(ok, check.Equals, true)
 
 	var tests = []struct {
@@ -242,8 +255,9 @@ func (s *ExecSuite) TestEmitExecAuditEvent(c *check.C) {
 	}
 	for _, tt := range tests {
 		emitExecAuditEvent(s.ctx, tt.inCommand, tt.inError)
-		c.Assert(fakeLog.lastEvent.GetString(events.ExecEventCommand), check.Equals, tt.outCommand)
-		c.Assert(fakeLog.lastEvent.GetString(events.ExecEventCode), check.Equals, tt.outCode)
+		execEvent := fakeServer.LastEvent().(*apievents.Exec)
+		c.Assert(execEvent.Command, check.Equals, tt.outCommand)
+		c.Assert(execEvent.ExitCode, check.Equals, tt.outCode)
 	}
 }
 
@@ -409,9 +423,14 @@ func (f *fakeTerminal) SetTermType(string) {
 
 // fakeServer is stub for tests
 type fakeServer struct {
-	auditLog    events.IAuditLog
+	auditLog events.IAuditLog
+	events.MockEmitter
 	accessPoint auth.AccessPoint
 	id          string
+}
+
+func (f *fakeServer) Context() context.Context {
+	return context.TODO()
 }
 
 func (f *fakeServer) ID() string {
@@ -438,13 +457,6 @@ func (f *fakeServer) PermitUserEnvironment() bool {
 	return true
 }
 
-func (s *fakeServer) EmitAuditEvent(events.Event, events.EventFields) {
-}
-
-func (f *fakeServer) GetAuditLog() events.IAuditLog {
-	return f.auditLog
-}
-
 func (f *fakeServer) GetAccessPoint() auth.AccessPoint {
 	return f.accessPoint
 }
@@ -465,8 +477,32 @@ func (f *fakeServer) GetClock() clockwork.Clock {
 	return nil
 }
 
-func (f *fakeServer) GetInfo() services.Server {
-	return nil
+func (f *fakeServer) GetInfo() types.Server {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "localhost"
+	}
+
+	return &types.ServerV2{
+		Kind:    types.KindNode,
+		Version: types.V2,
+		Metadata: types.Metadata{
+			Name:      "",
+			Namespace: "",
+			Labels:    make(map[string]string),
+		},
+		Spec: types.ServerSpecV2{
+			CmdLabels: make(map[string]types.CommandLabelV2),
+			Addr:      "",
+			Hostname:  hostname,
+			UseTunnel: false,
+			Version:   teleport.Version,
+		},
+	}
+}
+
+func (f *fakeServer) GetUtmpPath() (string, string) {
+	return "", ""
 }
 
 func (f *fakeServer) UseTunnel() bool {
@@ -477,14 +513,20 @@ func (f *fakeServer) GetBPF() bpf.BPF {
 	return &bpf.NOP{}
 }
 
-// fakeLog is used in tests to obtain the last event emit to the Audit Log.
-type fakeLog struct {
-	lastEvent events.EventFields
+func (f *fakeServer) GetRestrictedSessionManager() restricted.Manager {
+	return &restricted.NOP{}
 }
 
-func (a *fakeLog) EmitAuditEvent(e events.Event, f events.EventFields) error {
-	a.lastEvent = f
-	return nil
+// fakeLog is used in tests to obtain the last event emit to the Audit Log.
+type fakeLog struct {
+}
+
+func (a *fakeLog) EmitAuditEventLegacy(e events.Event, f events.EventFields) error {
+	return trace.NotImplemented("not implemented")
+}
+
+func (a *fakeLog) EmitAuditEvent(ctx context.Context, e apievents.AuditEvent) error {
+	return trace.NotImplemented("not implemented")
 }
 
 func (a *fakeLog) PostSessionSlice(s events.SessionSlice) error {
@@ -503,12 +545,18 @@ func (a *fakeLog) GetSessionEvents(namespace string, sid rsession.ID, after int,
 	return nil, trace.NotFound("")
 }
 
-func (a *fakeLog) SearchEvents(fromUTC, toUTC time.Time, query string, limit int) ([]events.EventFields, error) {
-	return nil, trace.NotFound("")
+func (a *fakeLog) SearchEvents(fromUTC, toUTC time.Time, namespace string, eventTypes []string, limit int, order types.EventOrder, startKey string) ([]apievents.AuditEvent, string, error) {
+	return nil, "", trace.NotFound("")
 }
 
-func (a *fakeLog) SearchSessionEvents(fromUTC time.Time, toUTC time.Time, limit int) ([]events.EventFields, error) {
-	return nil, trace.NotFound("")
+func (a *fakeLog) SearchSessionEvents(fromUTC time.Time, toUTC time.Time, limit int, order types.EventOrder, startKey string) ([]apievents.AuditEvent, string, error) {
+	return nil, "", trace.NotFound("")
+}
+
+func (a *fakeLog) StreamSessionEvents(ctx context.Context, sessionID rsession.ID, startIndex int64) (chan apievents.AuditEvent, chan error) {
+	c, e := make(chan apievents.AuditEvent), make(chan error, 1)
+	e <- trace.NotImplemented("not implemented")
+	return c, e
 }
 
 func (a *fakeLog) WaitForDelivery(context.Context) error {

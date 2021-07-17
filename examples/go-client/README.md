@@ -1,47 +1,48 @@
 ## Teleport Auth Go Client
 
-### Introduction
+This program demonstrates how to...
 
-Teleport Auth Server has an API which hasn't been officially documented (yet).
-Both `tctl` and `tsh` use the Auth API to:
-
-* Request certificates (`tsh login` or `tctl auth sign`)
-* Add nodes and users (`tctl users` and `tctl nodes`)
-* Manipulate cluster state (`tctl` resources)
-
-### API Authentication
-
-Auth API clients must perform two-way authentication using x509 certificates:
-
-1. They have to validate the auth server x509 certificate to make sure the
-   API endpoint can be trusted.
-2. They must offer their x509 certificate, which has been previously issued
-   by the auth sever.
+1. Authenticate the client using credential loaders.
+2. Authorize API calls using an independent user and role.
+3. Create a new client and make API calls to the Auth server.
 
 ### Demo
 
-This little program demonstrates how to:
+This demo can be used to quickly get the API client up and running.
 
-1. Authenticate against the Auth API using two certificates.
-2. Makes an API call to issue a server join token, i.e. an equivalent 
-   of `tctl node add`
+##### Create resources
 
-Before running it, you have to use `tctl` to issue an API certificate,
-i.e. on the auth server:
-
-```
-$ tctl auth export --type=tls > /var/lib/teleport/ca.cert
-```
-
-This should work as long as you execute it on the same auth server:
+Create the `access-admin` user and role using the following commands:
 
 ```bash
-$ go get github.com/gravitational/teleport/lib/auth
+$ tctl create -f access-admin.yaml
+$ tctl users add access-admin --roles=access-admin
+```
+
+##### Generate Credentials
+
+Login with `tsh` to generate Profile credentials.
+
+```bash
+# login and automatically generate keys
+$ tsh login --user=access-admin
+```
+
+NOTE: You can pass the `InsecureAddressDiscovery` in `client.Config` field to skip verification of the TLS certificate of the proxy. Don't do this for production clients.
+
+##### Run
+
+```bash
 $ go run main.go
 ```
 
-### TODO
+### Reference
 
-This Auth server API allows clients to "jump" to API endpoints of all trusted
-clusters connected to it. We need to add a snippet how to enumerate trusted
-clusters and connect to their API endpoints later.
+To see more information on the Go Client and how to use it, visit our API documentation:
+
+- [Introduction](https:/goteleport.com/docs/reference/api/introduction)
+- [Getting Started](https:/goteleport.com/docs/reference/api/getting-started)
+- [Architecture](https:/goteleport.com/docs/reference/api/architecture)
+- [pkg.go.dev](https://pkg.go.dev/github.com/gravitational/teleport/api/client)
+  - [Client type](https://pkg.go.dev/github.com/gravitational/teleport/api/client#Client)
+  - [Credentials type](https://pkg.go.dev/github.com/gravitational/teleport/api/client#Credentials)

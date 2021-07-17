@@ -18,35 +18,34 @@ package auth
 
 import (
 	"context"
-	"fmt"
+	"net/url"
 	"time"
 
+	"github.com/gravitational/teleport/api/types"
 	authority "github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/lite"
+	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/trace"
 
 	"github.com/jonboulle/clockwork"
 	"gopkg.in/check.v1"
 )
 
 type GithubSuite struct {
-	a *AuthServer
-	b backend.Backend
-	c clockwork.FakeClock
+	a           *Server
+	mockEmitter *events.MockEmitter
+	b           backend.Backend
+	c           clockwork.FakeClock
 }
 
-var _ = fmt.Printf
 var _ = check.Suite(&GithubSuite{})
 
 func (s *GithubSuite) SetUpSuite(c *check.C) {
-	var err error
-
-	utils.InitLoggerForTests()
-
 	s.c = clockwork.NewFakeClockAt(time.Now())
 
+	var err error
 	s.b, err = lite.NewWithConfig(context.Background(), lite.Config{
 		Path:             c.MkDir(),
 		PollStreamPeriod: 200 * time.Millisecond,
@@ -54,7 +53,7 @@ func (s *GithubSuite) SetUpSuite(c *check.C) {
 	})
 	c.Assert(err, check.IsNil)
 
-	clusterName, err := services.NewClusterName(services.ClusterNameSpecV2{
+	clusterName, err := services.NewClusterNameWithRandomID(types.ClusterNameSpecV2{
 		ClusterName: "me.localhost",
 	})
 	c.Assert(err, check.IsNil)
@@ -65,18 +64,21 @@ func (s *GithubSuite) SetUpSuite(c *check.C) {
 		Authority:              authority.New(),
 		SkipPeriodicOperations: true,
 	}
-	s.a, err = NewAuthServer(authConfig)
+	s.a, err = NewServer(authConfig)
 	c.Assert(err, check.IsNil)
+
+	s.mockEmitter = &events.MockEmitter{}
+	s.a.emitter = s.mockEmitter
 }
 
 func (s *GithubSuite) TestPopulateClaims(c *check.C) {
 	claims, err := populateGithubClaims(&testGithubAPIClient{})
 	c.Assert(err, check.IsNil)
-	c.Assert(claims, check.DeepEquals, &services.GithubClaims{
+	c.Assert(claims, check.DeepEquals, &types.GithubClaims{
 		Username: "octocat",
 		OrganizationToTeams: map[string][]string{
-			"org1": []string{"team1", "team2"},
-			"org2": []string{"team1"},
+			"org1": {"team1", "team2"},
+			"org2": {"team1"},
 		},
 	})
 }
@@ -126,4 +128,45 @@ func (c *testGithubAPIClient) getTeams() ([]teamResponse, error) {
 			Org:  orgResponse{Login: "org2"},
 		},
 	}, nil
+}
+
+func (s *GithubSuite) TestValidateGithubAuthCallbackEventsEmitted(c *check.C) {
+	auth := &githubAuthResponse{
+		auth: GithubAuthResponse{
+			Username: "test-name",
+		},
+		claims: map[string][]string{
+			"test": {},
+		},
+	}
+
+	m := &mockedGithubManager{}
+
+	// Test success event.
+	m.mockValidateGithubAuthCallback = func(q url.Values) (*githubAuthResponse, error) {
+		return auth, nil
+	}
+	_, _ = validateGithubAuthCallbackHelper(context.Background(), m, nil, s.a.emitter)
+	c.Assert(s.mockEmitter.LastEvent().GetType(), check.Equals, events.UserLoginEvent)
+	c.Assert(s.mockEmitter.LastEvent().GetCode(), check.Equals, events.UserSSOLoginCode)
+	s.mockEmitter.Reset()
+
+	// Test failure event.
+	m.mockValidateGithubAuthCallback = func(q url.Values) (*githubAuthResponse, error) {
+		return auth, trace.BadParameter("")
+	}
+	_, _ = validateGithubAuthCallbackHelper(context.Background(), m, nil, s.a.emitter)
+	c.Assert(s.mockEmitter.LastEvent().GetCode(), check.Equals, events.UserSSOLoginFailureCode)
+}
+
+type mockedGithubManager struct {
+	mockValidateGithubAuthCallback func(q url.Values) (*githubAuthResponse, error)
+}
+
+func (m *mockedGithubManager) validateGithubAuthCallback(q url.Values) (*githubAuthResponse, error) {
+	if m.mockValidateGithubAuthCallback != nil {
+		return m.mockValidateGithubAuthCallback(q)
+	}
+
+	return nil, trace.NotImplemented("mockValidateGithubAuthCallback not implemented")
 }

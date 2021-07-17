@@ -16,38 +16,15 @@ limitations under the License.
 
 package utils
 
-// CopyByteSlice returns a copy of the byte slice.
-func CopyByteSlice(in []byte) []byte {
+// CopyStringsMap returns a copy of the strings map
+func CopyStringsMap(in map[string]string) map[string]string {
 	if in == nil {
 		return nil
 	}
-	out := make([]byte, len(in))
-	copy(out, in)
-	return out
-}
-
-// CopyByteSlices returns a copy of the byte slices.
-func CopyByteSlices(in [][]byte) [][]byte {
-	if in == nil {
-		return nil
+	out := make(map[string]string, len(in))
+	for key, val := range in {
+		out[key] = val
 	}
-	out := make([][]byte, len(in))
-	for i := range in {
-		out[i] = CopyByteSlice(in[i])
-	}
-	return out
-}
-
-// CopyStrings makes a deep copy of the passed in string slice and returns
-// the copy.
-func CopyStrings(in []string) []string {
-	if in == nil {
-		return nil
-	}
-
-	out := make([]string, len(in))
-	copy(out, in)
-
 	return out
 }
 

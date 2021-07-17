@@ -22,11 +22,11 @@ package bpf
 import "C"
 
 import (
-	"unsafe"
+	"context"
 
-	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
@@ -52,6 +52,9 @@ type BPF interface {
 // srv.ServerContext, unfortunately due to circular imports with lib/srv and
 // lib/bpf, part of that structure is reproduced in SessionContext.
 type SessionContext struct {
+	// Context is a cancel context, scoped to a server, and not a session.
+	Context context.Context
+
 	// Namespace is the namespace within which this session occurs.
 	Namespace string
 
@@ -71,8 +74,8 @@ type SessionContext struct {
 	// used by Teleport to find itself by cgroup.
 	PID int
 
-	// AuditLog is used to store events for a particular sessionl
-	AuditLog events.IAuditLog
+	// Emitter is used to record events for a particular session
+	Emitter apievents.Emitter
 
 	// Events is the set of events (command, disk, or network) to record for
 	// this session.
@@ -139,10 +142,7 @@ func (s *NOP) CloseSession(ctx *SessionContext) error {
 
 // IsHostCompatible checks that BPF programs can run on this host.
 func IsHostCompatible() error {
-	// To find the cgroup ID of a program, bpf_get_current_cgroup_id is needed
-	// which was introduced in 4.18.
-	// https://github.com/torvalds/linux/commit/bf6fa2c893c5237b48569a13fa3c673041430b6c
-	minKernel := semver.New(teleport.EnhancedRecordingMinKernel)
+	minKernel := semver.New(constants.EnhancedRecordingMinKernel)
 	version, err := utils.KernelVersion()
 	if err != nil {
 		return trace.Wrap(err)
@@ -151,12 +151,8 @@ func IsHostCompatible() error {
 		return trace.BadParameter("incompatible kernel found, minimum supported kernel is %v", minKernel)
 	}
 
-	// Check that libbcc is on the system.
-	libraryName := C.CString("libbcc.so.0")
-	defer C.free(unsafe.Pointer(libraryName))
-	handle := C.dlopen(libraryName, C.RTLD_NOW)
-	if handle == nil {
-		return trace.BadParameter("libbcc.so not found")
+	if err = utils.HasBTF(); err != nil {
+		return trace.Wrap(err)
 	}
 
 	return nil

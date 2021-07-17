@@ -1,6 +1,6 @@
 ## Configuring High Availability
 
-Running multiple instances of the Authentication Services requires using a high availability storage configuration.  The [documentation](https://gravitational.com/teleport/docs/admin-guide/#high-availability) provides detailed examples using AWS DynamoDB/S3, GCP Firestore/Google storage or an `etcd` cluster. Here we provide detailed steps for an AWS example configuration.
+Running multiple instances of the Authentication Services requires using a High Availability storage configuration.  The [documentation](https://gravitational.com/teleport/docs/admin-guide/#high-availability) provides detailed examples using AWS DynamoDB/S3, GCP Firestore/Google storage or an `etcd` cluster. Here we provide detailed steps for an AWS example configuration.
 
 ### Prerequisites
  - Available AWS credentials (/home/<user>/.aws/credentials)
@@ -44,7 +44,7 @@ extraAuthVolumeMounts:
 
 ### Configuring Multiple Instances of Teleport
 
-A high availability deployment of Teleport will typically have at least 2 proxy and 2 auth service instances.  SSH service is typically not enabled on these instances.  To enable separate deployments of the auth and auth services follow these steps.
+A High Availability deployment of Teleport will typically have at least two proxy and two auth service instances. SSH service is typically not enabled on these instances. To enable separate deployments of the auth and auth services follow these steps.
 
 1. In the configuration section set the `highAvailability` to true.  Also confirm the auth public address and Service Type.
 ```yaml
@@ -52,7 +52,8 @@ A high availability deployment of Teleport will typically have at least 2 proxy 
   # High availability configuration with proxy and auth servers. No SSH configured service.
   proxyCount: 2
   authCount: 2
-  authServiceType: ClusterIP
+  authService:
+    type: ClusterIP
   auth_public_address: auth.example.com
 ```
 2. Set the connection for the proxies to connect to the auth service in the config section. The auth service is available at the Kubernetes service name and the public address setting.  So if you deploy an app named `myexample` then the auth service will be available in the Cluster at `myexampleauth` in addition to the public address.
@@ -66,12 +67,12 @@ A high availability deployment of Teleport will typically have at least 2 proxy 
 ```
 ### Confirming
 
-After configuring both of these options run the install.  In the example below you will see two teleport pods that are the Proxy instances  (teleport-) and two teleport pods that that are the Auth instances (teleportauth-).
+After configuring both of these options run the install.  In the example below you will see two teleport pods that are the Proxy instances (`teleport-`) and two teleport pods that that are the Auth instances (`teleportauth-`).
 
 ``` bash
-$ helm install --name teleport ./
+$ helm install teleport ./
 
-$ kubectl get pods 
+$ kubectl get pods
 NAME                            READY   STATUS    RESTARTS   AGE
 teleport-d67584df8-8vfls        1/1     Running   0          62m
 teleport-d67584df8-p9l2g        1/1     Running   0          62m

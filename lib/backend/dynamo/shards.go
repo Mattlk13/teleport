@@ -1,5 +1,5 @@
 /*
-Copyright 2015-2019 Gravitational, Inc.
+Copyright 2015-2020 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
 */
 
 package dynamo
@@ -22,6 +21,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/utils"
 
@@ -38,7 +38,7 @@ type shardEvent struct {
 	err     error
 }
 
-func (b *DynamoDBBackend) asyncPollStreams(ctx context.Context) error {
+func (b *Backend) asyncPollStreams(ctx context.Context) error {
 	retry, err := utils.NewLinear(utils.LinearConfig{
 		Step: b.RetryPeriod / 10,
 		Max:  b.RetryPeriod,
@@ -70,7 +70,7 @@ func (b *DynamoDBBackend) asyncPollStreams(ctx context.Context) error {
 	}
 }
 
-func (b *DynamoDBBackend) pollStreams(externalCtx context.Context) error {
+func (b *Backend) pollStreams(externalCtx context.Context) error {
 	ctx, cancel := context.WithCancel(externalCtx)
 	defer cancel()
 
@@ -130,20 +130,20 @@ func (b *DynamoDBBackend) pollStreams(externalCtx context.Context) error {
 	}
 }
 
-func (b *DynamoDBBackend) findStream(ctx context.Context) (*string, error) {
+func (b *Backend) findStream(ctx context.Context) (*string, error) {
 	status, err := b.svc.DescribeTableWithContext(ctx, &dynamodb.DescribeTableInput{
-		TableName: aws.String(b.Tablename),
+		TableName: aws.String(b.TableName),
 	})
 	if err != nil {
 		return nil, trace.Wrap(convertError(err))
 	}
 	if status.Table.LatestStreamArn == nil {
-		return nil, trace.NotFound("No streams found for table %v", b.Tablename)
+		return nil, trace.NotFound("No streams found for table %v", b.TableName)
 	}
 	return status.Table.LatestStreamArn, nil
 }
 
-func (b *DynamoDBBackend) pollShard(ctx context.Context, streamArn *string, shard *dynamodbstreams.Shard, eventsC chan shardEvent) error {
+func (b *Backend) pollShard(ctx context.Context, streamArn *string, shard *dynamodbstreams.Shard, eventsC chan shardEvent) error {
 	shardIterator, err := b.streams.GetShardIteratorWithContext(ctx, &dynamodbstreams.GetShardIteratorInput{
 		ShardId:           shard.ShardId,
 		ShardIteratorType: aws.String(dynamodbstreams.ShardIteratorTypeLatest),
@@ -168,7 +168,9 @@ func (b *DynamoDBBackend) pollShard(ctx context.Context, streamArn *string, shar
 			if err != nil {
 				return convertError(err)
 			}
-			b.Debugf("Got %v stream shard records.", len(out.Records))
+			if len(out.Records) > 0 {
+				b.Debugf("Got %v new stream shard records.", len(out.Records))
+			}
 			if len(out.Records) == 0 {
 				if out.NextShardIterator == nil {
 					b.Debugf("Shard is closed: %v.", aws.StringValue(shard.ShardId))
@@ -199,7 +201,7 @@ func (b *DynamoDBBackend) pollShard(ctx context.Context, streamArn *string, shar
 }
 
 // collectActiveShards collects shards
-func (b *DynamoDBBackend) collectActiveShards(ctx context.Context, streamArn *string) ([]*dynamodbstreams.Shard, error) {
+func (b *Backend) collectActiveShards(ctx context.Context, streamArn *string) ([]*dynamodbstreams.Shard, error) {
 	var out []*dynamodbstreams.Shard
 
 	input := &dynamodbstreams.DescribeStreamInput{
@@ -228,12 +230,12 @@ func filterActiveShards(shards []*dynamodbstreams.Shard) []*dynamodbstreams.Shar
 	return active
 }
 
-func toOpType(rec *dynamodbstreams.Record) (backend.OpType, error) {
+func toOpType(rec *dynamodbstreams.Record) (types.OpType, error) {
 	switch aws.StringValue(rec.EventName) {
 	case dynamodbstreams.OperationTypeInsert, dynamodbstreams.OperationTypeModify:
-		return backend.OpPut, nil
+		return types.OpPut, nil
 	case dynamodbstreams.OperationTypeRemove:
-		return backend.OpDelete, nil
+		return types.OpDelete, nil
 	default:
 		return -1, trace.BadParameter("unsupported DynamodDB operation: %v", aws.StringValue(rec.EventName))
 	}
@@ -245,7 +247,7 @@ func toEvent(rec *dynamodbstreams.Record) (*backend.Event, error) {
 		return nil, trace.Wrap(err)
 	}
 	switch op {
-	case backend.OpPut:
+	case types.OpPut:
 		var r record
 		if err := dynamodbattribute.UnmarshalMap(rec.Dynamodb.NewImage, &r); err != nil {
 			return nil, trace.Wrap(err)
@@ -263,7 +265,7 @@ func toEvent(rec *dynamodbstreams.Record) (*backend.Event, error) {
 				ID:      r.ID,
 			},
 		}, nil
-	case backend.OpDelete:
+	case types.OpDelete:
 		var r record
 		if err := dynamodbattribute.UnmarshalMap(rec.Dynamodb.Keys, &r); err != nil {
 			return nil, trace.Wrap(err)
@@ -279,7 +281,7 @@ func toEvent(rec *dynamodbstreams.Record) (*backend.Event, error) {
 	}
 }
 
-func (b *DynamoDBBackend) asyncPollShard(ctx context.Context, streamArn *string, shard *dynamodbstreams.Shard, eventsC chan shardEvent) {
+func (b *Backend) asyncPollShard(ctx context.Context, streamArn *string, shard *dynamodbstreams.Shard, eventsC chan shardEvent) {
 	var err error
 	defer func() {
 		if err == nil {
@@ -295,9 +297,9 @@ func (b *DynamoDBBackend) asyncPollShard(ctx context.Context, streamArn *string,
 	err = b.pollShard(ctx, streamArn, shard, eventsC)
 }
 
-func (b *DynamoDBBackend) turnOnTimeToLive(ctx context.Context) error {
+func (b *Backend) turnOnTimeToLive(ctx context.Context) error {
 	status, err := b.svc.DescribeTimeToLiveWithContext(ctx, &dynamodb.DescribeTimeToLiveInput{
-		TableName: aws.String(b.Tablename),
+		TableName: aws.String(b.TableName),
 	})
 	if err != nil {
 		return trace.Wrap(convertError(err))
@@ -307,7 +309,7 @@ func (b *DynamoDBBackend) turnOnTimeToLive(ctx context.Context) error {
 		return nil
 	}
 	_, err = b.svc.UpdateTimeToLiveWithContext(ctx, &dynamodb.UpdateTimeToLiveInput{
-		TableName: aws.String(b.Tablename),
+		TableName: aws.String(b.TableName),
 		TimeToLiveSpecification: &dynamodb.TimeToLiveSpecification{
 			AttributeName: aws.String(ttlKey),
 			Enabled:       aws.Bool(true),
@@ -316,9 +318,9 @@ func (b *DynamoDBBackend) turnOnTimeToLive(ctx context.Context) error {
 	return convertError(err)
 }
 
-func (b *DynamoDBBackend) turnOnStreams(ctx context.Context) error {
+func (b *Backend) turnOnStreams(ctx context.Context) error {
 	status, err := b.svc.DescribeTableWithContext(ctx, &dynamodb.DescribeTableInput{
-		TableName: aws.String(b.Tablename),
+		TableName: aws.String(b.TableName),
 	})
 	if err != nil {
 		return trace.Wrap(convertError(err))
@@ -327,7 +329,7 @@ func (b *DynamoDBBackend) turnOnStreams(ctx context.Context) error {
 		return nil
 	}
 	_, err = b.svc.UpdateTableWithContext(ctx, &dynamodb.UpdateTableInput{
-		TableName: aws.String(b.Tablename),
+		TableName: aws.String(b.TableName),
 		StreamSpecification: &dynamodb.StreamSpecification{
 			StreamEnabled:  aws.Bool(true),
 			StreamViewType: aws.String(dynamodb.StreamViewTypeNewImage),

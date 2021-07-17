@@ -22,6 +22,7 @@ import (
 	"runtime"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/trace"
 )
 
@@ -75,10 +76,19 @@ func (r *RemoveDirCloser) Close() error {
 }
 
 // IsDir is a helper function to quickly check if a given path is a valid directory
-func IsDir(dirPath string) bool {
-	fi, err := os.Stat(dirPath)
+func IsDir(path string) bool {
+	fi, err := os.Stat(path)
 	if err == nil {
 		return fi.IsDir()
+	}
+	return false
+}
+
+// IsFile is a convenience helper to check if the given path is a regular file
+func IsFile(path string) bool {
+	fi, err := os.Stat(path)
+	if err == nil {
+		return fi.Mode().IsRegular()
 	}
 	return false
 }
@@ -117,6 +127,22 @@ func OpenFile(path string) (*os.File, error) {
 	return f, nil
 }
 
+// StatFile stats path, returns error if it exists but a directory.
+func StatFile(path string) (os.FileInfo, error) {
+	newPath, err := NormalizePath(path)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	fi, err := os.Stat(newPath)
+	if err != nil {
+		return nil, trace.ConvertSystemError(err)
+	}
+	if fi.IsDir() {
+		return nil, trace.BadParameter("%v is not a file", path)
+	}
+	return fi, nil
+}
+
 // StatDir stats directory, returns error if file exists, but not a directory
 func StatDir(path string) (os.FileInfo, error) {
 	fi, err := os.Stat(path)
@@ -132,11 +158,11 @@ func StatDir(path string) (os.FileInfo, error) {
 // getHomeDir returns the home directory based off the OS.
 func getHomeDir() string {
 	switch runtime.GOOS {
-	case teleport.LinuxOS:
+	case constants.LinuxOS:
 		return os.Getenv(teleport.EnvHome)
-	case teleport.DarwinOS:
+	case constants.DarwinOS:
 		return os.Getenv(teleport.EnvHome)
-	case teleport.WindowsOS:
+	case constants.WindowsOS:
 		return os.Getenv(teleport.EnvUserProfile)
 	}
 	return ""

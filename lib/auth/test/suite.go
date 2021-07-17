@@ -20,7 +20,12 @@ package test
 import (
 	"time"
 
+	"github.com/gravitational/trace"
+
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/sshutils"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/sshca"
@@ -62,24 +67,24 @@ func (s *AuthSuite) GenerateHostCert(c *check.C) {
 	priv, pub, err := s.A.GenerateKeyPair("")
 	c.Assert(err, check.IsNil)
 
+	caSigner, err := ssh.ParsePrivateKey(priv)
+	c.Assert(err, check.IsNil)
+
 	cert, err := s.A.GenerateHostCert(
 		services.HostCertParams{
-			PrivateCASigningKey: priv,
-			CASigningAlg:        defaults.CASignatureAlgorithm,
-			PublicHostKey:       pub,
-			HostID:              "00000000-0000-0000-0000-000000000000",
-			NodeName:            "auth.example.com",
-			ClusterName:         "example.com",
-			Roles:               teleport.Roles{teleport.RoleAdmin},
-			TTL:                 time.Hour,
+			CASigner:      caSigner,
+			CASigningAlg:  defaults.CASignatureAlgorithm,
+			PublicHostKey: pub,
+			HostID:        "00000000-0000-0000-0000-000000000000",
+			NodeName:      "auth.example.com",
+			ClusterName:   "example.com",
+			Roles:         types.SystemRoles{types.RoleAdmin},
+			TTL:           time.Hour,
 		})
 	c.Assert(err, check.IsNil)
 
-	publicKey, _, _, _, err := ssh.ParseAuthorizedKey(cert)
+	certificate, err := sshutils.ParseCertificate(cert)
 	c.Assert(err, check.IsNil)
-
-	certificate, ok := publicKey.(*ssh.Certificate)
-	c.Assert(ok, check.Equals, true)
 
 	// Check the valid time is not more than 1 minute before the current time.
 	validAfter := time.Unix(int64(certificate.ValidAfter), 0)
@@ -94,8 +99,11 @@ func (s *AuthSuite) GenerateUserCert(c *check.C) {
 	priv, pub, err := s.A.GenerateKeyPair("")
 	c.Assert(err, check.IsNil)
 
+	caSigner, err := ssh.ParsePrivateKey(priv)
+	c.Assert(err, check.IsNil)
+
 	cert, err := s.A.GenerateUserCert(services.UserCertParams{
-		PrivateCASigningKey:   priv,
+		CASigner:              caSigner,
 		CASigningAlg:          defaults.CASignatureAlgorithm,
 		PublicUserKey:         pub,
 		Username:              "user",
@@ -103,29 +111,17 @@ func (s *AuthSuite) GenerateUserCert(c *check.C) {
 		TTL:                   time.Hour,
 		PermitAgentForwarding: true,
 		PermitPortForwarding:  true,
-		CertificateFormat:     teleport.CertificateFormatStandard,
+		CertificateFormat:     constants.CertificateFormatStandard,
 	})
 	c.Assert(err, check.IsNil)
 
-	publicKey, _, _, _, err := ssh.ParseAuthorizedKey(cert)
+	// Check the valid time is not more than 1 minute before and 1 hour after
+	// the current time.
+	err = checkCertExpiry(cert, s.Clock.Now().Add(-1*time.Minute), s.Clock.Now().Add(1*time.Hour))
 	c.Assert(err, check.IsNil)
 
-	certificate, ok := publicKey.(*ssh.Certificate)
-	c.Assert(ok, check.Equals, true)
-
-	// Check the valid time is not more than 1 minute before the current time.
-	validAfter := time.Unix(int64(certificate.ValidAfter), 0)
-	c.Assert(validAfter.Unix(), check.Equals, s.Clock.Now().UTC().Add(-1*time.Minute).Unix())
-
-	// Check the valid time is not more than 1 hour after the current time.
-	validBefore := time.Unix(int64(certificate.ValidBefore), 0)
-	c.Assert(validBefore.Unix(), check.Equals, s.Clock.Now().UTC().Add(1*time.Hour).Unix())
-
-	_, _, _, _, err = ssh.ParseAuthorizedKey(cert)
-	c.Assert(err, check.IsNil)
-
-	_, err = s.A.GenerateUserCert(services.UserCertParams{
-		PrivateCASigningKey:   priv,
+	cert, err = s.A.GenerateUserCert(services.UserCertParams{
+		CASigner:              caSigner,
 		CASigningAlg:          defaults.CASignatureAlgorithm,
 		PublicUserKey:         pub,
 		Username:              "user",
@@ -133,12 +129,14 @@ func (s *AuthSuite) GenerateUserCert(c *check.C) {
 		TTL:                   -20,
 		PermitAgentForwarding: true,
 		PermitPortForwarding:  true,
-		CertificateFormat:     teleport.CertificateFormatStandard,
+		CertificateFormat:     constants.CertificateFormatStandard,
 	})
-	c.Assert(err, check.NotNil)
+	c.Assert(err, check.IsNil)
+	err = checkCertExpiry(cert, s.Clock.Now().Add(-1*time.Minute), s.Clock.Now().Add(defaults.MinCertDuration))
+	c.Assert(err, check.IsNil)
 
 	_, err = s.A.GenerateUserCert(services.UserCertParams{
-		PrivateCASigningKey:   priv,
+		CASigner:              caSigner,
 		CASigningAlg:          defaults.CASignatureAlgorithm,
 		PublicUserKey:         pub,
 		Username:              "user",
@@ -146,12 +144,14 @@ func (s *AuthSuite) GenerateUserCert(c *check.C) {
 		TTL:                   0,
 		PermitAgentForwarding: true,
 		PermitPortForwarding:  true,
-		CertificateFormat:     teleport.CertificateFormatStandard,
+		CertificateFormat:     constants.CertificateFormatStandard,
 	})
-	c.Assert(err, check.NotNil)
+	c.Assert(err, check.IsNil)
+	err = checkCertExpiry(cert, s.Clock.Now().Add(-1*time.Minute), s.Clock.Now().Add(defaults.MinCertDuration))
+	c.Assert(err, check.IsNil)
 
 	_, err = s.A.GenerateUserCert(services.UserCertParams{
-		PrivateCASigningKey:   priv,
+		CASigner:              caSigner,
 		CASigningAlg:          defaults.CASignatureAlgorithm,
 		PublicUserKey:         pub,
 		Username:              "user",
@@ -159,29 +159,49 @@ func (s *AuthSuite) GenerateUserCert(c *check.C) {
 		TTL:                   time.Hour,
 		PermitAgentForwarding: true,
 		PermitPortForwarding:  true,
-		CertificateFormat:     teleport.CertificateFormatStandard,
+		CertificateFormat:     constants.CertificateFormatStandard,
 	})
 	c.Assert(err, check.IsNil)
 
 	inRoles := []string{"role-1", "role-2"}
+	impersonator := "alice"
 	cert, err = s.A.GenerateUserCert(services.UserCertParams{
-		PrivateCASigningKey:   priv,
+		CASigner:              caSigner,
 		CASigningAlg:          defaults.CASignatureAlgorithm,
 		PublicUserKey:         pub,
 		Username:              "user",
+		Impersonator:          impersonator,
 		AllowedLogins:         []string{"root"},
 		TTL:                   time.Hour,
 		PermitAgentForwarding: true,
 		PermitPortForwarding:  true,
-		CertificateFormat:     teleport.CertificateFormatStandard,
+		CertificateFormat:     constants.CertificateFormatStandard,
 		Roles:                 inRoles,
 	})
 	c.Assert(err, check.IsNil)
-	parsedKey, _, _, _, err := ssh.ParseAuthorizedKey(cert)
+	parsedCert, err := sshutils.ParseCertificate(cert)
 	c.Assert(err, check.IsNil)
-	parsedCert, ok := parsedKey.(*ssh.Certificate)
-	c.Assert(ok, check.Equals, true)
 	outRoles, err := services.UnmarshalCertRoles(parsedCert.Extensions[teleport.CertExtensionTeleportRoles])
 	c.Assert(err, check.IsNil)
 	c.Assert(outRoles, check.DeepEquals, inRoles)
+
+	outImpersonator := parsedCert.Extensions[teleport.CertExtensionImpersonator]
+	c.Assert(outImpersonator, check.DeepEquals, impersonator)
+}
+
+func checkCertExpiry(cert []byte, after, before time.Time) error {
+	certificate, err := sshutils.ParseCertificate(cert)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	validAfter := time.Unix(int64(certificate.ValidAfter), 0)
+	if !validAfter.Equal(after) {
+		return trace.BadParameter("ValidAfter incorrect: got %v, want %v", validAfter, after)
+	}
+	validBefore := time.Unix(int64(certificate.ValidBefore), 0)
+	if !validBefore.Equal(before) {
+		return trace.BadParameter("ValidBefore incorrect: got %v, want %v", validBefore, before)
+	}
+	return nil
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2016 Gravitational, Inc.
+Copyright 2016-2020 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,11 +21,16 @@ package defaults
 import (
 	"crypto/tls"
 	"fmt"
+	"net/http"
 	"time"
 
-	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/lib/limiter"
 	"github.com/gravitational/teleport/lib/utils"
+
+	"github.com/gravitational/trace"
+	"gopkg.in/square/go-jose.v2"
+
 	"golang.org/x/crypto/ssh"
 )
 
@@ -48,12 +53,15 @@ const (
 	// run behind an environment/firewall which only allows outgoing connections)
 	SSHProxyTunnelListenPort = 3024
 
-	// KubeProxyListenPort is a default port for kubernetes proxies
-	KubeProxyListenPort = 3026
+	// KubeListenPort is a default port for kubernetes proxies
+	KubeListenPort = 3026
 
 	// When running as a "SSH Proxy" this port will be used to
 	// serve auth requests.
 	AuthListenPort = 3025
+
+	// MySQLListenPort is the default listen port for MySQL proxy.
+	MySQLListenPort = 3036
 
 	// Default DB to use for persisting state. Another options is "etcd"
 	BackendType = "bolt"
@@ -82,10 +90,6 @@ const (
 	// InviteTokenTTL sets the lifespan of tokens used for adding nodes and users
 	// to a cluster
 	InviteTokenTTL = 15 * time.Minute
-
-	// DefaultDialTimeout is a default TCP dial timeout we set for our
-	// connection attempts
-	DefaultDialTimeout = 30 * time.Second
 
 	// HTTPMaxIdleConns is the max idle connections across all hosts.
 	HTTPMaxIdleConns = 2000
@@ -123,6 +127,14 @@ const (
 	// ReadHeadersTimeout is a default TCP timeout when we wait
 	// for the response headers to arrive
 	ReadHeadersTimeout = time.Second
+
+	// DatabaseConnectTimeout is a timeout for connecting to a database via
+	// database access.
+	DatabaseConnectTimeout = time.Minute
+
+	// HandshakeReadDeadline is the default time to wait for the client during
+	// the TLS handshake.
+	HandshakeReadDeadline = 5 * time.Second
 
 	// SignupTokenTTL is a default TTL for a web signup one time token
 	SignupTokenTTL = time.Hour
@@ -206,9 +218,6 @@ const (
 	// is locked after MaxLoginAttempts
 	AccountLockInterval = 20 * time.Minute
 
-	// Namespace is default namespace
-	Namespace = "default"
-
 	// AttemptTTL is TTL for login attempt
 	AttemptTTL = time.Minute * 30
 
@@ -249,21 +258,26 @@ const (
 	// CallbackTimeout is how long to wait for a response from SSO provider
 	// before timeout.
 	CallbackTimeout = 180 * time.Second
+
+	// ConcurrentUploadsPerStream limits the amount of concurrent uploads
+	// per stream
+	ConcurrentUploadsPerStream = 1
+
+	// UploadGracePeriod is a period after which non-completed
+	// upload is considered abandoned and will be completed by the reconciler
+	UploadGracePeriod = 24 * time.Hour
+
+	// InactivityFlushPeriod is a period of inactivity
+	// that triggers upload of the data - flush.
+	InactivityFlushPeriod = 5 * time.Minute
+
+	// NodeJoinTokenTTL is when a token for nodes expires.
+	NodeJoinTokenTTL = 4 * time.Hour
 )
 
 var (
 	// ResyncInterval is how often tunnels are resynced.
 	ResyncInterval = 5 * time.Second
-
-	// ServerAnnounceTTL is a period between heartbeats
-	// Median sleep time between node pings is this value / 2 + random
-	// deviation added to this time to avoid lots of simultaneous
-	// heartbeats coming to auth server
-	ServerAnnounceTTL = 600 * time.Second
-
-	// ServerKeepAliveTTL is a period between server keep alives,
-	// when servers announce only presence withough sending full data
-	ServerKeepAliveTTL = 60 * time.Second
 
 	// AuthServersRefreshPeriod is a period for clients to refresh their
 	// their stored list of auth servers
@@ -287,6 +301,10 @@ var (
 	// NetworkBackoffDuration is a standard backoff on network requests
 	// usually is slow, e.g. once in 30 seconds
 	NetworkBackoffDuration = time.Second * 30
+
+	// AuditBackoffTimeout is a time out before audit logger will
+	// start loosing events
+	AuditBackoffTimeout = 5 * time.Second
 
 	// NetworkRetryDuration is a standard retry on network requests
 	// to retry quickly, e.g. once in one second
@@ -312,17 +330,6 @@ var (
 	// period used in services
 	HighResReportingPeriod = 10 * time.Second
 
-	// KeepAliveInterval is interval at which Teleport will send keep-alive
-	// messages to the client. The default interval of 5 minutes (300 seconds) is
-	// set to help keep connections alive when using AWS NLBs (which have a default
-	// timeout of 350 seconds)
-	KeepAliveInterval = 5 * time.Minute
-
-	// KeepAliveCountMax is the number of keep-alive messages that can be sent
-	// without receiving a response from the client before the client is
-	// disconnected. The max count mirrors ClientAliveCountMax of sshd.
-	KeepAliveCountMax = 3
-
 	// DiskAlertThreshold is the disk space alerting threshold.
 	DiskAlertThreshold = 90
 
@@ -347,9 +354,32 @@ var (
 	// NodeQueueSize is node service queue size
 	NodeQueueSize = 128
 
+	// KubernetesQueueSize is kubernetes service watch queue size
+	KubernetesQueueSize = 128
+
+	// AppsQueueSize is apps service queue size.
+	AppsQueueSize = 128
+
+	// DatabasesQueueSize is db service queue size.
+	DatabasesQueueSize = 128
+
 	// CASignatureAlgorithm is the default signing algorithm to use when
 	// creating new SSH CAs.
 	CASignatureAlgorithm = ssh.SigAlgoRSASHA2512
+
+	// SessionControlTimeout is the maximum amount of time a controlled session
+	// may persist after contact with the auth server is lost (sessctl semaphore
+	// leases are refreshed at a rate of ~1/2 this duration).
+	SessionControlTimeout = time.Minute * 2
+
+	// SPDYPingPeriod is the period for sending out SPDY ping frames on inbound
+	// and outbound connections. SPDY is used for interactive Kubernetes
+	// connections. These pings are needed to avoid timeouts on load balancers
+	// that don't respect TCP keep-alives.
+	SPDYPingPeriod = 30 * time.Second
+
+	// AsyncBufferSize is a default buffer size for async emitters
+	AsyncBufferSize = 1024
 )
 
 // Default connection limits, they can be applied separately on any of the Teleport
@@ -375,22 +405,20 @@ const (
 )
 
 const (
-	// MinCertDuration specifies minimum duration of validity of issued cert
+	// MinCertDuration specifies minimum duration of validity of issued certificate
 	MinCertDuration = time.Minute
-	// MaxCertDuration limits maximum duration of validity of issued cert
-	MaxCertDuration = 30 * time.Hour
-	// CertDuration is a default certificate duration
-	// 12 is default as it' longer than average working day (I hope so)
-	CertDuration = 12 * time.Hour
+
 	// RotationGracePeriod is a default rotation period for graceful
 	// certificate rotations, by default to set to maximum allowed user
 	// cert duration
-	RotationGracePeriod = MaxCertDuration
+	RotationGracePeriod = defaults.MaxCertDuration
+
 	// PendingAccessDuration defines the expiry of a pending access request.
 	PendingAccessDuration = time.Hour
+
 	// MaxAccessDuration defines the maximum time for which an access request
 	// can be active.
-	MaxAccessDuration = MaxCertDuration
+	MaxAccessDuration = defaults.MaxCertDuration
 )
 
 // list of roles teleport service can run as:
@@ -402,7 +430,27 @@ const (
 	// RoleAuthService is authentication and authorization service,
 	// the only stateful role in the system
 	RoleAuthService = "auth"
+	// RoleApp is an application proxy.
+	RoleApp = "app"
+	// RoleDatabase is a database proxy role.
+	RoleDatabase = "db"
 )
+
+const (
+	// ProtocolPostgres is the PostgreSQL database protocol.
+	ProtocolPostgres = "postgres"
+	// ProtocolMySQL is the MySQL database protocol.
+	ProtocolMySQL = "mysql"
+	// ProtocolMongoDB is the MongoDB database protocol.
+	ProtocolMongoDB = "mongodb"
+)
+
+// DatabaseProtocols is a list of all supported database protocols.
+var DatabaseProtocols = []string{
+	ProtocolPostgres,
+	ProtocolMySQL,
+	ProtocolMongoDB,
+}
 
 const (
 	// PerfBufferPageCount is the size of the perf ring buffer in number of pages.
@@ -422,14 +470,6 @@ const (
 	ArgsCacheSize = 1024
 )
 
-// EnhancedEvents returns the default list of enhanced events.
-func EnhancedEvents() []string {
-	return []string{
-		teleport.EnhancedRecordingCommand,
-		teleport.EnhancedRecordingNetwork,
-	}
-}
-
 var (
 	// ConfigFilePath is default path to teleport config file
 	ConfigFilePath = "/etc/teleport.yaml"
@@ -439,13 +479,20 @@ var (
 	DataDir = "/var/lib/teleport"
 
 	// StartRoles is default roles teleport assumes when started via 'start' command
-	StartRoles = []string{RoleProxy, RoleNode, RoleAuthService}
+	StartRoles = []string{RoleProxy, RoleNode, RoleAuthService, RoleApp, RoleDatabase}
 
 	// ETCDPrefix is default key in ETCD clustered configurations
 	ETCDPrefix = "/teleport"
 
 	// ConfigEnvar is a name of teleport's configuration environment variable
 	ConfigEnvar = "TELEPORT_CONFIG"
+
+	// ConfigFileEnvar is the name of the environment variable used to specify a path to
+	// the Teleport configuration file that tctl reads on use
+	ConfigFileEnvar = "TELEPORT_CONFIG_FILE"
+
+	// TunnelPublicAddrEnvar optionally specifies the alternative reverse tunnel address.
+	TunnelPublicAddrEnvar = "TELEPORT_TUNNEL_PUBLIC_ADDR"
 
 	// LicenseFile is the default name of the license file
 	LicenseFile = "license.pem"
@@ -486,7 +533,7 @@ const (
 )
 
 // ConfigureLimiter assigns the default parameters to a connection throttler (AKA limiter)
-func ConfigureLimiter(lc *limiter.LimiterConfig) {
+func ConfigureLimiter(lc *limiter.Config) {
 	lc.MaxConnections = LimiterMaxConnections
 	lc.MaxNumberOfUsers = LimiterMaxConcurrentUsers
 }
@@ -508,7 +555,7 @@ func ProxyListenAddr() *utils.NetAddr {
 
 // KubeProxyListenAddr returns the default listening address for the Kubernetes Proxy service
 func KubeProxyListenAddr() *utils.NetAddr {
-	return makeAddr(BindIP, KubeProxyListenPort)
+	return makeAddr(BindIP, KubeListenPort)
 }
 
 // ProxyWebListenAddr returns the default listening address for the Web-based SSH Proxy service
@@ -556,6 +603,9 @@ const (
 
 	// WebsocketResize is receiving a resize request.
 	WebsocketResize = "w"
+
+	// WebsocketU2FChallenge is sending a U2F challenge.
+	WebsocketU2FChallenge = "u"
 )
 
 // The following are cryptographic primitives Teleport does not support in
@@ -565,6 +615,15 @@ const (
 	DiffieHellmanGroup1SHA1  = "diffie-hellman-group1-sha1"
 	HMACSHA1                 = "hmac-sha1"
 	HMACSHA196               = "hmac-sha1-96"
+)
+
+const (
+	// ApplicationTokenKeyType is the type of asymmetric key used to sign tokens.
+	// See https://tools.ietf.org/html/rfc7518#section-6.1 for possible values.
+	ApplicationTokenKeyType = "RSA"
+	// ApplicationTokenAlgorithm is the default algorithm used to sign
+	// application access tokens.
+	ApplicationTokenAlgorithm = jose.RS256
 )
 
 // WindowsOpenSSHNamedPipe is the address of the named pipe that the
@@ -617,7 +676,7 @@ var (
 // CheckPasswordLimiter creates a rate limit that can be used to slow down
 // requests that come to the check password endpoint.
 func CheckPasswordLimiter() *limiter.Limiter {
-	limiter, err := limiter.NewLimiter(limiter.LimiterConfig{
+	limiter, err := limiter.NewLimiter(limiter.Config{
 		MaxConnections:   LimiterMaxConnections,
 		MaxNumberOfUsers: LimiterMaxConcurrentUsers,
 		Rates: []limiter.Rate{
@@ -632,4 +691,28 @@ func CheckPasswordLimiter() *limiter.Limiter {
 		panic(fmt.Sprintf("Failed to create limiter: %v.", err))
 	}
 	return limiter
+}
+
+// Transport returns a new http.RoundTripper with sensible defaults.
+func Transport() (*http.Transport, error) {
+	// Clone the default transport to pick up sensible defaults.
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, trace.BadParameter("invalid transport type %T", http.DefaultTransport)
+	}
+	tr := defaultTransport.Clone()
+
+	// Increase the size of the transport's connection pool. This substantially
+	// improves the performance of Teleport under load as it reduces the number
+	// of TLS handshakes performed.
+	tr.MaxIdleConns = HTTPMaxIdleConns
+	tr.MaxIdleConnsPerHost = HTTPMaxIdleConnsPerHost
+
+	// Set IdleConnTimeout on the transport. This defines the maximum amount of
+	// time before idle connections are closed. Leaving this unset will lead to
+	// connections open forever and will cause memory leaks in a long running
+	// process.
+	tr.IdleConnTimeout = HTTPIdleTimeout
+
+	return tr, nil
 }

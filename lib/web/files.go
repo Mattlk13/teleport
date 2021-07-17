@@ -17,13 +17,12 @@ limitations under the License.
 package web
 
 import (
-	"context"
 	"net/http"
 
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/reversetunnel"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/sshutils/scp"
 
 	"github.com/gravitational/trace"
@@ -79,7 +78,7 @@ func (h *Handler) transferFile(w http.ResponseWriter, r *http.Request, p httprou
 		return nil, trace.Wrap(err)
 	}
 
-	return ok(), nil
+	return OK(), nil
 }
 
 type fileTransfer struct {
@@ -104,7 +103,7 @@ func (f *fileTransfer) download(req fileTransferRequest, httpReq *http.Request, 
 		return trace.Wrap(err)
 	}
 
-	err = tc.ExecuteSCP(context.TODO(), cmd)
+	err = tc.ExecuteSCP(httpReq.Context(), cmd)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -128,7 +127,7 @@ func (f *fileTransfer) upload(req fileTransferRequest, httpReq *http.Request) er
 		return trace.Wrap(err)
 	}
 
-	err = tc.ExecuteSCP(context.TODO(), cmd)
+	err = tc.ExecuteSCP(httpReq.Context(), cmd)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -137,7 +136,7 @@ func (f *fileTransfer) upload(req fileTransferRequest, httpReq *http.Request) er
 }
 
 func (f *fileTransfer) createClient(req fileTransferRequest, httpReq *http.Request) (*client.TeleportClient, error) {
-	if !services.IsValidNamespace(req.namespace) {
+	if !types.IsValidNamespace(req.namespace) {
 		return nil, trace.BadParameter("invalid namespace %q", req.namespace)
 	}
 
@@ -145,7 +144,7 @@ func (f *fileTransfer) createClient(req fileTransferRequest, httpReq *http.Reque
 		return nil, trace.BadParameter("missing login")
 	}
 
-	servers, err := f.authClient.GetNodes(req.namespace)
+	servers, err := f.authClient.GetNodes(httpReq.Context(), req.namespace)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}

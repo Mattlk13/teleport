@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Gravitational, Inc.
+Copyright 2017-2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,9 +30,17 @@ import (
 // protocol detection
 type Conn struct {
 	net.Conn
-	protocol  int
+	protocol  Protocol
 	proxyLine *ProxyLine
 	reader    *bufio.Reader
+}
+
+// NewConn returns a net.Conn wrapper that supports peeking into the connection.
+func NewConn(conn net.Conn) *Conn {
+	return &Conn{
+		Conn:   conn,
+		reader: bufio.NewReader(conn),
+	}
 }
 
 // Read reads from connection
@@ -56,11 +64,39 @@ func (c *Conn) RemoteAddr() net.Addr {
 	return c.Conn.RemoteAddr()
 }
 
+// Protocol returns the detected connection protocol
+func (c *Conn) Protocol() Protocol {
+	return c.protocol
+}
+
+// Detect detects the connection protocol by peeking into the first few bytes.
+func (c *Conn) Detect() (Protocol, error) {
+	bytes, err := c.reader.Peek(8)
+	if err != nil {
+		return ProtoUnknown, trace.Wrap(err)
+	}
+	proto, err := detectProto(bytes)
+	if err != nil && !trace.IsBadParameter(err) {
+		return ProtoUnknown, trace.Wrap(err)
+	}
+	return proto, nil
+}
+
+// ReadProxyLine reads proxy-line from the connection.
+func (c *Conn) ReadProxyLine() (*ProxyLine, error) {
+	proxyLine, err := ReadProxyLine(c.reader)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	c.proxyLine = proxyLine
+	return proxyLine, nil
+}
+
 func newListener(parent context.Context, addr net.Addr) *Listener {
 	context, cancel := context.WithCancel(parent)
 	return &Listener{
 		addr:    addr,
-		connC:   make(chan *Conn),
+		connC:   make(chan net.Conn),
 		cancel:  cancel,
 		context: context,
 	}
@@ -70,7 +106,7 @@ func newListener(parent context.Context, addr net.Addr) *Listener {
 // connections from multiplexer based on the connection type
 type Listener struct {
 	addr    net.Addr
-	connC   chan *Conn
+	connC   chan net.Conn
 	cancel  context.CancelFunc
 	context context.Context
 }

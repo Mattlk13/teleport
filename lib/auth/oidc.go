@@ -1,5 +1,5 @@
 /*
-Copyright 2017-2019 Gravitational, Inc.
+Copyright 2017-2020 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,6 +25,11 @@ import (
 	"net/url"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
+	apievents "github.com/gravitational/teleport/api/types/events"
+	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/services"
@@ -38,22 +43,22 @@ import (
 	"golang.org/x/oauth2/jwt"
 )
 
-func (s *AuthServer) getOrCreateOIDCClient(conn services.OIDCConnector) (*oidc.Client, error) {
-	client, err := s.getOIDCClient(conn)
+func (a *Server) getOrCreateOIDCClient(conn types.OIDCConnector) (*oidc.Client, error) {
+	client, err := a.getOIDCClient(conn)
 	if err == nil {
 		return client, nil
 	}
 	if !trace.IsNotFound(err) {
 		return nil, trace.Wrap(err)
 	}
-	return s.createOIDCClient(conn)
+	return a.createOIDCClient(conn)
 }
 
-func (s *AuthServer) getOIDCClient(conn services.OIDCConnector) (*oidc.Client, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+func (a *Server) getOIDCClient(conn types.OIDCConnector) (*oidc.Client, error) {
+	a.lock.Lock()
+	defer a.lock.Unlock()
 
-	clientPack, ok := s.oidcClients[conn.GetName()]
+	clientPack, ok := a.oidcClients[conn.GetName()]
 	if !ok {
 		return nil, trace.NotFound("connector %v is not found", conn.GetName())
 	}
@@ -63,12 +68,12 @@ func (s *AuthServer) getOIDCClient(conn services.OIDCConnector) (*oidc.Client, e
 		return clientPack.client, nil
 	}
 
-	delete(s.oidcClients, conn.GetName())
+	delete(a.oidcClients, conn.GetName())
 	return nil, trace.NotFound("connector %v has updated the configuration and is invalidated", conn.GetName())
 
 }
 
-func (s *AuthServer) createOIDCClient(conn services.OIDCConnector) (*oidc.Client, error) {
+func (a *Server) createOIDCClient(conn types.OIDCConnector) (*oidc.Client, error) {
 	config := oidcConfig(conn)
 	client, err := oidc.NewClient(config)
 	if err != nil {
@@ -85,7 +90,7 @@ func (s *AuthServer) createOIDCClient(conn services.OIDCConnector) (*oidc.Client
 
 	select {
 	case <-ctx.Done():
-	case <-s.closeCtx.Done():
+	case <-a.closeCtx.Done():
 		return nil, trace.ConnectionProblem(nil, "auth server is shutting down")
 	}
 
@@ -102,30 +107,18 @@ func (s *AuthServer) createOIDCClient(conn services.OIDCConnector) (*oidc.Client
 				"unknown problem with connector %v, most likely URL %q is not valid or not accessible, check configuration and try to re-create the connector",
 				conn.GetName(), conn.GetIssuerURL())
 		}
-		if err := s.EmitAuditEvent(events.UserSSOLoginFailure, events.EventFields{
-			events.LoginMethod:        events.LoginMethodOIDC,
-			events.AuthAttemptSuccess: false,
-			events.AuthAttemptErr:     trace.Unwrap(ctx.Err()).Error(),
-			events.AuthAttemptMessage: err.Error(),
-		}); err != nil {
-			log.Warnf("Failed to emit OIDC login failure event: %v", err)
-		}
-		// return user-friendly error hiding the actual error in the event
-		// logs for security purposes
-		return nil, trace.ConnectionProblem(nil,
-			"failed to login with %v",
-			conn.GetDisplay())
+		return nil, err
 	}
 
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	a.lock.Lock()
+	defer a.lock.Unlock()
 
-	s.oidcClients[conn.GetName()] = &oidcClient{client: client, config: config}
+	a.oidcClients[conn.GetName()] = &oidcClient{client: client, config: config}
 
 	return client, nil
 }
 
-func oidcConfig(conn services.OIDCConnector) oidc.ClientConfig {
+func oidcConfig(conn types.OIDCConnector) oidc.ClientConfig {
 	return oidc.ClientConfig{
 		RedirectURL: conn.GetRedirectURL(),
 		Credentials: oidc.ClientCredentials{
@@ -133,48 +126,64 @@ func oidcConfig(conn services.OIDCConnector) oidc.ClientConfig {
 			Secret: conn.GetClientSecret(),
 		},
 		// open id notifies provider that we are using OIDC scopes
-		Scope: utils.Deduplicate(append([]string{"openid", "email"}, conn.GetScope()...)),
+		Scope: apiutils.Deduplicate(append([]string{"openid", "email"}, conn.GetScope()...)),
 	}
 }
 
 // UpsertOIDCConnector creates or updates an OIDC connector.
-func (s *AuthServer) UpsertOIDCConnector(ctx context.Context, connector services.OIDCConnector) error {
-	if err := s.Identity.UpsertOIDCConnector(connector); err != nil {
+func (a *Server) UpsertOIDCConnector(ctx context.Context, connector types.OIDCConnector) error {
+	if err := a.Identity.UpsertOIDCConnector(ctx, connector); err != nil {
 		return trace.Wrap(err)
 	}
-
-	if err := s.EmitAuditEvent(events.OIDCConnectorCreated, events.EventFields{
-		events.FieldName: connector.GetName(),
-		events.EventUser: clientUsername(ctx),
+	if err := a.emitter.EmitAuditEvent(ctx, &apievents.OIDCConnectorCreate{
+		Metadata: apievents.Metadata{
+			Type: events.OIDCConnectorCreatedEvent,
+			Code: events.OIDCConnectorCreatedCode,
+		},
+		UserMetadata: apievents.UserMetadata{
+			User:         ClientUsername(ctx),
+			Impersonator: ClientImpersonator(ctx),
+		},
+		ResourceMetadata: apievents.ResourceMetadata{
+			Name: connector.GetName(),
+		},
 	}); err != nil {
-		log.Warnf("Failed to emit OIDC connector create event: %v", err)
+		log.WithError(err).Warn("Failed to emit OIDC connector create event.")
 	}
 
 	return nil
 }
 
 // DeleteOIDCConnector deletes an OIDC connector by name.
-func (s *AuthServer) DeleteOIDCConnector(ctx context.Context, connectorName string) error {
-	if err := s.Identity.DeleteOIDCConnector(connectorName); err != nil {
+func (a *Server) DeleteOIDCConnector(ctx context.Context, connectorName string) error {
+	if err := a.Identity.DeleteOIDCConnector(ctx, connectorName); err != nil {
 		return trace.Wrap(err)
 	}
-
-	if err := s.EmitAuditEvent(events.OIDCConnectorDeleted, events.EventFields{
-		events.FieldName: connectorName,
-		events.EventUser: clientUsername(ctx),
+	if err := a.emitter.EmitAuditEvent(ctx, &apievents.OIDCConnectorDelete{
+		Metadata: apievents.Metadata{
+			Type: events.OIDCConnectorDeletedEvent,
+			Code: events.OIDCConnectorDeletedCode,
+		},
+		UserMetadata: apievents.UserMetadata{
+			User:         ClientUsername(ctx),
+			Impersonator: ClientImpersonator(ctx),
+		},
+		ResourceMetadata: apievents.ResourceMetadata{
+			Name: connectorName,
+		},
 	}); err != nil {
-		log.Warnf("Failed to emit OIDC connector delete event: %v", err)
+		log.WithError(err).Warn("Failed to emit OIDC connector delete event.")
 	}
-
 	return nil
 }
 
-func (s *AuthServer) CreateOIDCAuthRequest(req services.OIDCAuthRequest) (*services.OIDCAuthRequest, error) {
-	connector, err := s.Identity.GetOIDCConnector(req.ConnectorID, true)
+func (a *Server) CreateOIDCAuthRequest(req services.OIDCAuthRequest) (*services.OIDCAuthRequest, error) {
+	ctx := context.TODO()
+	connector, err := a.Identity.GetOIDCConnector(ctx, req.ConnectorID, true)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	oidcClient, err := s.getOrCreateOIDCClient(connector)
+	oidcClient, err := a.getOrCreateOIDCClient(connector)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -209,7 +218,7 @@ func (s *AuthServer) CreateOIDCAuthRequest(req services.OIDCAuthRequest) (*servi
 
 	log.Debugf("OIDC redirect URL: %v.", req.RedirectURL)
 
-	err = s.Identity.CreateOIDCAuthRequest(req, defaults.OIDCAuthRequestTTL)
+	err = a.Identity.CreateOIDCAuthRequest(req, defaults.OIDCAuthRequestTTL)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -219,34 +228,45 @@ func (s *AuthServer) CreateOIDCAuthRequest(req services.OIDCAuthRequest) (*servi
 // ValidateOIDCAuthCallback is called by the proxy to check OIDC query parameters
 // returned by OIDC Provider, if everything checks out, auth server
 // will respond with OIDCAuthResponse, otherwise it will return error
-func (a *AuthServer) ValidateOIDCAuthCallback(q url.Values) (*OIDCAuthResponse, error) {
+func (a *Server) ValidateOIDCAuthCallback(q url.Values) (*OIDCAuthResponse, error) {
+	event := &apievents.UserLogin{
+		Metadata: apievents.Metadata{
+			Type: events.UserLoginEvent,
+		},
+		Method: events.LoginMethodOIDC,
+	}
+
 	re, err := a.validateOIDCAuthCallback(q)
+	if re != nil && re.claims != nil {
+		attributes, err := apievents.EncodeMap(re.claims)
+		if err != nil {
+			event.Status.UserMessage = fmt.Sprintf("Failed to encode identity attributes: %v", err.Error())
+			log.WithError(err).Debug("Failed to encode identity attributes.")
+		} else {
+			event.IdentityAttributes = attributes
+		}
+	}
+
 	if err != nil {
-		fields := events.EventFields{
-			events.LoginMethod:        events.LoginMethodOIDC,
-			events.AuthAttemptSuccess: false,
-			// log the original internal error in audit log
-			events.AuthAttemptErr: trace.Unwrap(err).Error(),
+		event.Code = events.UserSSOLoginFailureCode
+		event.Status.Success = false
+		event.Status.Error = trace.Unwrap(err).Error()
+		event.Status.UserMessage = err.Error()
+
+		if err := a.emitter.EmitAuditEvent(a.closeCtx, event); err != nil {
+			log.WithError(err).Warn("Failed to emit OIDC login failed event.")
 		}
-		if re != nil && re.claims != nil {
-			fields[events.IdentityAttributes] = re.claims
-		}
-		if err := a.EmitAuditEvent(events.UserSSOLoginFailure, fields); err != nil {
-			log.Warnf("Failed to emit OIDC login failure event: %v", err)
-		}
+
 		return nil, trace.Wrap(err)
 	}
-	fields := events.EventFields{
-		events.EventUser:          re.auth.Username,
-		events.AuthAttemptSuccess: true,
-		events.LoginMethod:        events.LoginMethodOIDC,
+	event.Code = events.UserSSOLoginCode
+	event.User = re.auth.Username
+	event.Status.Success = true
+
+	if err := a.emitter.EmitAuditEvent(a.closeCtx, event); err != nil {
+		log.WithError(err).Warn("Failed to emit OIDC login event.")
 	}
-	if re.claims != nil {
-		fields[events.IdentityAttributes] = re.claims
-	}
-	if err := a.EmitAuditEvent(events.UserSSOLogin, fields); err != nil {
-		log.Warnf("Failed to emit OIDC login event: %v", err)
-	}
+
 	return &re.auth, nil
 }
 
@@ -255,7 +275,8 @@ type oidcAuthResponse struct {
 	claims jose.Claims
 }
 
-func (a *AuthServer) validateOIDCAuthCallback(q url.Values) (*oidcAuthResponse, error) {
+func (a *Server) validateOIDCAuthCallback(q url.Values) (*oidcAuthResponse, error) {
+	ctx := context.TODO()
 	if error := q.Get("error"); error != "" {
 		return nil, trace.OAuth2(oauth2.ErrorInvalidRequest, error, q)
 	}
@@ -282,7 +303,7 @@ func (a *AuthServer) validateOIDCAuthCallback(q url.Values) (*oidcAuthResponse, 
 		return nil, trace.Wrap(err)
 	}
 
-	connector, err := a.Identity.GetOIDCConnector(req.ConnectorID, true)
+	connector, err := a.Identity.GetOIDCConnector(ctx, req.ConnectorID, true)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -295,14 +316,7 @@ func (a *AuthServer) validateOIDCAuthCallback(q url.Values) (*oidcAuthResponse, 
 	// extract claims from both the id token and the userinfo endpoint and merge them
 	claims, err := a.getClaims(oidcClient, connector, code)
 	if err != nil {
-		return nil, trace.WrapWithMessage(
-			// preserve the original error message, to avoid leaking
-			// server errors to the user in the UI, but override
-			// user message to the high level instruction to check audit log for details
-			trace.OAuth2(
-				oauth2.ErrorUnsupportedResponseType, err.Error(), q),
-			"unable to construct claims, check audit log for details",
-		)
+		return nil, trace.Wrap(err)
 	}
 	re := &oidcAuthResponse{
 		claims: claims,
@@ -346,7 +360,7 @@ func (a *AuthServer) validateOIDCAuthCallback(q url.Values) (*oidcAuthResponse, 
 	// Auth was successful, return session, certificate, etc. to caller.
 	re.auth = OIDCAuthResponse{
 		Req: *req,
-		Identity: services.ExternalIdentity{
+		Identity: types.ExternalIdentity{
 			ConnectorID: params.connectorName,
 			Username:    params.username,
 		},
@@ -359,7 +373,13 @@ func (a *AuthServer) validateOIDCAuthCallback(q url.Values) (*oidcAuthResponse, 
 
 	// If the request is coming from a browser, create a web session.
 	if req.CreateWebSession {
-		session, err := a.createWebSession(user, params.sessionTTL)
+		session, err := a.createWebSession(context.TODO(), types.NewWebSessionRequest{
+			User:       user.GetName(),
+			Roles:      user.GetRoles(),
+			Traits:     user.GetTraits(),
+			SessionTTL: params.sessionTTL,
+			LoginTime:  a.clock.Now().UTC(),
+		})
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -368,7 +388,7 @@ func (a *AuthServer) validateOIDCAuthCallback(q url.Values) (*oidcAuthResponse, 
 
 	// If a public key was provided, sign it and return a certificate.
 	if len(req.PublicKey) != 0 {
-		sshCert, tlsCert, err := a.createSessionCert(user, params.sessionTTL, req.PublicKey, req.Compatibility, req.RouteToCluster)
+		sshCert, tlsCert, err := a.createSessionCert(user, params.sessionTTL, req.PublicKey, req.Compatibility, req.RouteToCluster, req.KubernetesCluster)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -377,8 +397,8 @@ func (a *AuthServer) validateOIDCAuthCallback(q url.Values) (*oidcAuthResponse, 
 		re.auth.TLSCert = tlsCert
 
 		// Return the host CA for this cluster only.
-		authority, err := a.GetCertAuthority(services.CertAuthID{
-			Type:       services.HostCA,
+		authority, err := a.GetCertAuthority(types.CertAuthID{
+			Type:       types.HostCA,
 			DomainName: clusterName.GetClusterName(),
 		}, false)
 		if err != nil {
@@ -396,9 +416,9 @@ type OIDCAuthResponse struct {
 	// Username is authenticated teleport username
 	Username string `json:"username"`
 	// Identity contains validated OIDC identity
-	Identity services.ExternalIdentity `json:"identity"`
+	Identity types.ExternalIdentity `json:"identity"`
 	// Web session will be generated by auth server if requested in OIDCAuthRequest
-	Session services.WebSession `json:"session,omitempty"`
+	Session types.WebSession `json:"session,omitempty"`
 	// Cert will be generated by certificate authority
 	Cert []byte `json:"cert,omitempty"`
 	// TLSCert is PEM encoded TLS certificate
@@ -407,39 +427,10 @@ type OIDCAuthResponse struct {
 	Req services.OIDCAuthRequest `json:"req"`
 	// HostSigners is a list of signing host public keys
 	// trusted by proxy, used in console login
-	HostSigners []services.CertAuthority `json:"host_signers"`
+	HostSigners []types.CertAuthority `json:"host_signers"`
 }
 
-// buildOIDCRoles takes a connector and claims and returns a slice of roles.
-func (a *AuthServer) buildOIDCRoles(connector services.OIDCConnector, claims jose.Claims) ([]string, error) {
-	roles := connector.MapClaims(claims)
-	if len(roles) == 0 {
-		return nil, trace.AccessDenied("unable to map claims to role for connector: %v", connector.GetName())
-	}
-
-	return roles, nil
-}
-
-// claimsToTraitMap extracts all string claims and creates a map of traits
-// that can be used to populate role variables.
-func claimsToTraitMap(claims jose.Claims) map[string][]string {
-	traits := make(map[string][]string)
-
-	for claimName := range claims {
-		claimValue, ok, _ := claims.StringClaim(claimName)
-		if ok {
-			traits[claimName] = []string{claimValue}
-		}
-		claimValues, ok, _ := claims.StringsClaim(claimName)
-		if ok {
-			traits[claimName] = claimValues
-		}
-	}
-
-	return traits
-}
-
-func (a *AuthServer) calculateOIDCUser(connector services.OIDCConnector, claims jose.Claims, ident *oidc.Identity, request *services.OIDCAuthRequest) (*createUserParams, error) {
+func (a *Server) calculateOIDCUser(connector types.OIDCConnector, claims jose.Claims, ident *oidc.Identity, request *services.OIDCAuthRequest) (*createUserParams, error) {
 	var err error
 
 	p := createUserParams{
@@ -447,57 +438,59 @@ func (a *AuthServer) calculateOIDCUser(connector services.OIDCConnector, claims 
 		username:      ident.Email,
 	}
 
-	p.roles, err = a.buildOIDCRoles(connector, claims)
-	if err != nil {
-		return nil, trace.Wrap(err)
+	p.traits = services.OIDCClaimsToTraits(claims)
+
+	var warnings []string
+	warnings, p.roles = services.TraitsToRoles(connector.GetTraitMappings(), p.traits)
+	if len(p.roles) == 0 {
+		if len(warnings) != 0 {
+			log.WithField("connector", connector).Warnf("Unable to map attibutes to roles: %q", warnings)
+		}
+		return nil, trace.AccessDenied("unable to map claims to role for connector: %v", connector.GetName())
 	}
-	p.traits = claimsToTraitMap(claims)
 
 	// Pick smaller for role: session TTL from role or requested TTL.
 	roles, err := services.FetchRoles(p.roles, a.Access, p.traits)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	roleTTL := roles.AdjustSessionTTL(defaults.MaxCertDuration)
+	roleTTL := roles.AdjustSessionTTL(apidefaults.MaxCertDuration)
 	p.sessionTTL = utils.MinTTL(roleTTL, request.CertTTL)
 
 	return &p, nil
 }
 
-func (a *AuthServer) createOIDCUser(p *createUserParams) (services.User, error) {
+func (a *Server) createOIDCUser(p *createUserParams) (types.User, error) {
 	expires := a.GetClock().Now().UTC().Add(p.sessionTTL)
 
 	log.Debugf("Generating dynamic OIDC identity %v/%v with roles: %v.", p.connectorName, p.username, p.roles)
-	user, err := services.GetUserMarshaler().GenerateUser(&services.UserV2{
-		Kind:    services.KindUser,
-		Version: services.V2,
-		Metadata: services.Metadata{
+	user := &types.UserV2{
+		Kind:    types.KindUser,
+		Version: types.V2,
+		Metadata: types.Metadata{
 			Name:      p.username,
-			Namespace: defaults.Namespace,
+			Namespace: apidefaults.Namespace,
 			Expires:   &expires,
 		},
-		Spec: services.UserSpecV2{
+		Spec: types.UserSpecV2{
 			Roles:  p.roles,
 			Traits: p.traits,
-			OIDCIdentities: []services.ExternalIdentity{
+			OIDCIdentities: []types.ExternalIdentity{
 				{
 					ConnectorID: p.connectorName,
 					Username:    p.username,
 				},
 			},
-			CreatedBy: services.CreatedBy{
-				User: services.UserRef{Name: teleport.UserSystem},
+			CreatedBy: types.CreatedBy{
+				User: types.UserRef{Name: teleport.UserSystem},
 				Time: a.clock.Now().UTC(),
-				Connector: &services.ConnectorRef{
-					Type:     teleport.ConnectorOIDC,
+				Connector: &types.ConnectorRef{
+					Type:     constants.OIDC,
 					ID:       p.connectorName,
 					Identity: p.username,
 				},
 			},
 		},
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
 	}
 
 	// Get the user to check if it already exists or not.
@@ -561,9 +554,12 @@ func claimsFromIDToken(oidcClient *oidc.Client, idToken string) (jose.Claims, er
 // the issuer to be HTTPS and leave integrity and confidentiality to TLS. Authenticity is taken care of
 // during the token exchange.
 func claimsFromUserInfo(oidcClient *oidc.Client, issuerURL string, accessToken string) (jose.Claims, error) {
+	// If the issuer URL is not HTTPS, return the error as trace.NotFound to
+	// allow the caller to treat this condition gracefully and extract claims
+	// just from the token.
 	err := isHTTPS(issuerURL)
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, trace.NotFound(err.Error())
 	}
 
 	oac, err := oidcClient.OAuthClient()
@@ -583,9 +579,13 @@ func claimsFromUserInfo(oidcClient *oidc.Client, issuerURL string, accessToken s
 	}
 
 	endpoint := pc.UserInfoEndpoint.String()
+
+	// If the userinfo endpoint is not HTTPS, return the error as trace.NotFound to
+	// allow the caller to treat this condition gracefully and extract claims
+	// just from the token.
 	err = isHTTPS(endpoint)
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, trace.NotFound(err.Error())
 	}
 	log.Debugf("Fetching OIDC claims from UserInfo endpoint: %q.", endpoint)
 
@@ -614,7 +614,7 @@ func claimsFromUserInfo(oidcClient *oidc.Client, issuerURL string, accessToken s
 	return claims, nil
 }
 
-func (a *AuthServer) claimsFromGSuite(config *jwt.Config, issuerURL string, userEmail string, domain string) (jose.Claims, error) {
+func (a *Server) claimsFromGSuite(config *jwt.Config, issuerURL string, userEmail string, domain string) (jose.Claims, error) {
 	client, err := a.newGsuiteClient(config, issuerURL, userEmail, domain)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -622,7 +622,7 @@ func (a *AuthServer) claimsFromGSuite(config *jwt.Config, issuerURL string, user
 	return client.fetchGroups()
 }
 
-func (a *AuthServer) newGsuiteClient(config *jwt.Config, issuerURL string, userEmail string, domain string) (*gsuiteClient, error) {
+func (a *Server) newGsuiteClient(config *jwt.Config, issuerURL string, userEmail string, domain string) (*gsuiteClient, error) {
 	err := isHTTPS(issuerURL)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -635,11 +635,12 @@ func (a *AuthServer) newGsuiteClient(config *jwt.Config, issuerURL string, userE
 
 	return &gsuiteClient{
 		domain:    domain,
-		client:    config.Client(context.TODO()),
+		client:    config.Client(a.closeCtx),
 		url:       *u,
 		userEmail: userEmail,
 		config:    config,
-		auditLog:  a,
+		emitter:   a.emitter,
+		ctx:       a.closeCtx,
 	}, nil
 }
 
@@ -649,7 +650,8 @@ type gsuiteClient struct {
 	userEmail string
 	domain    string
 	config    *jwt.Config
-	auditLog  events.IAuditLog
+	emitter   apievents.Emitter
+	ctx       context.Context
 }
 
 // fetchGroups fetches GSuite groups a user belongs to and returns
@@ -662,15 +664,22 @@ collect:
 	for {
 		if count > MaxPages {
 			warningMessage := "Truncating list of teams used to populate claims: " +
-				"hit maximum number pages that can be fetched from GSuite."
+				"hit maximum number pages that can be fetched from Google Workspace."
 
 			// Print warning to Teleport logs as well as the Audit Log.
 			log.Warnf(warningMessage)
-			if err := g.auditLog.EmitAuditEvent(events.UserSSOLoginFailure, events.EventFields{
-				events.LoginMethod:        events.LoginMethodOIDC,
-				events.AuthAttemptMessage: warningMessage,
+			if err := g.emitter.EmitAuditEvent(g.ctx, &apievents.UserLogin{
+				Metadata: apievents.Metadata{
+					Type: events.UserLoginEvent,
+					Code: events.UserSSOLoginFailureCode,
+				},
+				Method: events.LoginMethodOIDC,
+				Status: apievents.Status{
+					Success: false,
+					Error:   warningMessage,
+				},
 			}); err != nil {
-				log.Warnf("Failed to emit OIDC login failure event: %v", err)
+				log.WithError(err).Warnf("Failed to emit OIDC login failure event.")
 			}
 			break collect
 		}
@@ -701,7 +710,7 @@ func (g *gsuiteClient) fetchGroupsPage(pageToken string) (*gsuiteGroups, error) 
 	u.RawQuery = q.Encode()
 	endpoint := u.String()
 
-	log.Debugf("Fetching OIDC claims from GSuite groups endpoint: %q.", endpoint)
+	log.Debugf("Fetching OIDC claims from Google Workspace groups endpoint: %q.", endpoint)
 
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
@@ -714,7 +723,7 @@ func (g *gsuiteClient) fetchGroupsPage(pageToken string) (*gsuiteGroups, error) 
 	}
 	defer resp.Body.Close()
 
-	bytes, err := ioutil.ReadAll(resp.Body)
+	bytes, err := utils.ReadAtMost(resp.Body, teleport.MaxHTTPResponseSize)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -758,7 +767,7 @@ func mergeClaims(a jose.Claims, b jose.Claims) (jose.Claims, error) {
 }
 
 // getClaims gets claims from ID token and UserInfo and returns UserInfo claims merged into ID token claims.
-func (a *AuthServer) getClaims(oidcClient *oidc.Client, connector services.OIDCConnector, code string) (jose.Claims, error) {
+func (a *Server) getClaims(oidcClient *oidc.Client, connector types.OIDCConnector, code string) (jose.Claims, error) {
 	var err error
 
 	oac, err := oidcClient.OAuthClient()
@@ -768,24 +777,29 @@ func (a *AuthServer) getClaims(oidcClient *oidc.Client, connector services.OIDCC
 
 	t, err := oac.RequestToken(oauth2.GrantTypeAuthCode, code)
 	if err != nil {
+		if e, ok := err.(*oauth2.Error); ok {
+			if e.Type == oauth2.ErrorAccessDenied {
+				return nil, trace.Wrap(err, "the client_id and/or client_secret may be incorrect")
+			}
+		}
 		return nil, trace.Wrap(err)
 	}
 
 	idTokenClaims, err := claimsFromIDToken(oidcClient, t.IDToken)
 	if err != nil {
 		log.Debugf("Unable to fetch OIDC ID token claims: %v.", err)
-		return nil, trace.Wrap(err)
+		return nil, trace.Wrap(err, "unable to fetch OIDC ID token claims")
 	}
 	log.Debugf("OIDC ID Token claims: %v.", idTokenClaims)
 
 	userInfoClaims, err := claimsFromUserInfo(oidcClient, connector.GetIssuerURL(), t.AccessToken)
 	if err != nil {
 		if trace.IsNotFound(err) {
-			log.Debugf("OIDC provider doesn't offer UserInfo endpoint. Returning token claims: %v.", idTokenClaims)
+			log.Debugf("OIDC provider doesn't offer valid UserInfo endpoint. Returning token claims: %v.", idTokenClaims)
 			return idTokenClaims, nil
 		}
 		log.Debugf("Unable to fetch UserInfo claims: %v.", err)
-		return nil, trace.Wrap(err)
+		return nil, trace.Wrap(err, "unable to fetch UserInfo claims")
 	}
 	log.Debugf("UserInfo claims: %v.", userInfoClaims)
 
@@ -797,57 +811,66 @@ func (a *AuthServer) getClaims(oidcClient *oidc.Client, connector services.OIDCC
 	var exists bool
 	if idsub, exists, err = idTokenClaims.StringClaim("sub"); err != nil || !exists {
 		log.Debugf("Unable to extract OIDC sub claim from ID token.")
-		return nil, trace.Wrap(err)
+		return nil, trace.Wrap(err, "unable to extract OIDC sub claim from ID token")
 	}
 	if uisub, exists, err = userInfoClaims.StringClaim("sub"); err != nil || !exists {
 		log.Debugf("Unable to extract OIDC sub claim from UserInfo.")
-		return nil, trace.Wrap(err)
+		return nil, trace.Wrap(err, "unable to extract OIDC sub claim from UserInfo")
 	}
 	if idsub != uisub {
 		log.Debugf("OIDC claim subjects don't match '%v' != '%v'.", idsub, uisub)
-		return nil, trace.BadParameter("invalid subject in UserInfo")
+		return nil, trace.BadParameter("OIDC claim subjects in UserInfo does not match")
 	}
 
 	claims, err := mergeClaims(idTokenClaims, userInfoClaims)
 	if err != nil {
 		log.Debugf("Unable to merge OIDC claims: %v.", err)
-		return nil, trace.Wrap(err)
+		return nil, trace.Wrap(err, "unable to merge OIDC claims")
 	}
 
-	// for GSuite users, fetch extra data from the proprietary google API
-	// only if scope includes admin groups readonly scope
-	if connector.GetIssuerURL() == teleport.GSuiteIssuerURL {
+	// For Google Workspace users, fetch extra data from the proprietary Google groups API.
+	//
+	// If google_service_account_uri and google_service_account are not set, we
+	// assume that this is a non-GWorkspace OIDC provider using the same
+	// issuer URL as Google Workspace (e.g.
+	// https://developers.google.com/identity/protocols/oauth2/openid-connect).
+	if connector.GetIssuerURL() == teleport.GSuiteIssuerURL && (connector.GetGoogleServiceAccountURI() != "" || connector.GetGoogleServiceAccount() != "") {
 		email, _, err := claims.StringClaim("email")
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
 
-		serviceAccountURI := connector.GetGoogleServiceAccountURI()
-		if serviceAccountURI == "" {
-			return nil, trace.NotFound(
-				"the gsuite connector requires google_service_account_uri parameter to be specified and pointing to a valid google service account file with credentials, read this article for more details https://developers.google.com/admin-sdk/directory/v1/guides/delegation")
+		var jsonCredentials []byte
+		var credentialLoadingMethod string
+		if connector.GetGoogleServiceAccountURI() != "" {
+			// load the google service account from URI
+			credentialLoadingMethod = "google_service_account_uri"
+
+			uri, err := utils.ParseSessionsURI(connector.GetGoogleServiceAccountURI())
+			if err != nil {
+				return nil, trace.BadParameter("failed to parse google_service_account_uri: %v", err)
+			}
+			jsonCredentials, err = ioutil.ReadFile(uri.Path)
+			if err != nil {
+				return nil, trace.Wrap(err)
+			}
+		} else if connector.GetGoogleServiceAccount() != "" {
+			// load the google service account from string
+			credentialLoadingMethod = "google_service_account"
+			jsonCredentials = []byte(connector.GetGoogleServiceAccount())
 		}
 
-		uri, err := utils.ParseSessionsURI(serviceAccountURI)
+		config, err := google.JWTConfigFromJSON(jsonCredentials, teleport.GSuiteGroupsScope)
 		if err != nil {
-			return nil, trace.BadParameter("failed to parse google_service_account_uri: %v", err)
+			return nil, trace.BadParameter("unable to parse google service account from %v: %v", credentialLoadingMethod, err)
 		}
 
 		impersonateAdmin := connector.GetGoogleAdminEmail()
 		if impersonateAdmin == "" {
 			return nil, trace.NotFound(
-				"the gsuite connector requires google_admin_email user to impersonate, as service accounts can not be used directly https://developers.google.com/identity/protocols/OAuth2ServiceAccount#delegatingauthority")
+				"the google workspace connector requires google_admin_email user to impersonate, as service accounts can not be used directly https://developers.google.com/identity/protocols/OAuth2ServiceAccount#delegatingauthority")
 		}
 
-		jsonCredentials, err := ioutil.ReadFile(uri.Path)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-
-		config, err := google.JWTConfigFromJSON(jsonCredentials, teleport.GSuiteGroupsScope)
-		if err != nil {
-			return nil, trace.BadParameter("unable to parse client secret file to config: %v", err)
-		}
 		// User should impersonate admin user, otherwise it won't work:
 		//
 		// https://developers.google.com/admin-sdk/directory/v1/guides/delegation
@@ -856,7 +879,7 @@ func (a *AuthServer) getClaims(oidcClient *oidc.Client, connector services.OIDCC
 		//
 		domain, exists, err := userInfoClaims.StringClaim(teleport.GSuiteDomainClaim)
 		if err != nil || !exists {
-			return nil, trace.BadParameter("hd is the required claim for GSuite")
+			return nil, trace.BadParameter("hd is the required claim for Google Workspace")
 		}
 		config.Subject = impersonateAdmin
 
@@ -865,10 +888,10 @@ func (a *AuthServer) getClaims(oidcClient *oidc.Client, connector services.OIDCC
 			if !trace.IsNotFound(err) {
 				return nil, trace.Wrap(err)
 			}
-			log.Debugf("Found no GSuite claims.")
+			log.Debugf("Found no Google Workspace claims.")
 		} else {
 			if gsuiteClaims != nil {
-				log.Debugf("Got GSuiteclaims: %v.", gsuiteClaims)
+				log.Debugf("Got gsuiteClaims claims from Google Workspace: %v.", gsuiteClaims)
 			}
 			claims, err = mergeClaims(claims, gsuiteClaims)
 			if err != nil {
@@ -883,7 +906,7 @@ func (a *AuthServer) getClaims(oidcClient *oidc.Client, connector services.OIDCC
 // validateACRValues validates that we get an appropriate response for acr values. By default
 // we expect the same value we send, but this function also handles Identity Provider specific
 // forms of validation.
-func (a *AuthServer) validateACRValues(acrValue string, identityProvider string, claims jose.Claims) error {
+func (a *Server) validateACRValues(acrValue string, identityProvider string, claims jose.Claims) error {
 	switch identityProvider {
 	case teleport.NetIQ:
 		log.Debugf("Validating OIDC ACR values with '%v' rules.", identityProvider)

@@ -1,5 +1,5 @@
 /*
-Copyright 2018 Gravitational, Inc.
+Copyright 2018-2020 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,56 +23,56 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"os"
-	"path/filepath"
+	"testing"
 	"time"
 
-	"github.com/gravitational/teleport/lib/defaults"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
+	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/fixtures"
 	"github.com/gravitational/teleport/lib/session"
+	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/check.v1"
 )
 
-// HandlerSuite is a conformance test suite to verify external UploadHandlers
-// behavior.
-type HandlerSuite struct {
-	Handler events.UploadHandler
-}
-
-func (s *HandlerSuite) UploadDownload(c *check.C) {
+// UploadDownload tests uploads and downloads
+func UploadDownload(t *testing.T, handler events.MultipartHandler) {
 	val := "hello, how is it going? this is the uploaded file"
 	id := session.NewID()
-	_, err := s.Handler.Upload(context.TODO(), id, bytes.NewBuffer([]byte(val)))
-	c.Assert(err, check.IsNil)
+	_, err := handler.Upload(context.TODO(), id, bytes.NewBuffer([]byte(val)))
+	require.Nil(t, err)
 
-	dir := c.MkDir()
-	f, err := os.Create(filepath.Join(dir, string(id)))
-	c.Assert(err, check.IsNil)
+	f, err := ioutil.TempFile("", string(id))
+	require.Nil(t, err)
+	defer os.Remove(f.Name())
 	defer f.Close()
 
-	err = s.Handler.Download(context.TODO(), id, f)
-	c.Assert(err, check.IsNil)
+	err = handler.Download(context.TODO(), id, f)
+	require.Nil(t, err)
 
 	_, err = f.Seek(0, 0)
-	c.Assert(err, check.IsNil)
+	require.Nil(t, err)
 
 	data, err := ioutil.ReadAll(f)
-	c.Assert(err, check.IsNil)
-	c.Assert(string(data), check.Equals, val)
+	require.Nil(t, err)
+	require.Equal(t, string(data), val)
 }
 
-func (s *HandlerSuite) DownloadNotFound(c *check.C) {
+// DownloadNotFound tests handling of the scenario when download is not found
+func DownloadNotFound(t *testing.T, handler events.MultipartHandler) {
 	id := session.NewID()
 
-	dir := c.MkDir()
-	f, err := os.Create(filepath.Join(dir, string(id)))
-	c.Assert(err, check.IsNil)
+	f, err := ioutil.TempFile("", string(id))
+	require.Nil(t, err)
+	defer os.Remove(f.Name())
 	defer f.Close()
 
-	err = s.Handler.Download(context.TODO(), id, f)
-	fixtures.ExpectNotFound(c, err)
+	err = handler.Download(context.TODO(), id, f)
+	fixtures.AssertNotFound(t, err)
 }
 
 // EventsSuite is a conformance test suite to verify external event backends
@@ -82,10 +82,91 @@ type EventsSuite struct {
 	QueryDelay time.Duration
 }
 
+// EventPagination covers event search pagination.
+func (s *EventsSuite) EventPagination(c *check.C) {
+	// This serves no special purpose except to make querying easier.
+	baseTime := time.Date(2019, time.May, 10, 14, 43, 0, 0, time.UTC)
+
+	names := []string{"bob", "jack", "daisy", "evan"}
+
+	for i, name := range names {
+		err := s.Log.EmitAuditEventLegacy(events.UserLocalLoginE, events.EventFields{
+			events.LoginMethod:        events.LoginMethodSAML,
+			events.AuthAttemptSuccess: true,
+			events.EventUser:          name,
+			events.EventTime:          baseTime.Add(time.Second * time.Duration(i)),
+		})
+		c.Assert(err, check.IsNil)
+	}
+
+	toTime := baseTime.Add(time.Hour)
+	var arr []apievents.AuditEvent
+	var err error
+	var checkpoint string
+
+	err = utils.RetryStaticFor(time.Minute*5, time.Second*5, func() error {
+		arr, checkpoint, err = s.Log.SearchEvents(baseTime, toTime, apidefaults.Namespace, nil, 100, types.EventOrderAscending, checkpoint)
+		return err
+	})
+	c.Assert(err, check.IsNil)
+	c.Assert(arr, check.HasLen, 4)
+	c.Assert(checkpoint, check.Equals, "")
+
+	for _, name := range names {
+		arr, checkpoint, err = s.Log.SearchEvents(baseTime, toTime, apidefaults.Namespace, nil, 1, types.EventOrderAscending, checkpoint)
+		c.Assert(err, check.IsNil)
+		c.Assert(arr, check.HasLen, 1)
+		event, ok := arr[0].(*apievents.UserLogin)
+		c.Assert(ok, check.Equals, true)
+		c.Assert(name, check.Equals, event.User)
+	}
+	if checkpoint != "" {
+		arr, checkpoint, err = s.Log.SearchEvents(baseTime, toTime, apidefaults.Namespace, nil, 1, types.EventOrderAscending, checkpoint)
+		c.Assert(err, check.IsNil)
+		c.Assert(arr, check.HasLen, 0)
+	}
+	c.Assert(checkpoint, check.Equals, "")
+
+	for _, i := range []int{0, 2} {
+		nameA := names[i]
+		nameB := names[i+1]
+		arr, checkpoint, err = s.Log.SearchEvents(baseTime, toTime, apidefaults.Namespace, nil, 2, types.EventOrderAscending, checkpoint)
+		c.Assert(err, check.IsNil)
+		c.Assert(arr, check.HasLen, 2)
+		eventA, okA := arr[0].(*apievents.UserLogin)
+		eventB, okB := arr[1].(*apievents.UserLogin)
+		c.Assert(okA, check.Equals, true)
+		c.Assert(okB, check.Equals, true)
+		c.Assert(nameA, check.Equals, eventA.User)
+		c.Assert(nameB, check.Equals, eventB.User)
+	}
+	if checkpoint != "" {
+		arr, checkpoint, err = s.Log.SearchEvents(baseTime, toTime, apidefaults.Namespace, nil, 1, types.EventOrderAscending, checkpoint)
+		c.Assert(err, check.IsNil)
+		c.Assert(arr, check.HasLen, 0)
+	}
+	c.Assert(checkpoint, check.Equals, "")
+
+	for i := len(names) - 1; i >= 0; i-- {
+		arr, checkpoint, err = s.Log.SearchEvents(baseTime, toTime, apidefaults.Namespace, nil, 1, types.EventOrderDescending, checkpoint)
+		c.Assert(err, check.IsNil)
+		c.Assert(arr, check.HasLen, 1)
+		event, ok := arr[0].(*apievents.UserLogin)
+		c.Assert(ok, check.Equals, true)
+		c.Assert(names[i], check.Equals, event.User)
+	}
+	if checkpoint != "" {
+		arr, checkpoint, err = s.Log.SearchEvents(baseTime, toTime, apidefaults.Namespace, nil, 1, types.EventOrderDescending, checkpoint)
+		c.Assert(err, check.IsNil)
+		c.Assert(arr, check.HasLen, 0)
+	}
+	c.Assert(checkpoint, check.Equals, "")
+}
+
 // SessionEventsCRUD covers session events
 func (s *EventsSuite) SessionEventsCRUD(c *check.C) {
 	// Bob has logged in
-	err := s.Log.EmitAuditEvent(events.UserLocalLogin, events.EventFields{
+	err := s.Log.EmitAuditEventLegacy(events.UserLocalLoginE, events.EventFields{
 		events.LoginMethod:        events.LoginMethodSAML,
 		events.AuthAttemptSuccess: true,
 		events.EventUser:          "bob",
@@ -98,25 +179,30 @@ func (s *EventsSuite) SessionEventsCRUD(c *check.C) {
 		time.Sleep(s.QueryDelay)
 	}
 
-	history, err := s.Log.SearchEvents(s.Clock.Now().Add(-1*time.Hour), s.Clock.Now().Add(time.Hour), "", 100)
+	var history []apievents.AuditEvent
+
+	err = utils.RetryStaticFor(time.Minute*5, time.Second*5, func() error {
+		history, _, err = s.Log.SearchEvents(s.Clock.Now().Add(-1*time.Hour), s.Clock.Now().Add(time.Hour), apidefaults.Namespace, nil, 100, types.EventOrderAscending, "")
+		return err
+	})
 	c.Assert(err, check.IsNil)
 	c.Assert(history, check.HasLen, 1)
 
 	// start the session and emit data stream to it and wrap it up
 	sessionID := session.NewID()
 	err = s.Log.PostSessionSlice(events.SessionSlice{
-		Namespace: defaults.Namespace,
+		Namespace: apidefaults.Namespace,
 		SessionID: string(sessionID),
 		Chunks: []*events.SessionChunk{
 			// start the seession
-			&events.SessionChunk{
+			{
 				Time:       s.Clock.Now().UTC().UnixNano(),
 				EventIndex: 0,
 				EventType:  events.SessionStartEvent,
 				Data:       marshal(events.EventFields{events.EventLogin: "bob"}),
 			},
 			// emitting session end event should close the session
-			&events.SessionChunk{
+			{
 				Time:       s.Clock.Now().Add(time.Hour).UTC().UnixNano(),
 				EventIndex: 4,
 				EventType:  events.SessionEndEvent,
@@ -128,17 +214,17 @@ func (s *EventsSuite) SessionEventsCRUD(c *check.C) {
 	c.Assert(err, check.IsNil)
 
 	// read the session event
-	history, err = s.Log.GetSessionEvents(defaults.Namespace, sessionID, 0, false)
+	historyEvents, err := s.Log.GetSessionEvents(apidefaults.Namespace, sessionID, 0, false)
+	c.Assert(err, check.IsNil)
+	c.Assert(historyEvents, check.HasLen, 2)
+	c.Assert(historyEvents[0].GetString(events.EventType), check.Equals, events.SessionStartEvent)
+	c.Assert(historyEvents[1].GetString(events.EventType), check.Equals, events.SessionEndEvent)
+
+	history, _, err = s.Log.SearchSessionEvents(s.Clock.Now().Add(-1*time.Hour), s.Clock.Now().Add(2*time.Hour), 100, types.EventOrderAscending, "")
 	c.Assert(err, check.IsNil)
 	c.Assert(history, check.HasLen, 2)
-	c.Assert(history[0].GetString(events.EventType), check.Equals, events.SessionStartEvent)
-	c.Assert(history[1].GetString(events.EventType), check.Equals, events.SessionEndEvent)
 
-	history, err = s.Log.SearchSessionEvents(s.Clock.Now().Add(-1*time.Hour), s.Clock.Now().Add(2*time.Hour), 100)
-	c.Assert(err, check.IsNil)
-	c.Assert(history, check.HasLen, 2)
-
-	history, err = s.Log.SearchSessionEvents(s.Clock.Now().Add(-1*time.Hour), s.Clock.Now().Add(time.Hour-time.Second), 100)
+	history, _, err = s.Log.SearchSessionEvents(s.Clock.Now().Add(-1*time.Hour), s.Clock.Now().Add(time.Hour-time.Second), 100, types.EventOrderAscending, "")
 	c.Assert(err, check.IsNil)
 	c.Assert(history, check.HasLen, 1)
 }

@@ -22,21 +22,20 @@ import (
 	"crypto/x509"
 	"encoding/base32"
 	"encoding/base64"
-	"fmt"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/auth/u2f"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/lite"
-	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/suite"
-	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/jonboulle/clockwork"
-	"github.com/tstranex/u2f"
 	"gopkg.in/check.v1"
 )
 
@@ -46,12 +45,7 @@ type ResourceSuite struct {
 	bk backend.Backend
 }
 
-var _ = fmt.Printf
 var _ = check.Suite(&ResourceSuite{})
-
-func (r *ResourceSuite) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests(testing.Verbose())
-}
 
 func (r *ResourceSuite) SetUpTest(c *check.C) {
 	var err error
@@ -70,7 +64,7 @@ func (r *ResourceSuite) TearDownTest(c *check.C) {
 	c.Assert(r.bk.Close(), check.IsNil)
 }
 
-func (r *ResourceSuite) dumpResources(c *check.C) []services.Resource {
+func (r *ResourceSuite) dumpResources(c *check.C) []types.Resource {
 	startKey := []byte("/")
 	endKey := backend.RangeEnd(startKey)
 	result, err := r.bk.GetRange(context.TODO(), startKey, endKey, 0)
@@ -80,10 +74,10 @@ func (r *ResourceSuite) dumpResources(c *check.C) []services.Resource {
 	return resources
 }
 
-func (r *ResourceSuite) runCreationChecks(c *check.C, resources ...services.Resource) {
+func (r *ResourceSuite) runCreationChecks(c *check.C, resources ...types.Resource) {
 	for _, rsc := range resources {
 		switch r := rsc.(type) {
-		case services.User:
+		case types.User:
 			c.Logf("Creating User: %+v", r)
 		default:
 		}
@@ -111,33 +105,41 @@ func (r *ResourceSuite) TestUserResourceWithSecrets(c *check.C) {
 }
 
 func (r *ResourceSuite) runUserResourceTest(c *check.C, withSecrets bool) {
-	alice := newUserTestCase(c, "alice", nil, withSecrets)
-	bob := newUserTestCase(c, "bob", nil, withSecrets)
+	expiry := r.bk.Clock().Now().Add(time.Minute)
+
+	alice := newUserTestCase(c, "alice", nil, withSecrets, expiry)
+	bob := newUserTestCase(c, "bob", nil, withSecrets, expiry)
 	// Check basic dynamic item creation
 	r.runCreationChecks(c, alice, bob)
 	// Check that dynamically created item is compatible with service
 	s := NewIdentityService(r.bk)
 	b, err := s.GetUser("bob", withSecrets)
 	c.Assert(err, check.IsNil)
-	c.Assert(bob.Equals(b), check.Equals, true, check.Commentf("dynamically inserted user does not match"))
+	c.Assert(services.UsersEquals(bob, b), check.Equals, true, check.Commentf("dynamically inserted user does not match"))
 	allUsers, err := s.GetUsers(withSecrets)
 	c.Assert(err, check.IsNil)
 	c.Assert(len(allUsers), check.Equals, 2, check.Commentf("expected exactly two users"))
 	for _, user := range allUsers {
 		switch user.GetName() {
 		case "alice":
-			c.Assert(alice.Equals(user), check.Equals, true, check.Commentf("alice does not match"))
+			c.Assert(services.UsersEquals(alice, user), check.Equals, true, check.Commentf("alice does not match"))
 		case "bob":
-			c.Assert(bob.Equals(user), check.Equals, true, check.Commentf("bob does not match"))
+			c.Assert(services.UsersEquals(bob, user), check.Equals, true, check.Commentf("bob does not match"))
 		default:
 			c.Errorf("Unexpected user %q", user.GetName())
 		}
 	}
+
+	// Advance the clock to let the users to expire.
+	r.bk.Clock().(clockwork.FakeClock).Advance(2 * time.Minute)
+	allUsers, err = s.GetUsers(withSecrets)
+	c.Assert(err, check.IsNil)
+	c.Assert(len(allUsers), check.Equals, 0, check.Commentf("expected all users to expire"))
 }
 
 func (r *ResourceSuite) TestCertAuthorityResource(c *check.C) {
-	userCA := suite.NewTestCA(services.UserCA, "example.com")
-	hostCA := suite.NewTestCA(services.HostCA, "example.com")
+	userCA := suite.NewTestCA(types.UserCA, "example.com")
+	hostCA := suite.NewTestCA(types.HostCA, "example.com")
 	// Check basic dynamic item creation
 	r.runCreationChecks(c, userCA, hostCA)
 	// Check that dynamically created item is compatible with service
@@ -147,7 +149,8 @@ func (r *ResourceSuite) TestCertAuthorityResource(c *check.C) {
 }
 
 func (r *ResourceSuite) TestTrustedClusterResource(c *check.C) {
-	foo, err := services.NewTrustedCluster("foo", services.TrustedClusterSpecV2{
+	ctx := context.Background()
+	foo, err := types.NewTrustedCluster("foo", types.TrustedClusterSpecV2{
 		Enabled:              true,
 		Roles:                []string{"bar", "baz"},
 		Token:                "qux",
@@ -156,7 +159,7 @@ func (r *ResourceSuite) TestTrustedClusterResource(c *check.C) {
 	})
 	c.Assert(err, check.IsNil)
 
-	bar, err := services.NewTrustedCluster("bar", services.TrustedClusterSpecV2{
+	bar, err := types.NewTrustedCluster("bar", types.TrustedClusterSpecV2{
 		Enabled:              false,
 		Roles:                []string{"baz", "aux"},
 		Token:                "quux",
@@ -168,26 +171,27 @@ func (r *ResourceSuite) TestTrustedClusterResource(c *check.C) {
 	r.runCreationChecks(c, foo, bar)
 
 	s := NewPresenceService(r.bk)
-	_, err = s.GetTrustedCluster("foo")
+	_, err = s.GetTrustedCluster(ctx, "foo")
 	c.Assert(err, check.IsNil)
-	_, err = s.GetTrustedCluster("bar")
+	_, err = s.GetTrustedCluster(ctx, "bar")
 	c.Assert(err, check.IsNil)
 }
 
 func (r *ResourceSuite) TestGithubConnectorResource(c *check.C) {
-	connector := &services.GithubConnectorV3{
-		Kind:    services.KindGithubConnector,
-		Version: services.V3,
-		Metadata: services.Metadata{
+	ctx := context.Background()
+	connector := &types.GithubConnectorV3{
+		Kind:    types.KindGithubConnector,
+		Version: types.V3,
+		Metadata: types.Metadata{
 			Name:      "github",
-			Namespace: defaults.Namespace,
+			Namespace: apidefaults.Namespace,
 		},
-		Spec: services.GithubConnectorSpecV3{
+		Spec: types.GithubConnectorSpecV3{
 			ClientID:     "aaa",
 			ClientSecret: "bbb",
 			RedirectURL:  "https://localhost:3080/v1/webapi/github/callback",
 			Display:      "Github",
-			TeamsToLogins: []services.TeamMapping{
+			TeamsToLogins: []types.TeamMapping{
 				{
 					Organization: "gravitational",
 					Team:         "admins",
@@ -201,7 +205,7 @@ func (r *ResourceSuite) TestGithubConnectorResource(c *check.C) {
 	r.runCreationChecks(c, connector)
 
 	s := NewIdentityService(r.bk)
-	_, err := s.GetGithubConnector("github", true)
+	_, err := s.GetGithubConnector(ctx, "github", true)
 	c.Assert(err, check.IsNil)
 }
 
@@ -222,28 +226,34 @@ func u2fRegTestCase(c *check.C) u2f.Registration {
 	return registration
 }
 
-func localAuthSecretsTestCase(c *check.C) services.LocalAuthSecrets {
-	var auth services.LocalAuthSecrets
+func localAuthSecretsTestCase(c *check.C) types.LocalAuthSecrets {
+	var auth types.LocalAuthSecrets
 	var err error
 	auth.PasswordHash, err = bcrypt.GenerateFromPassword([]byte("insecure"), bcrypt.MinCost)
 	c.Assert(err, check.IsNil)
-	auth.TOTPKey = base32.StdEncoding.EncodeToString([]byte("abc123"))
-	auth.U2FCounter = 7
-	reg := u2fRegTestCase(c)
-	err = auth.SetU2FRegistration(&reg)
+
+	dev, err := services.NewTOTPDevice("otp", base32.StdEncoding.EncodeToString([]byte("abc123")), time.Now())
 	c.Assert(err, check.IsNil)
+	auth.MFA = append(auth.MFA, dev)
+
+	reg := u2fRegTestCase(c)
+	dev, err = u2f.NewDevice("u2f", &reg, time.Now())
+	c.Assert(err, check.IsNil)
+	dev.GetU2F().Counter = 7
+	auth.MFA = append(auth.MFA, dev)
 	return auth
 }
 
-func newUserTestCase(c *check.C, name string, roles []string, withSecrets bool) services.User {
-	user := services.UserV2{
-		Kind:    services.KindUser,
-		Version: services.V2,
-		Metadata: services.Metadata{
+func newUserTestCase(c *check.C, name string, roles []string, withSecrets bool, expires time.Time) types.User {
+	user := types.UserV2{
+		Kind:    types.KindUser,
+		Version: types.V2,
+		Metadata: types.Metadata{
 			Name:      name,
-			Namespace: defaults.Namespace,
+			Namespace: apidefaults.Namespace,
+			Expires:   &expires,
 		},
-		Spec: services.UserSpecV2{
+		Spec: types.UserSpecV2{
 			Roles: roles,
 		},
 	}

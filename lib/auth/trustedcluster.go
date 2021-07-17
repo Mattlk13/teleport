@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/types"
+	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/httplib"
@@ -37,15 +39,15 @@ import (
 )
 
 // UpsertTrustedCluster creates or toggles a Trusted Cluster relationship.
-func (a *AuthServer) UpsertTrustedCluster(ctx context.Context, trustedCluster services.TrustedCluster) (services.TrustedCluster, error) {
+func (a *Server) UpsertTrustedCluster(ctx context.Context, trustedCluster types.TrustedCluster) (types.TrustedCluster, error) {
 	var exists bool
 
 	// It is recommended to omit trusted cluster name because the trusted cluster name
 	// is updated to the roots cluster name during the handshake with the root cluster.
-	var existingCluster services.TrustedCluster
+	var existingCluster types.TrustedCluster
 	if trustedCluster.GetName() != "" {
 		var err error
-		if existingCluster, err = a.Presence.GetTrustedCluster(trustedCluster.GetName()); err == nil {
+		if existingCluster, err = a.Presence.GetTrustedCluster(ctx, trustedCluster.GetName()); err == nil {
 			exists = true
 		}
 	}
@@ -91,7 +93,7 @@ func (a *AuthServer) UpsertTrustedCluster(ctx context.Context, trustedCluster se
 	case exists == false && enable == true:
 		log.Debugf("Creating enabled Trusted Cluster relationship.")
 
-		if err := a.checkLocalRoles(trustedCluster.GetRoleMap()); err != nil {
+		if err := a.checkLocalRoles(ctx, trustedCluster.GetRoleMap()); err != nil {
 			return nil, trace.Wrap(err)
 		}
 
@@ -115,7 +117,7 @@ func (a *AuthServer) UpsertTrustedCluster(ctx context.Context, trustedCluster se
 	case exists == false && enable == false:
 		log.Debugf("Creating disabled Trusted Cluster relationship.")
 
-		if err := a.checkLocalRoles(trustedCluster.GetRoleMap()); err != nil {
+		if err := a.checkLocalRoles(ctx, trustedCluster.GetRoleMap()); err != nil {
 			return nil, trace.Wrap(err)
 		}
 
@@ -141,16 +143,26 @@ func (a *AuthServer) UpsertTrustedCluster(ctx context.Context, trustedCluster se
 		return nil, trace.Wrap(err)
 	}
 
-	if err := a.EmitAuditEvent(events.TrustedClusterCreate, events.EventFields{
-		events.EventUser: clientUsername(ctx),
+	if err := a.emitter.EmitAuditEvent(ctx, &apievents.TrustedClusterCreate{
+		Metadata: apievents.Metadata{
+			Type: events.TrustedClusterCreateEvent,
+			Code: events.TrustedClusterCreateCode,
+		},
+		UserMetadata: apievents.UserMetadata{
+			User:         ClientUsername(ctx),
+			Impersonator: ClientImpersonator(ctx),
+		},
+		ResourceMetadata: apievents.ResourceMetadata{
+			Name: trustedCluster.GetName(),
+		},
 	}); err != nil {
-		log.Warnf("Failed to emit trusted cluster create event: %v", err)
+		log.WithError(err).Warn("Failed to emit trusted cluster create event.")
 	}
 
 	return tc, nil
 }
 
-func (a *AuthServer) checkLocalRoles(roleMap services.RoleMap) error {
+func (a *Server) checkLocalRoles(ctx context.Context, roleMap types.RoleMap) error {
 	for _, mapping := range roleMap {
 		for _, localRole := range mapping.Local {
 			// expansion means dynamic mapping is in place,
@@ -158,7 +170,7 @@ func (a *AuthServer) checkLocalRoles(roleMap services.RoleMap) error {
 			if utils.ContainsExpansion(localRole) {
 				continue
 			}
-			_, err := a.GetRole(localRole)
+			_, err := a.GetRole(ctx, localRole)
 			if err != nil {
 				if trace.IsNotFound(err) {
 					return trace.NotFound("a role %q referenced in a mapping %v:%v is not defined", localRole, mapping.Remote, mapping.Local)
@@ -170,9 +182,9 @@ func (a *AuthServer) checkLocalRoles(roleMap services.RoleMap) error {
 	return nil
 }
 
-// DeleteTrustedCluster removes services.CertAuthority, services.ReverseTunnel,
+// DeleteTrustedCluster removes types.CertAuthority, services.ReverseTunnel,
 // and services.TrustedCluster resources.
-func (a *AuthServer) DeleteTrustedCluster(ctx context.Context, name string) error {
+func (a *Server) DeleteTrustedCluster(ctx context.Context, name string) error {
 	cn, err := a.GetClusterName()
 	if err != nil {
 		return trace.Wrap(err)
@@ -183,13 +195,13 @@ func (a *AuthServer) DeleteTrustedCluster(ctx context.Context, name string) erro
 		return trace.BadParameter("trusted cluster %q is the name of this root cluster and cannot be removed.", name)
 	}
 
-	if err := a.DeleteCertAuthority(services.CertAuthID{Type: services.HostCA, DomainName: name}); err != nil {
+	if err := a.DeleteCertAuthority(types.CertAuthID{Type: types.HostCA, DomainName: name}); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
 		}
 	}
 
-	if err := a.DeleteCertAuthority(services.CertAuthID{Type: services.UserCA, DomainName: name}); err != nil {
+	if err := a.DeleteCertAuthority(types.CertAuthID{Type: types.UserCA, DomainName: name}); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
 		}
@@ -205,17 +217,27 @@ func (a *AuthServer) DeleteTrustedCluster(ctx context.Context, name string) erro
 		return trace.Wrap(err)
 	}
 
-	if err := a.EmitAuditEvent(events.TrustedClusterDelete, events.EventFields{
-		events.EventUser: clientUsername(ctx),
+	if err := a.emitter.EmitAuditEvent(ctx, &apievents.TrustedClusterDelete{
+		Metadata: apievents.Metadata{
+			Type: events.TrustedClusterDeleteEvent,
+			Code: events.TrustedClusterDeleteCode,
+		},
+		UserMetadata: apievents.UserMetadata{
+			User:         ClientUsername(ctx),
+			Impersonator: ClientImpersonator(ctx),
+		},
+		ResourceMetadata: apievents.ResourceMetadata{
+			Name: name,
+		},
 	}); err != nil {
-		log.Warnf("Failed to emit trusted cluster delete event: %v", err)
+		log.WithError(err).Warn("Failed to emit trusted cluster delete event.")
 	}
 
 	return nil
 }
 
-func (a *AuthServer) establishTrust(trustedCluster services.TrustedCluster) ([]services.CertAuthority, error) {
-	var localCertAuthorities []services.CertAuthority
+func (a *Server) establishTrust(trustedCluster types.TrustedCluster) ([]types.CertAuthority, error) {
+	var localCertAuthorities []types.CertAuthority
 
 	domainName, err := a.GetDomainName()
 	if err != nil {
@@ -223,7 +245,7 @@ func (a *AuthServer) establishTrust(trustedCluster services.TrustedCluster) ([]s
 	}
 
 	// get a list of certificate authorities for this auth server
-	allLocalCAs, err := a.GetCertAuthorities(services.HostCA, false)
+	allLocalCAs, err := a.GetCertAuthorities(types.HostCA, false)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -256,7 +278,7 @@ func (a *AuthServer) establishTrust(trustedCluster services.TrustedCluster) ([]s
 	log.Debugf("Received validate response; CAs=%v", validateResponse.CAs)
 
 	for _, ca := range validateResponse.CAs {
-		for _, keyPair := range ca.GetTLSKeyPairs() {
+		for _, keyPair := range ca.GetActiveKeys().TLS {
 			cert, err := tlsca.ParseCertificatePEM(keyPair.Cert)
 			if err != nil {
 				return nil, trace.Wrap(err)
@@ -277,7 +299,7 @@ func (a *AuthServer) establishTrust(trustedCluster services.TrustedCluster) ([]s
 	return validateResponse.CAs, nil
 }
 
-func (a *AuthServer) addCertAuthorities(trustedCluster services.TrustedCluster, remoteCAs []services.CertAuthority) error {
+func (a *Server) addCertAuthorities(trustedCluster types.TrustedCluster, remoteCAs []types.CertAuthority) error {
 	// the remote auth server has verified our token. add the
 	// remote certificate authority to our backend
 	for _, remoteCertAuthority := range remoteCAs {
@@ -286,7 +308,7 @@ func (a *AuthServer) addCertAuthorities(trustedCluster services.TrustedCluster, 
 
 		// wipe out roles sent from the remote cluster and set roles from the trusted cluster
 		remoteCertAuthority.SetRoles(nil)
-		if remoteCertAuthority.GetType() == services.UserCA {
+		if remoteCertAuthority.GetType() == types.UserCA {
 			for _, r := range trustedCluster.GetRoles() {
 				remoteCertAuthority.AddRole(r)
 			}
@@ -306,7 +328,7 @@ func (a *AuthServer) addCertAuthorities(trustedCluster services.TrustedCluster, 
 
 // DeleteRemoteCluster deletes remote cluster resource, all certificate authorities
 // associated with it
-func (a *AuthServer) DeleteRemoteCluster(clusterName string) error {
+func (a *Server) DeleteRemoteCluster(clusterName string) error {
 	// To make sure remote cluster exists - to protect against random
 	// clusterName requests (e.g. when clusterName is set to local cluster name)
 	_, err := a.Presence.GetRemoteCluster(clusterName)
@@ -314,8 +336,8 @@ func (a *AuthServer) DeleteRemoteCluster(clusterName string) error {
 		return trace.Wrap(err)
 	}
 	// delete cert authorities associated with the cluster
-	err = a.DeleteCertAuthority(services.CertAuthID{
-		Type:       services.HostCA,
+	err = a.DeleteCertAuthority(types.CertAuthID{
+		Type:       types.HostCA,
 		DomainName: clusterName,
 	})
 	if err != nil {
@@ -328,8 +350,8 @@ func (a *AuthServer) DeleteRemoteCluster(clusterName string) error {
 	}
 	// there should be no User CA in trusted clusters on the main cluster side
 	// per standard automation but clean up just in case
-	err = a.DeleteCertAuthority(services.CertAuthID{
-		Type:       services.UserCA,
+	err = a.DeleteCertAuthority(types.CertAuthID{
+		Type:       types.UserCA,
 		DomainName: clusterName,
 	})
 	if err != nil {
@@ -341,7 +363,7 @@ func (a *AuthServer) DeleteRemoteCluster(clusterName string) error {
 }
 
 // GetRemoteCluster returns remote cluster by name
-func (a *AuthServer) GetRemoteCluster(clusterName string) (services.RemoteCluster, error) {
+func (a *Server) GetRemoteCluster(clusterName string) (types.RemoteCluster, error) {
 	// To make sure remote cluster exists - to protect against random
 	// clusterName requests (e.g. when clusterName is set to local cluster name)
 	remoteCluster, err := a.Presence.GetRemoteCluster(clusterName)
@@ -354,32 +376,59 @@ func (a *AuthServer) GetRemoteCluster(clusterName string) (services.RemoteCluste
 	return remoteCluster, nil
 }
 
-func (a *AuthServer) updateRemoteClusterStatus(remoteCluster services.RemoteCluster) error {
-	clusterConfig, err := a.GetClusterConfig()
+func (a *Server) updateRemoteClusterStatus(remoteCluster types.RemoteCluster) error {
+	ctx := context.TODO()
+	netConfig, err := a.GetClusterNetworkingConfig(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	keepAliveCountMax := clusterConfig.GetKeepAliveCountMax()
-	keepAliveInterval := clusterConfig.GetKeepAliveInterval()
+	keepAliveCountMax := netConfig.GetKeepAliveCountMax()
+	keepAliveInterval := netConfig.GetKeepAliveInterval()
 
 	// fetch tunnel connections for the cluster to update runtime status
 	connections, err := a.GetTunnelConnections(remoteCluster.GetName())
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	remoteCluster.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
 	lastConn, err := services.LatestTunnelConnection(connections)
-	if err == nil {
-		offlineThreshold := time.Duration(keepAliveCountMax) * keepAliveInterval
-		tunnelStatus := services.TunnelConnectionStatus(a.clock, lastConn, offlineThreshold)
-		remoteCluster.SetConnectionStatus(tunnelStatus)
-		remoteCluster.SetLastHeartbeat(lastConn.GetLastHeartbeat())
+	if err != nil {
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+		// No tunnel connections are known, mark the cluster offline (if it
+		// wasn't already).
+		if remoteCluster.GetConnectionStatus() != teleport.RemoteClusterStatusOffline {
+			remoteCluster.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
+			if err := a.UpdateRemoteCluster(ctx, remoteCluster); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
 	}
+
+	offlineThreshold := time.Duration(keepAliveCountMax) * keepAliveInterval
+	tunnelStatus := services.TunnelConnectionStatus(a.clock, lastConn, offlineThreshold)
+
+	// Update remoteCluster based on lastConn. If anything changed, update it
+	// in the backend too.
+	prevConnectionStatus := remoteCluster.GetConnectionStatus()
+	prevLastHeartbeat := remoteCluster.GetLastHeartbeat()
+	remoteCluster.SetConnectionStatus(tunnelStatus)
+	// Only bump LastHeartbeat if it's newer.
+	if lastConn.GetLastHeartbeat().After(prevLastHeartbeat) {
+		remoteCluster.SetLastHeartbeat(lastConn.GetLastHeartbeat().UTC())
+	}
+	if prevConnectionStatus != remoteCluster.GetConnectionStatus() || !prevLastHeartbeat.Equal(remoteCluster.GetLastHeartbeat()) {
+		if err := a.UpdateRemoteCluster(ctx, remoteCluster); err != nil {
+			return trace.Wrap(err)
+		}
+	}
+
 	return nil
 }
 
 // GetRemoteClusters returns remote clusters with updated statuses
-func (a *AuthServer) GetRemoteClusters(opts ...services.MarshalOption) ([]services.RemoteCluster, error) {
+func (a *Server) GetRemoteClusters(opts ...services.MarshalOption) ([]types.RemoteCluster, error) {
 	// To make sure remote cluster exists - to protect against random
 	// clusterName requests (e.g. when clusterName is set to local cluster name)
 	remoteClusters, err := a.Presence.GetRemoteClusters(opts...)
@@ -394,20 +443,25 @@ func (a *AuthServer) GetRemoteClusters(opts ...services.MarshalOption) ([]servic
 	return remoteClusters, nil
 }
 
-func (a *AuthServer) validateTrustedCluster(validateRequest *ValidateTrustedClusterRequest) (*ValidateTrustedClusterResponse, error) {
+func (a *Server) validateTrustedCluster(validateRequest *ValidateTrustedClusterRequest) (resp *ValidateTrustedClusterResponse, err error) {
+	defer func() {
+		if err != nil {
+			log.WithError(err).Info("Trusted cluster validation failed")
+		}
+	}()
+
+	log.Debugf("Received validate request: token=%v, CAs=%v", validateRequest.Token, validateRequest.CAs)
+
 	domainName, err := a.GetDomainName()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	// validate that we generated the token
-	err = a.validateTrustedClusterToken(validateRequest.Token)
+	tokenLabels, err := a.validateTrustedClusterToken(validateRequest.Token)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
-	// log the remote certificate authorities we are adding
-	log.Debugf("Received validate request: token=%v, CAs=%v", validateRequest.Token, validateRequest.CAs)
 
 	// add remote cluster resource to keep track of the remote cluster
 	var remoteClusterName string
@@ -418,9 +472,14 @@ func (a *AuthServer) validateTrustedCluster(validateRequest *ValidateTrustedClus
 		}
 		remoteClusterName = certAuthority.GetName()
 	}
-	remoteCluster, err := services.NewRemoteCluster(remoteClusterName)
+	remoteCluster, err := types.NewRemoteCluster(remoteClusterName)
 	if err != nil {
 		return nil, trace.Wrap(err)
+	}
+	if len(tokenLabels) != 0 {
+		meta := remoteCluster.GetMetadata()
+		meta.Labels = utils.CopyStringsMap(tokenLabels)
+		remoteCluster.SetMetadata(meta)
 	}
 
 	err = a.CreateRemoteCluster(remoteCluster)
@@ -440,12 +499,12 @@ func (a *AuthServer) validateTrustedCluster(validateRequest *ValidateTrustedClus
 
 	// export local cluster certificate authority and return it to the cluster
 	validateResponse := ValidateTrustedClusterResponse{
-		CAs: []services.CertAuthority{},
+		CAs: []types.CertAuthority{},
 	}
-	for _, caType := range []services.CertAuthType{services.HostCA, services.UserCA} {
+	for _, caType := range []types.CertAuthType{types.HostCA, types.UserCA} {
 		certAuthority, err := a.GetCertAuthority(
-			services.CertAuthID{Type: caType, DomainName: domainName},
-			false, services.SkipValidation())
+			types.CertAuthID{Type: caType, DomainName: domainName},
+			false)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -458,20 +517,20 @@ func (a *AuthServer) validateTrustedCluster(validateRequest *ValidateTrustedClus
 	return &validateResponse, nil
 }
 
-func (a *AuthServer) validateTrustedClusterToken(token string) error {
-	roles, err := a.ValidateToken(token)
+func (a *Server) validateTrustedClusterToken(token string) (map[string]string, error) {
+	roles, labels, err := a.ValidateToken(token)
 	if err != nil {
-		return trace.AccessDenied("the remote server denied access: invalid cluster token")
+		return nil, trace.AccessDenied("the remote server denied access: invalid cluster token")
 	}
 
-	if !roles.Include(teleport.RoleTrustedCluster) && !roles.Include(teleport.LegacyClusterTokenType) {
-		return trace.AccessDenied("role does not match")
+	if !roles.Include(types.RoleTrustedCluster) && !roles.Include(types.LegacyClusterTokenType) {
+		return nil, trace.AccessDenied("role does not match")
 	}
 
-	return nil
+	return labels, nil
 }
 
-func (s *AuthServer) sendValidateRequestToProxy(host string, validateRequest *ValidateTrustedClusterRequest) (*ValidateTrustedClusterResponse, error) {
+func (a *Server) sendValidateRequestToProxy(host string, validateRequest *ValidateTrustedClusterRequest) (*ValidateTrustedClusterResponse, error) {
 	proxyAddr := url.URL{
 		Scheme: "https",
 		Host:   host,
@@ -492,7 +551,7 @@ func (s *AuthServer) sendValidateRequestToProxy(host string, validateRequest *Va
 		}
 
 		// Disable certificate checking while in debug mode.
-		tlsConfig := utils.TLSConfig(s.cipherSuites)
+		tlsConfig := utils.TLSConfig(a.cipherSuites)
 		tlsConfig.InsecureSkipVerify = true
 		tr.TLSClientConfig = tlsConfig
 
@@ -532,15 +591,15 @@ func (s *AuthServer) sendValidateRequestToProxy(host string, validateRequest *Va
 }
 
 type ValidateTrustedClusterRequest struct {
-	Token string                   `json:"token"`
-	CAs   []services.CertAuthority `json:"certificate_authorities"`
+	Token string                `json:"token"`
+	CAs   []types.CertAuthority `json:"certificate_authorities"`
 }
 
 func (v *ValidateTrustedClusterRequest) ToRaw() (*ValidateTrustedClusterRequestRaw, error) {
 	cas := [][]byte{}
 
 	for _, certAuthority := range v.CAs {
-		data, err := services.GetCertAuthorityMarshaler().MarshalCertAuthority(certAuthority)
+		data, err := services.MarshalCertAuthority(certAuthority)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -560,10 +619,10 @@ type ValidateTrustedClusterRequestRaw struct {
 }
 
 func (v *ValidateTrustedClusterRequestRaw) ToNative() (*ValidateTrustedClusterRequest, error) {
-	cas := []services.CertAuthority{}
+	cas := []types.CertAuthority{}
 
 	for _, rawCertAuthority := range v.CAs {
-		certAuthority, err := services.GetCertAuthorityMarshaler().UnmarshalCertAuthority(rawCertAuthority)
+		certAuthority, err := services.UnmarshalCertAuthority(rawCertAuthority)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -578,14 +637,14 @@ func (v *ValidateTrustedClusterRequestRaw) ToNative() (*ValidateTrustedClusterRe
 }
 
 type ValidateTrustedClusterResponse struct {
-	CAs []services.CertAuthority `json:"certificate_authorities"`
+	CAs []types.CertAuthority `json:"certificate_authorities"`
 }
 
 func (v *ValidateTrustedClusterResponse) ToRaw() (*ValidateTrustedClusterResponseRaw, error) {
 	cas := [][]byte{}
 
 	for _, certAuthority := range v.CAs {
-		data, err := services.GetCertAuthorityMarshaler().MarshalCertAuthority(certAuthority)
+		data, err := services.MarshalCertAuthority(certAuthority)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -603,10 +662,10 @@ type ValidateTrustedClusterResponseRaw struct {
 }
 
 func (v *ValidateTrustedClusterResponseRaw) ToNative() (*ValidateTrustedClusterResponse, error) {
-	cas := []services.CertAuthority{}
+	cas := []types.CertAuthority{}
 
 	for _, rawCertAuthority := range v.CAs {
-		certAuthority, err := services.GetCertAuthorityMarshaler().UnmarshalCertAuthority(rawCertAuthority)
+		certAuthority, err := services.UnmarshalCertAuthority(rawCertAuthority)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -621,32 +680,35 @@ func (v *ValidateTrustedClusterResponseRaw) ToNative() (*ValidateTrustedClusterR
 
 // activateCertAuthority will activate both the user and host certificate
 // authority given in the services.TrustedCluster resource.
-func (a *AuthServer) activateCertAuthority(t services.TrustedCluster) error {
-	err := a.ActivateCertAuthority(services.CertAuthID{Type: services.UserCA, DomainName: t.GetName()})
+func (a *Server) activateCertAuthority(t types.TrustedCluster) error {
+	err := a.ActivateCertAuthority(types.CertAuthID{Type: types.UserCA, DomainName: t.GetName()})
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	return trace.Wrap(a.ActivateCertAuthority(services.CertAuthID{Type: services.HostCA, DomainName: t.GetName()}))
+	return trace.Wrap(a.ActivateCertAuthority(types.CertAuthID{Type: types.HostCA, DomainName: t.GetName()}))
 }
 
 // deactivateCertAuthority will deactivate both the user and host certificate
 // authority given in the services.TrustedCluster resource.
-func (a *AuthServer) deactivateCertAuthority(t services.TrustedCluster) error {
-	err := a.DeactivateCertAuthority(services.CertAuthID{Type: services.UserCA, DomainName: t.GetName()})
+func (a *Server) deactivateCertAuthority(t types.TrustedCluster) error {
+	err := a.DeactivateCertAuthority(types.CertAuthID{Type: types.UserCA, DomainName: t.GetName()})
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	return trace.Wrap(a.DeactivateCertAuthority(services.CertAuthID{Type: services.HostCA, DomainName: t.GetName()}))
+	return trace.Wrap(a.DeactivateCertAuthority(types.CertAuthID{Type: types.HostCA, DomainName: t.GetName()}))
 }
 
 // createReverseTunnel will create a services.ReverseTunnel givenin the
 // services.TrustedCluster resource.
-func (a *AuthServer) createReverseTunnel(t services.TrustedCluster) error {
-	reverseTunnel := services.NewReverseTunnel(
+func (a *Server) createReverseTunnel(t types.TrustedCluster) error {
+	reverseTunnel, err := types.NewReverseTunnel(
 		t.GetName(),
 		[]string{t.GetReverseTunnelAddress()},
 	)
+	if err != nil {
+		return trace.Wrap(err)
+	}
 	return trace.Wrap(a.UpsertReverseTunnel(reverseTunnel))
 }

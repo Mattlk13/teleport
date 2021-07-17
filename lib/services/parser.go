@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Gravitational, Inc.
+Copyright 2020 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,10 +23,10 @@ import (
 	"time"
 
 	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/lib/wrappers"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/wrappers"
 
 	"github.com/gravitational/trace"
-	"github.com/jonboulle/clockwork"
 	log "github.com/sirupsen/logrus"
 	"github.com/vulcand/predicate"
 	"github.com/vulcand/predicate/builder"
@@ -41,8 +41,8 @@ type RuleContext interface {
 	// String returns human friendly representation of a context
 	String() string
 	// GetResource returns resource if specified in the context,
-	// if unpecified, returns error.
-	GetResource() (Resource, error)
+	// if unspecified, returns error.
+	GetResource() (types.Resource, error)
 }
 
 var (
@@ -75,7 +75,7 @@ func NewWhereParser(ctx RuleContext) (predicate.Parser, error) {
 					}
 					return nil, trace.Wrap(err)
 				}
-				ca, ok := resource.(CertAuthority)
+				ca, ok := resource.(types.CertAuthority)
 				if !ok {
 					return "", nil
 				}
@@ -172,10 +172,10 @@ func (l *LogAction) Log(level, format string, args ...interface{}) predicate.Boo
 // Context is a default rule context used in teleport
 type Context struct {
 	// User is currently authenticated user
-	User User
+	User types.User
 	// Resource is an optional resource, in case if the rule
 	// checks access to the resource
-	Resource Resource
+	Resource types.Resource
 }
 
 // String returns user friendly representation of this context
@@ -188,11 +188,15 @@ const (
 	UserIdentifier = "user"
 	// ResourceIdentifier represents resource registered identifier in the rules
 	ResourceIdentifier = "resource"
+	// ImpersonateRoleIdentifier is a role to impersonate
+	ImpersonateRoleIdentifier = "impersonate_role"
+	// ImpersonateUserIdentifier is a user to impersonate
+	ImpersonateUserIdentifier = "impersonate_user"
 )
 
 // GetResource returns resource specified in the context,
 // returns error if not specified.
-func (ctx *Context) GetResource() (Resource, error) {
+func (ctx *Context) GetResource() (types.Resource, error) {
 	if ctx.Resource == nil {
 		return nil, trace.NotFound("resource is not set in the context")
 	}
@@ -203,7 +207,7 @@ func (ctx *Context) GetResource() (Resource, error) {
 func (ctx *Context) GetIdentifier(fields []string) (interface{}, error) {
 	switch fields[0] {
 	case UserIdentifier:
-		var user User
+		var user types.User
 		if ctx.User == nil {
 			user = emptyUser
 		} else {
@@ -211,7 +215,7 @@ func (ctx *Context) GetIdentifier(fields []string) (interface{}, error) {
 		}
 		return predicate.GetFieldByTag(user, teleport.JSON, fields[1:])
 	case ResourceIdentifier:
-		var resource Resource
+		var resource types.Resource
 		if ctx.Resource == nil {
 			resource = emptyResource
 		} else {
@@ -223,50 +227,11 @@ func (ctx *Context) GetIdentifier(fields []string) (interface{}, error) {
 	}
 }
 
-// NewParserFn returns function that creates parser of 'where' section
-// in access rules
-type NewParserFn func(ctx RuleContext) (predicate.Parser, error)
-
-var whereParser = NewWhereParser
-var actionsParser = NewActionsParser
-
-// GetWhereParserFn returns global function that creates where parsers
-// this function is used in external tools to override and extend 'where' in rules
-func GetWhereParserFn() NewParserFn {
-	marshalerMutex.RLock()
-	defer marshalerMutex.RUnlock()
-	return whereParser
-}
-
-// SetWhereParserFn sets global function that creates where parsers
-// this function is used in external tools to override and extend 'where' in rules
-func SetWhereParserFn(fn NewParserFn) {
-	marshalerMutex.Lock()
-	defer marshalerMutex.Unlock()
-	whereParser = fn
-}
-
-// GetActionsParserFn returns global function that creates where parsers
-// this function is used in external tools to override and extend actions in rules
-func GetActionsParserFn() NewParserFn {
-	marshalerMutex.RLock()
-	defer marshalerMutex.RUnlock()
-	return actionsParser
-}
-
-// SetActionsParserFn sets global function that creates actions  parsers
-// this function is used in external tools to override and extend actions in rules
-func SetActionsParserFn(fn NewParserFn) {
-	marshalerMutex.Lock()
-	defer marshalerMutex.Unlock()
-	actionsParser = fn
-}
-
 // emptyResource is used when no resource is specified
 var emptyResource = &EmptyResource{}
 
 // emptyUser is used when no user is specified
-var emptyUser = &UserV2{}
+var emptyUser = &types.UserV2{}
 
 // EmptyResource is used to represent a use case when no resource
 // is specified in the rules matcher
@@ -278,7 +243,7 @@ type EmptyResource struct {
 	// Version is a resource version
 	Version string `json:"version"`
 	// Metadata is Role metadata
-	Metadata Metadata `json:"metadata"`
+	Metadata types.Metadata `json:"metadata"`
 }
 
 // GetVersion returns resource version
@@ -321,11 +286,6 @@ func (r *EmptyResource) Expiry() time.Time {
 	return r.Metadata.Expiry()
 }
 
-// SetTTL sets TTL header using realtime clock.
-func (r *EmptyResource) SetTTL(clock clockwork.Clock, ttl time.Duration) {
-	r.Metadata.SetTTL(clock, ttl)
-}
-
 // SetName sets the role name and is a shortcut for SetMetadata().Name.
 func (r *EmptyResource) SetName(s string) {
 	r.Metadata.Name = s
@@ -337,6 +297,57 @@ func (r *EmptyResource) GetName() string {
 }
 
 // GetMetadata returns role metadata.
-func (r *EmptyResource) GetMetadata() Metadata {
+func (r *EmptyResource) GetMetadata() types.Metadata {
 	return r.Metadata
+}
+
+func (r *EmptyResource) CheckAndSetDefaults() error { return nil }
+
+// BoolPredicateParser extends predicate.Parser with a convenience method
+// for evaluating bool predicates.
+type BoolPredicateParser interface {
+	predicate.Parser
+	EvalBoolPredicate(string) (bool, error)
+}
+
+type boolPredicateParser struct {
+	predicate.Parser
+}
+
+func (p boolPredicateParser) EvalBoolPredicate(expr string) (bool, error) {
+	ifn, err := p.Parse(expr)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+
+	fn, ok := ifn.(predicate.BoolPredicate)
+	if !ok {
+		return false, trace.BadParameter("unsupported type: %T", ifn)
+	}
+
+	return fn(), nil
+}
+
+// NewJSONBoolParser returns a generic parser for boolean expressions based on a
+// json-serializable context.
+func NewJSONBoolParser(ctx interface{}) (BoolPredicateParser, error) {
+	p, err := predicate.NewParser(predicate.Def{
+		Operators: predicate.Operators{
+			AND: predicate.And,
+			OR:  predicate.Or,
+			NOT: predicate.Not,
+		},
+		Functions: map[string]interface{}{
+			"equals":   predicate.Equals,
+			"contains": predicate.Contains,
+		},
+		GetIdentifier: func(fields []string) (interface{}, error) {
+			return predicate.GetFieldByTag(ctx, teleport.JSON, fields)
+		},
+		GetProperty: GetStringMapValue,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return boolPredicateParser{Parser: p}, nil
 }

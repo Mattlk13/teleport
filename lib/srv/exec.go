@@ -1,5 +1,5 @@
 /*
-Copyright 2015 Gravitational, Inc.
+Copyright 2015-2020 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,9 +31,10 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
+	apievents "github.com/gravitational/teleport/api/types/events"
+	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
 	log "github.com/sirupsen/logrus"
@@ -93,7 +94,7 @@ func NewExecRequest(ctx *ServerContext, command string) (Exec, error) {
 
 	// When in recording mode, return an *remoteExec which will execute the
 	// command on a remote host. This is used by in-memory forwarding nodes.
-	if ctx.ClusterConfig.GetSessionRecording() == services.RecordAtProxy {
+	if services.IsRecordAtProxy(ctx.SessionRecordingConfig.GetMode()) == true {
 		return &remoteExec{
 			ctx:     ctx,
 			command: command,
@@ -147,8 +148,7 @@ func (e *localExec) Start(channel ssh.Channel) (*ExecResult, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	// Connect stdout and stderr to the channel so the user can interact with
-	// the command.
+	// Connect stdout and stderr to the channel so the user can interact with the command.
 	e.Cmd.Stderr = channel.Stderr()
 	e.Cmd.Stdout = channel
 
@@ -157,12 +157,6 @@ func (e *localExec) Start(channel ssh.Channel) (*ExecResult, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	go func() {
-		if _, err := io.Copy(inputWriter, channel); err != nil {
-			e.Ctx.Warningf("Failed to forward data from SSH channel to local command %q stdin: %v", e.GetCommand(), err)
-		}
-		inputWriter.Close()
-	}()
 
 	// Start the command.
 	err = e.Cmd.Start()
@@ -178,6 +172,13 @@ func (e *localExec) Start(channel ssh.Channel) (*ExecResult, error) {
 		}, trace.ConvertSystemError(err)
 	}
 
+	go func() {
+		if _, err := io.Copy(inputWriter, channel); err != nil {
+			e.Ctx.Warnf("Failed to forward data from SSH channel to local command %q stdin: %v", e.GetCommand(), err)
+		}
+		inputWriter.Close()
+	}()
+
 	e.Ctx.Infof("Started local command execution: %q", e.Command)
 
 	return nil, nil
@@ -186,7 +187,7 @@ func (e *localExec) Start(channel ssh.Channel) (*ExecResult, error) {
 // Wait will block while the command executes.
 func (e *localExec) Wait() *ExecResult {
 	if e.Cmd.Process == nil {
-		e.Ctx.Errorf("no process")
+		e.Ctx.Error("No process.")
 	}
 
 	// Block until the command is finished executing.
@@ -246,7 +247,7 @@ func (e *localExec) transformSecureCopy() error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	e.Command = fmt.Sprintf("%s scp --remote-addr=%s --local-addr=%s %v",
+	e.Command = fmt.Sprintf("%s scp --remote-addr=%q --local-addr=%q %v",
 		teleportBin,
 		e.Ctx.ServerConn.RemoteAddr().String(),
 		e.Ctx.ServerConn.LocalAddr().String(),
@@ -289,6 +290,11 @@ type remoteExec struct {
 	ctx     *ServerContext
 }
 
+// String describes this remote exec value
+func (e *remoteExec) String() string {
+	return fmt.Sprintf("RemoteExec(Command=%v)", e.command)
+}
+
 // GetCommand returns the command string.
 func (e *remoteExec) GetCommand() string {
 	return e.command
@@ -301,11 +307,11 @@ func (e *remoteExec) SetCommand(command string) {
 
 // Start launches the given command returns (nil, nil) if successful.
 // ExecResult is only used to communicate an error while launching.
-func (r *remoteExec) Start(ch ssh.Channel) (*ExecResult, error) {
+func (e *remoteExec) Start(ch ssh.Channel) (*ExecResult, error) {
 	// hook up stdout/err the channel so the user can interact with the command
-	r.session.Stdout = ch
-	r.session.Stderr = ch.Stderr()
-	inputWriter, err := r.session.StdinPipe()
+	e.session.Stdout = ch
+	e.session.Stderr = ch.Stderr()
+	inputWriter, err := e.session.StdinPipe()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -313,12 +319,12 @@ func (r *remoteExec) Start(ch ssh.Channel) (*ExecResult, error) {
 	go func() {
 		// copy from the channel (client) into stdin of the process
 		if _, err := io.Copy(inputWriter, ch); err != nil {
-			r.ctx.Warnf("Failed copying data from SSH channel to remote command stdin: %v", err)
+			e.ctx.Warnf("Failed copying data from SSH channel to remote command stdin: %v", err)
 		}
 		inputWriter.Close()
 	}()
 
-	err = r.session.Start(r.command)
+	err = e.session.Start(e.command)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -327,60 +333,68 @@ func (r *remoteExec) Start(ch ssh.Channel) (*ExecResult, error) {
 }
 
 // Wait will block while the command executes.
-func (r *remoteExec) Wait() *ExecResult {
+func (e *remoteExec) Wait() *ExecResult {
 	// Block until the command is finished executing.
-	err := r.session.Wait()
+	err := e.session.Wait()
 	if err != nil {
-		r.ctx.Debugf("Remote command failed: %v.", err)
+		e.ctx.Debugf("Remote command failed: %v.", err)
 	} else {
-		r.ctx.Debugf("Remote command successfully executed.")
+		e.ctx.Debugf("Remote command successfully executed.")
 	}
 
 	// Emit the result of execution to the Audit Log.
-	emitExecAuditEvent(r.ctx, r.command, err)
+	emitExecAuditEvent(e.ctx, e.command, err)
 
 	return &ExecResult{
-		Command: r.GetCommand(),
+		Command: e.GetCommand(),
 		Code:    exitCode(err),
 	}
 }
 
 // Continue does nothing for remote command execution.
-func (r *remoteExec) Continue() {}
+func (e *remoteExec) Continue() {}
 
 // PID returns an invalid PID for remotExec.
-func (r *remoteExec) PID() int {
+func (e *remoteExec) PID() int {
 	return 0
 }
 
 func emitExecAuditEvent(ctx *ServerContext, cmd string, execErr error) {
-	// Report the result of this exec event to the audit logger.
-	auditLog := ctx.srv.GetAuditLog()
-	if auditLog == nil {
-		log.Warnf("No audit log")
-		return
+	// Create common fields for event.
+	serverMeta := apievents.ServerMetadata{
+		ServerID:        ctx.srv.HostUUID(),
+		ServerNamespace: ctx.srv.GetNamespace(),
 	}
 
-	var event events.Event
+	sessionMeta := apievents.SessionMetadata{
+		SessionID: string(ctx.SessionID()),
+		WithMFA:   ctx.Identity.Certificate.Extensions[teleport.CertExtensionMFAVerified],
+	}
 
-	// Create common fields for event.
-	fields := events.EventFields{
-		events.EventUser:      ctx.Identity.TeleportUser,
-		events.EventLogin:     ctx.Identity.Login,
-		events.LocalAddr:      ctx.ServerConn.LocalAddr().String(),
-		events.RemoteAddr:     ctx.ServerConn.RemoteAddr().String(),
-		events.EventNamespace: ctx.srv.GetNamespace(),
+	userMeta := apievents.UserMetadata{
+		User:         ctx.Identity.TeleportUser,
+		Login:        ctx.Identity.Login,
+		Impersonator: ctx.Identity.Impersonator,
+	}
+
+	connectionMeta := apievents.ConnectionMetadata{
+		RemoteAddr: ctx.ServerConn.RemoteAddr().String(),
+		LocalAddr:  ctx.ServerConn.LocalAddr().String(),
+	}
+
+	commandMeta := apievents.CommandMetadata{
+		Command: cmd,
 		// Due to scp being inherently vulnerable to command injection, always
 		// make sure the full command and exit code is recorded for accountability.
 		// For more details, see the following.
 		//
 		// https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=327019
 		// https://bugzilla.mindrot.org/show_bug.cgi?id=1998
-		events.ExecEventCode:    strconv.Itoa(exitCode(execErr)),
-		events.ExecEventCommand: cmd,
+		ExitCode: strconv.Itoa(exitCode(execErr)),
 	}
+
 	if execErr != nil {
-		fields[events.ExecEventError] = execErr.Error()
+		commandMeta.Error = execErr.Error()
 	}
 
 	// Parse the exec command to find out if it was SCP or not.
@@ -392,33 +406,56 @@ func emitExecAuditEvent(ctx *ServerContext, cmd string, execErr error) {
 
 	// Update appropriate fields based off if the request was SCP or not.
 	if isSCP {
-		fields[events.SCPPath] = path
-		fields[events.SCPAction] = action
+		scpEvent := &apievents.SCP{
+			Metadata: apievents.Metadata{
+				Type:        events.SCPEvent,
+				ClusterName: ctx.ClusterName,
+			},
+			ServerMetadata:     serverMeta,
+			SessionMetadata:    sessionMeta,
+			UserMetadata:       userMeta,
+			ConnectionMetadata: connectionMeta,
+			CommandMetadata:    commandMeta,
+			Path:               path,
+			Action:             action,
+		}
+
 		switch action {
 		case events.SCPActionUpload:
 			if execErr != nil {
-				event = events.SCPUploadFailure
+				scpEvent.Code = events.SCPUploadFailureCode
 			} else {
-				event = events.SCPUpload
+				scpEvent.Code = events.SCPUploadCode
 			}
 		case events.SCPActionDownload:
 			if execErr != nil {
-				event = events.SCPDownloadFailure
+				scpEvent.Code = events.SCPDownloadFailureCode
 			} else {
-				event = events.SCPDownload
+				scpEvent.Code = events.SCPDownloadCode
 			}
 		}
-	} else {
-		if execErr != nil {
-			event = events.ExecFailure
-		} else {
-			event = events.Exec
+		if err := ctx.srv.EmitAuditEvent(ctx.srv.Context(), scpEvent); err != nil {
+			log.WithError(err).Warn("Failed to emit scp event.")
 		}
-	}
-
-	// Emit the event.
-	if err := auditLog.EmitAuditEvent(event, fields); err != nil {
-		log.Warnf("Failed to emit exec audit event: %v", err)
+	} else {
+		execEvent := &apievents.Exec{
+			Metadata: apievents.Metadata{
+				Type: events.ExecEvent,
+			},
+			ServerMetadata:     serverMeta,
+			SessionMetadata:    sessionMeta,
+			UserMetadata:       userMeta,
+			ConnectionMetadata: connectionMeta,
+			CommandMetadata:    commandMeta,
+		}
+		if execErr != nil {
+			execEvent.Code = events.ExecFailureCode
+		} else {
+			execEvent.Code = events.ExecCode
+		}
+		if err := ctx.srv.EmitAuditEvent(ctx.srv.Context(), execEvent); err != nil {
+			log.WithError(err).Warn("Failed to emit exec event.")
+		}
 	}
 }
 
@@ -492,7 +529,7 @@ func parseSecureCopy(path string) (string, string, bool, error) {
 	// Look for the -t flag, it indicates that an upload occurred. The other
 	// flags do no matter for now.
 	action := events.SCPActionDownload
-	if utils.SliceContainsStr(parts, "-t") {
+	if apiutils.SliceContainsStr(parts, "-t") {
 		action = events.SCPActionUpload
 	}
 

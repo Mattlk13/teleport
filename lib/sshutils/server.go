@@ -1,5 +1,5 @@
 /*
-Copyright 2015 Gravitational, Inc.
+Copyright 2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,7 +21,6 @@ package sshutils
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"io"
 	"net"
@@ -38,15 +37,23 @@ import (
 
 	"github.com/gravitational/trace"
 
+	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
+)
+
+var proxyConnectionLimitHitCount = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Name: teleport.MetricProxyConnectionLimitHit,
+		Help: "Number of times the proxy connection limit was exceeded",
+	},
 )
 
 // Server is a generic implementation of an SSH server. All Teleport
 // services (auth, proxy, ssh) use this as a base to accept SSH connections.
 type Server struct {
-	*log.Entry
 	sync.RWMutex
 
+	log log.FieldLogger
 	// component is a name of the facility which uses this server,
 	// used for logging/debugging. typically it's "proxy" or "auth api", etc
 	component string
@@ -59,6 +66,7 @@ type Server struct {
 
 	newChanHandler NewChanHandler
 	reqHandler     RequestHandler
+	newConnHandler NewConnHandler
 
 	cfg     ssh.ServerConfig
 	limiter *limiter.Limiter
@@ -106,6 +114,14 @@ const (
 // ServerOption is a functional argument for server
 type ServerOption func(cfg *Server) error
 
+// SetLogger sets the logger for the server
+func SetLogger(logger log.FieldLogger) ServerOption {
+	return func(s *Server) error {
+		s.log = logger.WithField(trace.Component, "ssh:"+s.component)
+		return nil
+	}
+}
+
 func SetLimiter(limiter *limiter.Limiter) ServerOption {
 	return func(s *Server) error {
 		s.limiter = limiter
@@ -136,12 +152,16 @@ func NewServer(
 	h NewChanHandler,
 	hostSigners []ssh.Signer,
 	ah AuthMethods,
-	opts ...ServerOption) (*Server, error) {
-	var err error
+	opts ...ServerOption,
+) (*Server, error) {
+	err := utils.RegisterPrometheusCollectors(proxyConnectionLimitHitCount)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 
 	closeContext, cancel := context.WithCancel(context.TODO())
 	s := &Server{
-		Entry: log.WithFields(log.Fields{
+		log: log.WithFields(log.Fields{
 			trace.Component: "ssh:" + component,
 		}),
 		addr:           a,
@@ -150,7 +170,7 @@ func NewServer(
 		closeContext:   closeContext,
 		closeFunc:      cancel,
 	}
-	s.limiter, err = limiter.NewLimiter(limiter.LimiterConfig{})
+	s.limiter, err = limiter.NewLimiter(limiter.Config{})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -196,9 +216,16 @@ func SetRequestHandler(req RequestHandler) ServerOption {
 	}
 }
 
+func SetNewConnHandler(handler NewConnHandler) ServerOption {
+	return func(s *Server) error {
+		s.newConnHandler = handler
+		return nil
+	}
+}
+
 func SetCiphers(ciphers []string) ServerOption {
 	return func(s *Server) error {
-		s.Debugf("Supported ciphers: %q.", ciphers)
+		s.log.Debugf("Supported ciphers: %q.", ciphers)
 		if ciphers != nil {
 			s.cfg.Ciphers = ciphers
 		}
@@ -208,7 +235,7 @@ func SetCiphers(ciphers []string) ServerOption {
 
 func SetKEXAlgorithms(kexAlgorithms []string) ServerOption {
 	return func(s *Server) error {
-		s.Debugf("Supported KEX algorithms: %q.", kexAlgorithms)
+		s.log.Debugf("Supported KEX algorithms: %q.", kexAlgorithms)
 		if kexAlgorithms != nil {
 			s.cfg.KeyExchanges = kexAlgorithms
 		}
@@ -218,7 +245,7 @@ func SetKEXAlgorithms(kexAlgorithms []string) ServerOption {
 
 func SetMACAlgorithms(macAlgorithms []string) ServerOption {
 	return func(s *Server) error {
-		s.Debugf("Supported MAC algorithms: %q.", macAlgorithms)
+		s.log.Debugf("Supported MAC algorithms: %q.", macAlgorithms)
 		if macAlgorithms != nil {
 			s.cfg.MACs = macAlgorithms
 		}
@@ -261,6 +288,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		return trace.ConvertSystemError(err)
 	}
+	s.log.WithField("addr", listener.Addr().String()).Debug("Server start.")
 	if err := s.setListener(listener); err != nil {
 		return trace.Wrap(err)
 	}
@@ -298,7 +326,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if activeConnections == 0 {
 		return err
 	}
-	s.Infof("Shutdown: waiting for %v connections to finish.", activeConnections)
+	s.log.Infof("Shutdown: waiting for %v connections to finish.", activeConnections)
 	lastReport := time.Time{}
 	ticker := time.NewTicker(s.shutdownPollPeriod)
 	defer ticker.Stop()
@@ -310,11 +338,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 				return err
 			}
 			if time.Since(lastReport) > 10*s.shutdownPollPeriod {
-				s.Infof("Shutdown: waiting for %v connections to finish.", activeConnections)
+				s.log.Infof("Shutdown: waiting for %v connections to finish.", activeConnections)
 				lastReport = time.Now()
 			}
 		case <-ctx.Done():
-			s.Infof("Context cancelled wait, returning.")
+			s.log.Infof("Context cancelled wait, returning.")
 			return trace.ConnectionProblem(err, "context cancelled")
 		}
 	}
@@ -350,20 +378,20 @@ func (s *Server) acceptConnections() {
 	backoffTimer := time.NewTicker(5 * time.Second)
 	defer backoffTimer.Stop()
 	addr := s.Addr()
-	s.Debugf("Listening on %v.", addr)
+	s.log.Debugf("Listening on %v.", addr)
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
 			if s.isClosed() {
-				s.Debugf("Server %v has closed.", addr)
+				s.log.Debugf("Server %v has closed.", addr)
 				return
 			}
 			select {
 			case <-s.closeContext.Done():
-				s.Debugf("Server %v has closed.", addr)
+				s.log.Debugf("Server %v has closed.", addr)
 				return
 			case <-backoffTimer.C:
-				s.Debugf("Backoff on network error: %v.", err)
+				s.log.Debugf("Backoff on network error: %v.", err)
 			}
 		} else {
 			go s.HandleConnection(conn)
@@ -391,6 +419,9 @@ func (s *Server) HandleConnection(conn net.Conn) {
 		log.Errorf(err.Error())
 	}
 	if err := s.limiter.AcquireConnection(remoteAddr); err != nil {
+		if trace.IsLimitExceeded(err) {
+			proxyConnectionLimitHitCount.Inc()
+		}
 		log.Errorf(err.Error())
 		conn.Close()
 		return
@@ -423,12 +454,12 @@ func (s *Server) HandleConnection(conn net.Conn) {
 		return
 	}
 	// Connection successfully initiated
-	s.Debugf("Incoming connection %v -> %v vesion: %v.",
+	s.log.Debugf("Incoming connection %v -> %v version: %v.",
 		sconn.RemoteAddr(), sconn.LocalAddr(), string(sconn.ClientVersion()))
 
 	// will be called when the connection is closed
 	connClosed := func() {
-		s.Debugf("Closed connection %v.", sconn.RemoteAddr())
+		s.log.Debugf("Closed connection %v.", sconn.RemoteAddr())
 	}
 
 	// The keepalive ticket will ensure that SSH keepalive requests are being sent
@@ -444,6 +475,32 @@ func (s *Server) HandleConnection(conn net.Conn) {
 	ctx, ccx := NewConnectionContext(context.Background(), wconn, sconn)
 	defer ccx.Close()
 
+	if s.newConnHandler != nil {
+		// if newConnHandler was set, then we have additional setup work
+		// to do before we can begin serving normally.  Errors returned
+		// from a NewConnHandler are rejections.
+		ctx, err = s.newConnHandler.HandleNewConn(ctx, ccx)
+		if err != nil {
+			s.log.Warnf("Dropping inbound ssh connection due to error: %v", err)
+			// Immediately dropping the ssh connection results in an
+			// EOF error for the client.  We therefore wait briefly
+			// to see if the client opens a channel, which will give
+			// us the opportunity to respond with a human-readable
+			// error.
+			select {
+			case firstChan := <-chans:
+				if firstChan != nil {
+					firstChan.Reject(ssh.Prohibited, err.Error())
+				}
+			case <-s.closeContext.Done():
+			case <-time.After(time.Second * 1):
+			}
+			sconn.Close()
+			conn.Close()
+			return
+		}
+	}
+
 	for {
 		select {
 		// handle out of band ssh requests
@@ -452,7 +509,7 @@ func (s *Server) HandleConnection(conn net.Conn) {
 				connClosed()
 				return
 			}
-			s.Debugf("Received out-of-band request: %+v.", req)
+			s.log.Debugf("Received out-of-band request: %+v.", req)
 			if s.reqHandler != nil {
 				go s.reqHandler.HandleRequest(req)
 			}
@@ -471,7 +528,8 @@ func (s *Server) HandleConnection(conn net.Conn) {
 				log.Errorf("Failed sending keepalive request: %v", err)
 			}
 		case <-ctx.Done():
-			log.Debugf("Connection context canceled: %v -> %v", conn.RemoteAddr(), conn.LocalAddr())
+			s.log.Debugf("Connection context canceled: %v -> %v", conn.RemoteAddr(), conn.LocalAddr())
+			return
 		}
 	}
 }
@@ -488,6 +546,13 @@ type NewChanHandlerFunc func(context.Context, *ConnectionContext, ssh.NewChannel
 
 func (f NewChanHandlerFunc) HandleNewChan(ctx context.Context, ccx *ConnectionContext, ch ssh.NewChannel) {
 	f(ctx, ccx, ch)
+}
+
+// NewConnHandler is called once per incoming connection.
+// Errors terminate the incoming connection.  The returned context
+// must be the same as, or a child of, the passed in context.
+type NewConnHandler interface {
+	HandleNewConn(ctx context.Context, ccx *ConnectionContext) (context.Context, error)
 }
 
 type AuthMethods struct {
@@ -548,15 +613,10 @@ func validateHostSigner(fips bool, signer ssh.Signer) error {
 	return nil
 }
 
-type PublicKeyFunc func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error)
-type PasswordFunc func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error)
-
-// KeysEqual is constant time compare of the keys to avoid timing attacks
-func KeysEqual(ak, bk ssh.PublicKey) bool {
-	a := ssh.Marshal(ak)
-	b := ssh.Marshal(bk)
-	return (len(a) == len(b) && subtle.ConstantTimeCompare(a, b) == 1)
-}
+type (
+	PublicKeyFunc func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error)
+	PasswordFunc  func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error)
+)
 
 // HandshakePayload structure is sent as a JSON blob by the teleport
 // proxy to every SSH server who identifies itself as Teleport server
@@ -610,7 +670,7 @@ func (c *connectionWrapper) Read(b []byte) (int, error) {
 	}
 	// chop off extra unused bytes at the end of the buffer:
 	buff = buff[:n]
-	var skip = 0
+	skip := 0
 
 	// are we reading from a Teleport proxy?
 	if bytes.HasPrefix(buff, []byte(ProxyHelloSignature)) {

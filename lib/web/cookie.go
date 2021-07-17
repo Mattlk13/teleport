@@ -49,13 +49,13 @@ func DecodeCookie(b string) (*SessionCookie, error) {
 	return c, nil
 }
 
-func SetSession(w http.ResponseWriter, user, sid string) error {
+func SetSessionCookie(w http.ResponseWriter, user, sid string) error {
 	d, err := EncodeCookie(user, sid)
 	if err != nil {
 		return err
 	}
 	c := &http.Cookie{
-		Name:     "session",
+		Name:     CookieName,
 		Value:    d,
 		Path:     "/",
 		HttpOnly: true,
@@ -67,10 +67,15 @@ func SetSession(w http.ResponseWriter, user, sid string) error {
 
 func ClearSession(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     "session",
+		Name:     CookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   true,
 	})
 }
+
+const (
+	// CookieName is the name of the session cookie.
+	CookieName = "__Host-session"
+)

@@ -18,10 +18,11 @@ package local
 
 import (
 	"context"
-	"fmt"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/lite"
 	"github.com/gravitational/teleport/lib/services"
@@ -32,22 +33,22 @@ import (
 	"gopkg.in/check.v1"
 )
 
+func TestMain(m *testing.M) {
+	utils.InitLoggerForTests()
+	os.Exit(m.Run())
+}
+
 type ServicesSuite struct {
 	bk    backend.Backend
 	suite *suite.ServicesTestSuite
 }
 
-var _ = fmt.Printf
 var _ = check.Suite(&ServicesSuite{})
-
-func (s *ServicesSuite) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests(testing.Verbose())
-}
 
 func (s *ServicesSuite) SetUpTest(c *check.C) {
 	var err error
 
-	clock := clockwork.NewFakeClockAt(time.Now())
+	clock := clockwork.NewFakeClock()
 
 	s.bk, err = lite.NewWithConfig(context.TODO(), lite.Config{
 		Path:             c.MkDir(),
@@ -61,7 +62,10 @@ func (s *ServicesSuite) SetUpTest(c *check.C) {
 		*EventsService
 	}
 
-	eventsService := NewEventsService(s.bk)
+	configService, err := NewClusterConfigurationService(s.bk)
+	c.Assert(err, check.IsNil)
+
+	eventsService := NewEventsService(s.bk, configService.GetClusterConfig)
 	presenceService := NewPresenceService(s.bk)
 
 	s.suite = &suite.ServicesTestSuite{
@@ -72,18 +76,21 @@ func (s *ServicesSuite) SetUpTest(c *check.C) {
 		Access:        NewAccessService(s.bk),
 		EventsS:       eventsService,
 		ChangesC:      make(chan interface{}),
-		ConfigS:       NewClusterConfigurationService(s.bk),
+		ConfigS:       configService,
+		RestrictionsS: NewRestrictionsService(s.bk),
 		Clock:         clock,
 		NewProxyWatcher: func() (*services.ProxyWatcher, error) {
 			return services.NewProxyWatcher(services.ProxyWatcherConfig{
-				Context:     context.TODO(),
-				Component:   "test",
-				RetryPeriod: 200 * time.Millisecond,
-				Client: &client{
-					PresenceService: presenceService,
-					EventsService:   eventsService,
+				ResourceWatcherConfig: services.ResourceWatcherConfig{
+					ParentContext: context.TODO(),
+					Component:     "test",
+					RetryPeriod:   200 * time.Millisecond,
+					Client: &client{
+						PresenceService: presenceService,
+						EventsService:   eventsService,
+					},
 				},
-				ProxiesC: make(chan []services.Server, 10),
+				ProxiesC: make(chan []types.Server, 10),
 			})
 		},
 	}
@@ -99,6 +106,11 @@ func (s *ServicesSuite) TestUserCACRUD(c *check.C) {
 
 func (s *ServicesSuite) TestServerCRUD(c *check.C) {
 	s.suite.ServerCRUD(c)
+}
+
+// TestAppServerCRUD tests CRUD functionality for services.App.
+func (s *ServicesSuite) TestAppServerCRUD(c *check.C) {
+	s.suite.AppServerCRUD(c)
 }
 
 func (s *ServicesSuite) TestReverseTunnelsCRUD(c *check.C) {
@@ -163,4 +175,24 @@ func (s *ServicesSuite) TestEventsClusterConfig(c *check.C) {
 
 func (s *ServicesSuite) TestProxyWatcher(c *check.C) {
 	s.suite.ProxyWatcher(c)
+}
+
+func (s *ServicesSuite) TestSemaphoreLock(c *check.C) {
+	s.suite.SemaphoreLock(c)
+}
+
+func (s *ServicesSuite) TestSemaphoreConcurrency(c *check.C) {
+	s.suite.SemaphoreConcurrency(c)
+}
+
+func (s *ServicesSuite) TestSemaphoreContention(c *check.C) {
+	s.suite.SemaphoreContention(c)
+}
+
+func (s *ServicesSuite) TestSemaphoreFlakiness(c *check.C) {
+	s.suite.SemaphoreFlakiness(c)
+}
+
+func (s *ServicesSuite) TestNetworkRestrictions(c *check.C) {
+	s.suite.NetworkRestrictions(c)
 }

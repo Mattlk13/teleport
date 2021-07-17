@@ -1,5 +1,3 @@
-// +build firestore
-
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,14 +18,22 @@ package firestoreevents
 
 import (
 	"context"
+	"net"
+	"os"
 	"testing"
 	"time"
 
-	"github.com/gravitational/teleport/lib/events/test"
-	"github.com/gravitational/teleport/lib/utils"
 	"github.com/jonboulle/clockwork"
 	"gopkg.in/check.v1"
+
+	"github.com/gravitational/teleport/lib/events/test"
+	"github.com/gravitational/teleport/lib/utils"
 )
+
+func TestMain(m *testing.M) {
+	utils.InitLoggerForTests()
+	os.Exit(m.Run())
+}
 
 func TestFirestoreevents(t *testing.T) { check.TestingT(t) }
 
@@ -39,7 +45,10 @@ type FirestoreeventsSuite struct {
 var _ = check.Suite(&FirestoreeventsSuite{})
 
 func (s *FirestoreeventsSuite) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests()
+	if !emulatorRunning() {
+		c.Skip("Firestore emulator is not running, start it with: gcloud beta emulators firestore start --host-port=localhost:8618")
+	}
+
 	fakeClock := clockwork.NewFakeClock()
 
 	config := EventsConfig{}
@@ -59,11 +68,22 @@ func (s *FirestoreeventsSuite) SetUpSuite(c *check.C) {
 	s.log = log
 	s.EventsSuite.Log = log
 	s.EventsSuite.Clock = fakeClock
-	s.EventsSuite.QueryDelay = time.Second
+	s.EventsSuite.QueryDelay = time.Second * 5
+}
+
+func emulatorRunning() bool {
+	con, err := net.Dial("tcp", "localhost:8618")
+	if err != nil {
+		return false
+	}
+	con.Close()
+	return true
 }
 
 func (s *FirestoreeventsSuite) TearDownSuite(c *check.C) {
-	s.log.Close()
+	if s.log != nil {
+		s.log.Close()
+	}
 }
 
 func (s *FirestoreeventsSuite) TearDownTest(c *check.C) {
@@ -84,4 +104,8 @@ func (s *FirestoreeventsSuite) TearDownTest(c *check.C) {
 
 func (s *FirestoreeventsSuite) TestSessionEventsCRUD(c *check.C) {
 	s.SessionEventsCRUD(c)
+}
+
+func (s *FirestoreeventsSuite) TestPagination(c *check.C) {
+	s.EventPagination(c)
 }

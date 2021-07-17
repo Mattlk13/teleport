@@ -28,11 +28,14 @@ import (
 	"strings"
 	"time"
 
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
+	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/backend"
-	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 
+	"github.com/coreos/go-semver/semver"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
@@ -40,8 +43,11 @@ import (
 	"go.etcd.io/etcd/clientv3"
 	"go.etcd.io/etcd/etcdserver/api/v3rpc/rpctypes"
 	"go.etcd.io/etcd/mvcc/mvccpb"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/gravitational/teleport"
 )
 
 var (
@@ -105,21 +111,15 @@ var (
 			Buckets: prometheus.ExponentialBuckets(0.001, 2, 16),
 		},
 	)
+
+	prometheusCollectors = []prometheus.Collector{
+		writeLatencies, txLatencies, batchReadLatencies,
+		readLatencies, writeRequests, txRequests, batchReadRequests, readRequests,
+	}
 )
 
-func init() {
-	// Metrics have to be registered to be exposed:
-	prometheus.MustRegister(writeLatencies)
-	prometheus.MustRegister(txLatencies)
-	prometheus.MustRegister(batchReadLatencies)
-	prometheus.MustRegister(readLatencies)
-	prometheus.MustRegister(writeRequests)
-	prometheus.MustRegister(txRequests)
-	prometheus.MustRegister(batchReadRequests)
-	prometheus.MustRegister(readRequests)
-}
-
 type EtcdBackend struct {
+	backend.NoMigrations
 	nodes []string
 	*log.Entry
 	cfg              *Config
@@ -132,6 +132,7 @@ type EtcdBackend struct {
 	cancel           context.CancelFunc
 	watchStarted     context.Context
 	signalWatchStart context.CancelFunc
+	watchDone        chan struct{}
 }
 
 // Config represents JSON config for etcd backend
@@ -160,15 +161,10 @@ type Config struct {
 	// PasswordFile is an optional password file for HTTPS basic authentication,
 	// expects path to a file
 	PasswordFile string `json:"password_file,omitempty"`
+	// MaxClientMsgSizeBytes optionally specifies the size limit on client send message size.
+	// See https://github.com/etcd-io/etcd/blob/221f0cc107cb3497eeb20fb241e1bcafca2e9115/clientv3/config.go#L49
+	MaxClientMsgSizeBytes int `json:"etcd_max_client_msg_size_bytes,omitempty"`
 }
-
-// legacyDefaultPrefix was used instead of Config.Key prior to 4.3. It's used
-// below to allow a safe migration to the correct usage of Config.Key during
-// 4.3 and will be removed in 4.4
-//
-// DELETE IN 4.4: legacy prefix support for migration of
-// https://github.com/gravitational/teleport/issues/2883
-const legacyDefaultPrefix = "/teleport"
 
 // GetName returns the name of etcd backend as it appears in 'storage/type' section
 // in Teleport YAML file. This function is a part of backend API
@@ -181,14 +177,18 @@ var _ backend.Backend = &EtcdBackend{}
 
 // New returns new instance of Etcd-powered backend
 func New(ctx context.Context, params backend.Params) (*EtcdBackend, error) {
-	var err error
+	err := utils.RegisterPrometheusCollectors(prometheusCollectors...)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	if params == nil {
 		return nil, trace.BadParameter("missing etcd configuration")
 	}
 
 	// convert generic backend parameters structure to etcd config:
 	var cfg *Config
-	if err = utils.ObjectToStruct(params, &cfg); err != nil {
+	if err = apiutils.ObjectToStruct(params, &cfg); err != nil {
 		return nil, trace.BadParameter("invalid etcd configuration: %v", err)
 	}
 	if err = cfg.Validate(); err != nil {
@@ -212,11 +212,37 @@ func New(ctx context.Context, params backend.Params) (*EtcdBackend, error) {
 		ctx:              closeCtx,
 		watchStarted:     watchStarted,
 		signalWatchStart: signalWatchStart,
+		watchDone:        make(chan struct{}),
 		buf:              buf,
 	}
-	if err = b.reconnect(); err != nil {
+
+	// Check that the etcd nodes are at least the minimum version supported
+	if err = b.reconnect(ctx); err != nil {
 		return nil, trace.Wrap(err)
 	}
+	timeout, cancel := context.WithTimeout(ctx, time.Second*3*time.Duration(len(cfg.Nodes)))
+	defer cancel()
+	for _, n := range cfg.Nodes {
+		status, err := b.client.Status(timeout, n)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		ver := semver.New(status.Version)
+		min := semver.New(teleport.MinimumEtcdVersion)
+		if ver.LessThan(*min) {
+			return nil, trace.BadParameter("unsupported version of etcd %v for node %v, must be %v or greater",
+				status.Version, n, teleport.MinimumEtcdVersion)
+		}
+	}
+
+	// Reconnect the etcd client to work around a data race in their code.
+	// Upstream fix: https://github.com/etcd-io/etcd/pull/12992
+	if err = b.reconnect(ctx); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	go b.asyncWatch()
+
 	// Wrap backend in a input sanitizer and return it.
 	return b, nil
 }
@@ -242,7 +268,7 @@ func (cfg *Config) Validate() error {
 		cfg.BufferSize = backend.DefaultBufferSize
 	}
 	if cfg.DialTimeout == 0 {
-		cfg.DialTimeout = defaults.DefaultDialTimeout
+		cfg.DialTimeout = apidefaults.DefaultDialTimeout
 	}
 	if cfg.PasswordFile != "" {
 		out, err := ioutil.ReadFile(cfg.PasswordFile)
@@ -271,7 +297,13 @@ func (b *EtcdBackend) CloseWatchers() {
 	b.buf.Reset()
 }
 
-func (b *EtcdBackend) reconnect() error {
+func (b *EtcdBackend) reconnect(ctx context.Context) error {
+	if b.client != nil {
+		if err := b.client.Close(); err != nil {
+			b.Entry.WithError(err).Warning("Failed closing existing etcd client on reconnect.")
+		}
+	}
+
 	tlsConfig := utils.TLSConfig(nil)
 
 	if b.cfg.TLSCertFile != "" {
@@ -290,37 +322,36 @@ func (b *EtcdBackend) reconnect() error {
 		tlsConfig.Certificates = []tls.Certificate{tlsCert}
 	}
 
-	var caCertPEM []byte
 	if b.cfg.TLSCAFile != "" {
-		var err error
-		caCertPEM, err = ioutil.ReadFile(b.cfg.TLSCAFile)
+		caCertPEM, err := ioutil.ReadFile(b.cfg.TLSCAFile)
 		if err != nil {
 			return trace.ConvertSystemError(err)
 		}
-	}
 
-	certPool := x509.NewCertPool()
-	parsedCert, err := tlsca.ParseCertificatePEM(caCertPEM)
-	if err != nil {
-		return trace.Wrap(err, "failed to parse CA certificate")
-	}
-	certPool.AddCert(parsedCert)
+		certPool := x509.NewCertPool()
+		parsedCert, err := tlsca.ParseCertificatePEM(caCertPEM)
+		if err != nil {
+			return trace.Wrap(err, "failed to parse CA certificate %q", b.cfg.TLSCAFile)
+		}
+		certPool.AddCert(parsedCert)
 
-	tlsConfig.RootCAs = certPool
-	tlsConfig.ClientCAs = certPool
+		tlsConfig.RootCAs = certPool
+		tlsConfig.ClientCAs = certPool
+	}
 
 	clt, err := clientv3.New(clientv3.Config{
-		Endpoints:   b.nodes,
-		TLS:         tlsConfig,
-		DialTimeout: b.cfg.DialTimeout,
-		Username:    b.cfg.Username,
-		Password:    b.cfg.Password,
+		Endpoints:          b.nodes,
+		TLS:                tlsConfig,
+		DialTimeout:        b.cfg.DialTimeout,
+		DialOptions:        []grpc.DialOption{grpc.WithBlock()},
+		Username:           b.cfg.Username,
+		Password:           b.cfg.Password,
+		MaxCallSendMsgSize: b.cfg.MaxClientMsgSizeBytes,
 	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	b.client = clt
-	go b.asyncWatch()
 	return nil
 }
 
@@ -330,6 +361,8 @@ func (b *EtcdBackend) asyncWatch() {
 }
 
 func (b *EtcdBackend) watchEvents() error {
+	defer close(b.watchDone)
+
 start:
 	eventsC := b.client.Watch(b.ctx, b.cfg.Key, clientv3.WithPrefix())
 	b.signalWatchStart()
@@ -485,6 +518,7 @@ func (b *EtcdBackend) CompareAndSwap(ctx context.Context, expected backend.Item,
 		if trace.IsNotFound(err) {
 			return nil, trace.CompareFailed(err.Error())
 		}
+		return nil, trace.Wrap(err)
 	}
 	if !re.Succeeded {
 		return nil, trace.CompareFailed("key %q did not match expected value", string(expected.Key))
@@ -619,7 +653,7 @@ func (b *EtcdBackend) fromEvent(ctx context.Context, e clientv3.Event) (*backend
 			ID:  e.Kv.ModRevision,
 		},
 	}
-	if event.Type == backend.OpDelete {
+	if event.Type == types.OpDelete {
 		return event, nil
 	}
 	// get the new expiration date if it was updated
@@ -636,101 +670,6 @@ func (b *EtcdBackend) fromEvent(ctx context.Context, e clientv3.Event) (*backend
 	}
 	event.Item.Value = value
 	return event, nil
-}
-
-func (b *EtcdBackend) Migrate(ctx context.Context) error {
-	// DELETE IN 4.4: legacy prefix support for migration of
-	// https://github.com/gravitational/teleport/issues/2883
-	if err := b.syncLegacyPrefix(ctx); err != nil {
-		return trace.Wrap(err)
-	}
-	return nil
-}
-
-// DELETE IN 4.4: legacy prefix support for migration of
-// https://github.com/gravitational/teleport/issues/2883
-//
-// syncLegacyPrefix is a temporary migration step for 4.3 release. It will
-// attempt to replicate the data from '/teleport' prefix (legacyDefaultPrefix)
-// into the correct prefix specified in teleport.yaml (b.cfg.Key).
-//
-// The goal is to prevent the need for admin intervention when upgrading
-// Teleport clusters and to avoid losing any data during the upgrade to a fixed
-// version of Teleport. See issue linked above for more context.
-//
-// The replication will happen when:
-// - there's data under legacy prefix
-// - the configured prefix is different from the legacy prefix
-// - the configured prefix is empty OR older than the legacy prefix
-func (b *EtcdBackend) syncLegacyPrefix(ctx context.Context) error {
-	// Using the same prefix, nothing to migrate.
-	if b.cfg.Key == legacyDefaultPrefix {
-		return nil
-	}
-	legacyData, err := b.client.Get(ctx, legacyDefaultPrefix, clientv3.WithPrefix())
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	// No data in the legacy prefix, assume this is a new Teleport cluster and
-	// skip sync early.
-	if legacyData.Count == 0 {
-		return nil
-	}
-	prefixData, err := b.client.Get(ctx, b.cfg.Key, clientv3.WithPrefix())
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	if !shouldSync(legacyData.Kvs, prefixData.Kvs) {
-		return nil
-	}
-
-	b.Infof("Migrating Teleport etcd data from legacy prefix %q to configured prefix %q", legacyDefaultPrefix, b.cfg.Key)
-	defer b.Infof("Teleport etcd data migration complete")
-
-	// Now we know that legacy prefix has some data newer than the configured
-	// prefix. Migrate it over to configured prefix.
-	//
-	// Start with deleting existing prefix data.
-	b.Debugf("Deleting everything under %q", b.cfg.Key)
-	if _, err := b.client.Delete(ctx, b.cfg.Key, clientv3.WithPrefix()); err != nil {
-		return trace.Wrap(err)
-	}
-	// Now copy over all data from the legacy prefix to the new one.
-	var errs []error
-	for _, kv := range legacyData.Kvs {
-		// Replace the prefix.
-		key := b.cfg.Key + strings.TrimPrefix(string(kv.Key), legacyDefaultPrefix)
-		b.Debugf("Copying %q -> %q", kv.Key, key)
-		if _, err := b.client.Put(ctx, key, string(kv.Value)); err != nil {
-			errs = append(errs, trace.WrapWithMessage(err, "failed copying %q to %q: %v", kv.Key, key, err))
-		}
-	}
-	return trace.NewAggregate(errs...)
-}
-
-func shouldSync(legacyData, prefixData []*mvccpb.KeyValue) bool {
-	latestRev := func(kvs []*mvccpb.KeyValue) int64 {
-		var rev int64
-		for _, kv := range kvs {
-			if kv.CreateRevision > rev {
-				rev = kv.CreateRevision
-			}
-			if kv.ModRevision > rev {
-				rev = kv.ModRevision
-			}
-		}
-		return rev
-	}
-	if len(legacyData) == 0 {
-		return false
-	}
-	if len(prefixData) == 0 {
-		return true
-	}
-	// Data under the new prefix was updated more recently than data under the
-	// legacy prefix. Assume we already did a sync before and legacy prefix
-	// hasn't been touched since.
-	return latestRev(legacyData) > latestRev(prefixData)
 }
 
 // seconds converts duration to seconds, rounds up to 1 second
@@ -773,6 +712,8 @@ func convertErr(err error) error {
 			return trace.AlreadyExists(err.Error())
 		case codes.FailedPrecondition:
 			return trace.CompareFailed(err.Error())
+		case codes.ResourceExhausted:
+			return trace.LimitExceeded(err.Error())
 		default:
 			return trace.BadParameter(err.Error())
 		}
@@ -780,12 +721,12 @@ func convertErr(err error) error {
 	return trace.ConnectionProblem(err, err.Error())
 }
 
-func fromType(eventType mvccpb.Event_EventType) backend.OpType {
+func fromType(eventType mvccpb.Event_EventType) types.OpType {
 	switch eventType {
 	case mvccpb.PUT:
-		return backend.OpPut
+		return types.OpPut
 	default:
-		return backend.OpDelete
+		return types.OpDelete
 	}
 }
 

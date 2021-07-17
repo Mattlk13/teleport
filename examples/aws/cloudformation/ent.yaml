@@ -7,9 +7,9 @@ Parameters:
     Type: AWS::EC2::KeyPair::KeyName
 
   InstanceType:
-    Description: Teleport EC2 instance type    
+    Description: Teleport EC2 instance type
     ConstraintDescription: must be a valid EC2 instance type.
-    Type: String    
+    Type: String
     Default: m4.large
     AllowedValues:
     - m5.large
@@ -97,25 +97,24 @@ Mappings:
     t2.xlarge: {Arch: HVM64}
 
   AWSRegionArch2AMI:
-    # eu-west-1 = EU (Ireland)
-    # us-east-1 = US East (N. Virginia)
-    # us-east-2 = US East (Ohio)
-    # us-west-2 = US West (Oregon)
-    # All AMIs from AWS - gravitational-teleport-ami-ent-4.2.6
-    eu-west-1: {HVM64 : ami-0b509a6a63664db66}
-    eu-west-2: {HVM64 : ami-0eb5e9694088d0433}
-    us-east-1: {HVM64 : ami-090258a635fa31821}
-    us-east-2: {HVM64 : ami-047f1c2a098d9532e}
-    us-west-2: {HVM64 : ami-025e708a6b63f1aa4}
-    us-west-1: {HVM64 : ami-046006454f75bea51}
-    ap-south-1: {HVM64 : ami-0e2a3ca85d2461e34}
-    ap-northeast-2: {HVM64 : ami-06da7fe03b524adf4}
-    ap-southeast-1: {HVM64 : ami-00847220794745527}
-    ap-southeast-2: {HVM64 : ami-0f99b6fb0060b9085}
-    ap-northeast-1: {HVM64 : ami-0a2eb6931a7661b66}
-    ca-central-1: {HVM64 : ami-01aca16dbda4de6d4}
-    eu-central-1: {HVM64 : ami-01bffd502fb78103c}
-    sa-east-1: {HVM64 : ami-05e9e08642096bffa}
+    # All AMIs from AWS - gravitational-teleport-ami-ent-6.2.0
+    eu-north-1: {HVM64: ami-05ff5c0be3d4b8da4}
+    ap-south-1: {HVM64 : ami-0e506367fa6bf06ad}
+    eu-west-1: {HVM64 : ami-08ed956d9054124ec}
+    eu-west-2: {HVM64 : ami-0c13fdee73c56a9e5}
+    eu-west-3: {HVM64: ami-087bdce4ab6a2964d}
+    ap-northeast-1: {HVM64 : ami-028f6fc0f6bcc5467}
+    ap-northeast-2: {HVM64 : ami-0257a5282caf5dc8b}
+    ap-northeast-3: {HVM64: ami-0a36f2dfdca83ea7d}
+    sa-east-1: {HVM64 : ami-0db7a0b15f1fec84e}
+    ca-central-1: {HVM64 : ami-026797dc673798718}
+    ap-southeast-1: {HVM64 : ami-0ee78fe8e1d7b0f0b}
+    ap-southeast-2: {HVM64 : ami-012555117300eccf7}
+    eu-central-1: {HVM64 : ami-0a9f8367882508a34}
+    us-east-1: {HVM64 : ami-00a70c0830e3e28be}
+    us-east-2: {HVM64 : ami-0e3636771bd5a9558}
+    us-west-1: {HVM64 : ami-0f0e438f7c80db8aa}
+    us-west-2: {HVM64 : ami-0d4a763166ba78e9e}
 
 Resources:
 # Auth server setup
@@ -252,7 +251,7 @@ Resources:
             TELEPORT_AUTH_SERVER_LB=${LocalAuthServerLB}
             TELEPORT_CLUSTER_NAME=${DomainName}
             TELEPORT_DOMAIN_ADMIN_EMAIL=${DomainAdminEmail}
-            TELEPORT_DOMAIN_NAME=${DomainName}            
+            TELEPORT_DOMAIN_NAME=${DomainName}
             TELEPORT_DYNAMO_TABLE_NAME=${LocalMainTableName}
             TELEPORT_DYNAMO_EVENTS_TABLE_NAME=${LocalEventsTableName}
             TELEPORT_LOCKS_TABLE_NAME=${LocalLocksTableName}
@@ -262,12 +261,12 @@ Resources:
             EOF
 
             # Generate config and start proxy service
-            /usr/bin/teleport-generate-config
+            /usr/local/bin/teleport-generate-config
             systemctl enable teleport-ssm-publish-tokens.service teleport-ssm-publish-tokens.timer teleport-get-cert.service teleport-get-cert.timer teleport-renew-cert.service teleport-renew-cert.timer
             systemctl start --no-block teleport-auth teleport-ssm-publish-tokens.timer teleport-get-cert.timer teleport-renew-cert.timer
 
             # Write out healthcheck script
-            cat >> /usr/bin/teleport-cfn-signal-done <<EOF
+            cat >> /usr/local/bin/teleport-cfn-signal-done <<EOF
             #!/bin/bash
             for i in {1..10}; do systemctl status teleport-auth && break || sleep 10; done
             systemctl status teleport-auth
@@ -275,19 +274,19 @@ Resources:
             EOF
 
             # Make healthcheck script executable
-            chmod +x /usr/bin/teleport-cfn-signal-done
+            chmod +x /usr/local/bin/teleport-cfn-signal-done
 
             # Write out healthcheck systemd unit file
             cat >> /etc/systemd/system/cfn-signal-done.service <<EOF
             [Unit]
             Description=CloudFormation status signaller
             After=network.target
-            
+
             [Service]
             User=root
             Group=adm
             Type=oneshot
-            ExecStart=/usr/bin/teleport-cfn-signal-done
+            ExecStart=/usr/local/bin/teleport-cfn-signal-done
             EOF
 
             # Make systemd healthcheck unit run
@@ -393,7 +392,7 @@ Resources:
       Type: network
       LoadBalancerAttributes:
         - Key: load_balancing.cross_zone.enabled
-          Value: 'true'        
+          Value: 'true'
       Subnets:
         - Ref: ProxySubnetA
         - Ref: ProxySubnetB
@@ -435,13 +434,13 @@ Resources:
       Protocol: TCP
       VpcId: {Ref: VPC}
 
-  ProxyLaunchConfig: 
+  ProxyLaunchConfig:
     Type: AWS::AutoScaling::LaunchConfiguration
-    Properties: 
-      KeyName: 
+    Properties:
+      KeyName:
         Ref: KeyName
       # This line finds appropriate image ID based on the arch, region and instance type using FindInMap function
-      ImageId: !FindInMap [AWSRegionArch2AMI, !Ref 'AWS::Region', !FindInMap [AWSInstanceType2Arch, !Ref InstanceType, Arch]]  
+      ImageId: !FindInMap [AWSRegionArch2AMI, !Ref 'AWS::Region', !FindInMap [AWSInstanceType2Arch, !Ref InstanceType, Arch]]
       UserData:
         Fn::Base64:
           # Fn:Sub accepts two parameters as a list, the first one is the template
@@ -461,17 +460,17 @@ Resources:
             TELEPORT_DOMAIN_NAME=${DomainName}
             TELEPORT_PROXY_SERVER_LB=${LocalProxyServerLB}
             TELEPORT_S3_BUCKET=${LocalBucketName}
-            TELEPORT_ROLE=proxy            
+            TELEPORT_ROLE=proxy
             TELEPORT_SSM_KEY_ARN=${LocalKeyARN}
             EOF
 
             # Generate config and start proxy service
-            /usr/bin/teleport-generate-config
+            /usr/local/bin/teleport-generate-config
             systemctl enable teleport-proxy.service teleport-check-cert.service teleport-check-cert.timer
             systemctl start --no-block teleport-proxy.service teleport-check-cert.timer
 
             # Write out healthcheck script
-            cat >> /usr/bin/teleport-cfn-signal-done <<EOF
+            cat >> /usr/local/bin/teleport-cfn-signal-done <<EOF
             #!/bin/bash
             for i in {1..40}; do systemctl status teleport-proxy && break || sleep 30; done
             systemctl status teleport-proxy
@@ -479,19 +478,19 @@ Resources:
             EOF
 
             # Make healthcheck script executable
-            chmod +x /usr/bin/teleport-cfn-signal-done
+            chmod +x /usr/local/bin/teleport-cfn-signal-done
 
             # Write out healthcheck systemd unit file
             cat >> /etc/systemd/system/cfn-signal-done.service <<EOF
             [Unit]
             Description=CloudFormation status signaller
             After=network.target
-            
+
             [Service]
             User=root
             Group=adm
             Type=oneshot
-            ExecStart=/usr/bin/teleport-cfn-signal-done
+            ExecStart=/usr/local/bin/teleport-cfn-signal-done
             EOF
 
             # Make systemd healthcheck unit run
@@ -503,17 +502,17 @@ Resources:
             LocalKeyARN: !GetAtt Key.Arn,
             LocalBucketName: !Select [1, !Split [":::", !GetAtt Bucket.Arn]]
             }
-      SecurityGroups: 
+      SecurityGroups:
         - Ref: ProxySecurityGroup
       InstanceType: {Ref: InstanceType}
       # Proxies have to have public IP address in order
-      # to be reachable from the internet according to this 
+      # to be reachable from the internet according to this
       # article: https://aws.amazon.com/premiumsupport/knowledge-center/public-load-balancer-private-ec2/
       AssociatePublicIpAddress: true
       # IamInstance profile is an instance profile of the proxy
       IamInstanceProfile: {Ref: ProxyInstanceProfile}
 
-  ProxyASG: 
+  ProxyASG:
     Type: AWS::AutoScaling::AutoScalingGroup
     CreationPolicy:
       ResourceSignal:
@@ -565,12 +564,12 @@ Resources:
             TELEPORT_CLUSTER_NAME=${DomainName}
             TELEPORT_DOMAIN_NAME=${DomainName}
             TELEPORT_ROLE=node
-            TELEPORT_S3_BUCKET=${LocalBucketName}                   
+            TELEPORT_S3_BUCKET=${LocalBucketName}
             TELEPORT_SSM_KEY_ARN=${LocalKeyARN}
             EOF
 
             # Generate config and start proxy service
-            /usr/bin/teleport-generate-config
+            /usr/local/bin/teleport-generate-config
             systemctl enable teleport-node.service
             systemctl start --no-block teleport-node.service
           - {
@@ -893,16 +892,16 @@ Resources:
     Properties:
       Description: "SSM Key used by Teleport"
       EnableKeyRotation: True
-      KeyPolicy: 
+      KeyPolicy:
         Version: "2012-10-17"
         Id: "key-default-1"
-        Statement: 
-          - 
+        Statement:
+          -
             Sid: "Allow administration of the key"
             Effect: "Allow"
-            Principal: 
+            Principal:
               AWS: !Join ["", ["arn:aws:sts::", !Ref "AWS::AccountId", ":root"]]
-            Action: 
+            Action:
             - "kms:Create*"
             - "kms:Describe*"
             - "kms:Enable*"
@@ -916,13 +915,13 @@ Resources:
             - "kms:ScheduleKeyDeletion"
             - "kms:CancelKeyDeletion"
             Resource: "*"
-        
-          - 
+
+          -
             Sid: "Allow auth use of the key"
             Effect: "Allow"
-            Principal: 
+            Principal:
               AWS: !GetAtt AuthRole.Arn
-            Action: 
+            Action:
               - "kms:Encrypt"
               - "kms:Decrypt"
               - "kms:ReEncrypt*"
@@ -964,14 +963,14 @@ Resources:
       AttributeDefinitions:
       - {AttributeName: "HashKey", AttributeType: "S"}
       - {AttributeName: "FullPath", AttributeType: "S"}
-      
+
       TimeToLiveSpecification: {AttributeName: "Expires", Enabled: true}
       # Server side encrypt all the data for this table
       SSESpecification: {SSEEnabled: true}
       StreamSpecification:
         StreamViewType: NEW_IMAGE
 
-  # LocksTable is a dynamodb table that is 
+  # LocksTable is a dynamodb table that is
   # used as a distributed lock between auth servers
   # trying to renew and manage letsencrypt certificate
   LocksTable:
@@ -999,15 +998,15 @@ Resources:
       AttributeDefinitions:
       - {AttributeName: "SessionID", AttributeType: "S"}
       - {AttributeName: "EventIndex", AttributeType: "N"}
-      - {AttributeName: "EventNamespace", AttributeType: "S"}
+      - {AttributeName: "CreatedAtDate", AttributeType: "S"}
       - {AttributeName: "CreatedAt", AttributeType: "N"}
 
       TimeToLiveSpecification: {AttributeName: "Expires", Enabled: true}
 
       GlobalSecondaryIndexes:
-      - IndexName: "timesearch"
+      - IndexName: "timesearchV2"
         KeySchema:
-        - AttributeName: "EventNamespace"
+        - AttributeName: "CreatedAtDate"
           KeyType: "HASH"
         - AttributeName: "CreatedAt"
           KeyType: "RANGE"
@@ -1027,7 +1026,7 @@ Resources:
           - id: W35
             reason: "We don't need access logging configured here."
     # Cloudformation can't delete non-empty bucket
-    DeletionPolicy: Retain    
+    DeletionPolicy: Retain
     Properties:
       VersioningConfiguration: {Status: Enabled}
       BucketEncryption:

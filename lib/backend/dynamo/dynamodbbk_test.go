@@ -14,13 +14,13 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
 */
 
 package dynamo
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -31,10 +31,15 @@ import (
 	"gopkg.in/check.v1"
 )
 
+func TestMain(m *testing.M) {
+	utils.InitLoggerForTests()
+	os.Exit(m.Run())
+}
+
 func TestDynamoDB(t *testing.T) { check.TestingT(t) }
 
 type DynamoDBSuite struct {
-	bk        *DynamoDBBackend
+	bk        *Backend
 	suite     test.BackendSuite
 	tableName string
 }
@@ -42,9 +47,6 @@ type DynamoDBSuite struct {
 var _ = check.Suite(&DynamoDBSuite{})
 
 func (s *DynamoDBSuite) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests(testing.Verbose())
-	var err error
-
 	s.tableName = "teleport.dynamo.test"
 	newBackend := func() (backend.Backend, error) {
 		return New(context.Background(), map[string]interface{}{
@@ -54,7 +56,7 @@ func (s *DynamoDBSuite) SetUpSuite(c *check.C) {
 	}
 	bk, err := newBackend()
 	c.Assert(err, check.IsNil)
-	s.bk = bk.(*DynamoDBBackend)
+	s.bk = bk.(*Backend)
 	s.suite.B = s.bk
 	s.suite.NewBackend = newBackend
 }
@@ -99,5 +101,5 @@ func (s *DynamoDBSuite) TestWatchersClose(c *check.C) {
 }
 
 func (s *DynamoDBSuite) TestLocking(c *check.C) {
-	s.suite.Locking(c)
+	s.suite.Locking(c, s.bk)
 }

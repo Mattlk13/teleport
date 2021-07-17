@@ -17,7 +17,7 @@ limitations under the License.
 package utils
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -33,11 +33,55 @@ import (
 	"time"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/modules"
+
 	"github.com/gravitational/trace"
 	"github.com/pborman/uuid"
 	log "github.com/sirupsen/logrus"
 )
+
+// WriteContextCloser provides close method with context
+type WriteContextCloser interface {
+	Close(ctx context.Context) error
+	io.Writer
+}
+
+// WriteCloserWithContext converts ContextCloser to io.Closer,
+// whenever new Close method will be called, the ctx will be passed to it
+func WriteCloserWithContext(ctx context.Context, closer WriteContextCloser) io.WriteCloser {
+	return &closerWithContext{
+		WriteContextCloser: closer,
+		ctx:                ctx,
+	}
+}
+
+type closerWithContext struct {
+	WriteContextCloser
+	ctx context.Context
+}
+
+// Close closes all resources and returns the result
+func (c *closerWithContext) Close() error {
+	return c.WriteContextCloser.Close(c.ctx)
+}
+
+// NilCloser returns closer if it's not nil
+// otherwise returns a nop closer
+func NilCloser(r io.Closer) io.Closer {
+	if r == nil {
+		return &nilCloser{}
+	}
+	return r
+}
+
+type nilCloser struct {
+}
+
+func (*nilCloser) Close() error {
+	return nil
+}
 
 // NopWriteCloser returns a WriteCloser with a no-op Close method wrapping
 // the provided Writer w
@@ -132,21 +176,8 @@ func AsBool(v string) bool {
 	if v == "" {
 		return false
 	}
-	out, _ := ParseBool(v)
+	out, _ := apiutils.ParseBool(v)
 	return out
-}
-
-// ParseBool parses string as boolean value,
-// returns error in case if value is not recognized
-func ParseBool(value string) (bool, error) {
-	switch strings.ToLower(value) {
-	case "yes", "yeah", "y", "true", "1", "on":
-		return true, nil
-	case "no", "nope", "n", "false", "0", "off":
-		return false, nil
-	default:
-		return false, trace.BadParameter("unsupported value: %q", value)
-	}
 }
 
 // ParseAdvertiseAddr validates advertise address,
@@ -234,6 +265,18 @@ func IsGroupMember(gid int) (bool, error) {
 	return false, nil
 }
 
+// DNSName extracts DNS name from host:port string.
+func DNSName(hostport string) (string, error) {
+	host, err := Host(hostport)
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+	if ip := net.ParseIP(host); len(ip) != 0 {
+		return "", trace.BadParameter("%v is an IP address", host)
+	}
+	return host, nil
+}
+
 // Host extracts host from host:port string
 func Host(hostname string) (string, error) {
 	if hostname == "" {
@@ -249,7 +292,10 @@ func Host(hostname string) (string, error) {
 		return hostname, nil
 	}
 	host, _, err := SplitHostPort(hostname)
-	return host, err
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+	return host, nil
 }
 
 // SplitHostPort splits host and port and checks that host is not empty
@@ -298,7 +344,7 @@ func (mc *multiCloser) Close() error {
 }
 
 // MultiCloser implements io.Close, it sequentially calls Close() on each object
-func MultiCloser(closers ...io.Closer) *multiCloser {
+func MultiCloser(closers ...io.Closer) io.Closer {
 	return &multiCloser{
 		closers: closers,
 	}
@@ -320,6 +366,15 @@ func IsCertExpiredError(err error) bool {
 		return false
 	}
 	return strings.Contains(trace.Unwrap(err).Error(), "ssh: cert has expired")
+}
+
+// OpaqueAccessDenied returns a generic NotFound instead of AccessDenied
+// so as to avoid leaking the existence of secret resources.
+func OpaqueAccessDenied(err error) error {
+	if trace.IsAccessDenied(err) {
+		return trace.NotFound("not found")
+	}
+	return trace.Wrap(err)
 }
 
 // PortList is a list of TCP port
@@ -411,37 +466,6 @@ func PrintVersion() {
 	modules.GetModules().PrintVersion()
 }
 
-// HumanTimeFormat formats time as recognized by humans
-func HumanTimeFormat(d time.Time) string {
-	return d.Format(HumanTimeFormatString)
-}
-
-// Deduplicate deduplicates list of strings
-func Deduplicate(in []string) []string {
-	if len(in) == 0 {
-		return in
-	}
-	out := make([]string, 0, len(in))
-	seen := make(map[string]bool, len(in))
-	for _, val := range in {
-		if _, ok := seen[val]; !ok {
-			out = append(out, val)
-			seen[val] = true
-		}
-	}
-	return out
-}
-
-// SliceContainsStr returns 'true' if the slice contains the given value
-func SliceContainsStr(slice []string, value string) bool {
-	for i := range slice {
-		if slice[i] == value {
-			return true
-		}
-	}
-	return false
-}
-
 // StringSliceSubset returns true if b is a subset of a.
 func StringSliceSubset(a []string, b []string) error {
 	aset := make(map[string]bool)
@@ -499,79 +523,15 @@ func RemoveFromSlice(slice []string, values ...string) []string {
 // CheckCertificateFormatFlag checks if the certificate format is valid.
 func CheckCertificateFormatFlag(s string) (string, error) {
 	switch s {
-	case teleport.CertificateFormatStandard, teleport.CertificateFormatOldSSH, teleport.CertificateFormatUnspecified:
+	case constants.CertificateFormatStandard, teleport.CertificateFormatOldSSH, teleport.CertificateFormatUnspecified:
 		return s, nil
 	default:
 		return "", trace.BadParameter("invalid certificate format parameter: %q", s)
 	}
 }
 
-// Strings is a list of string that can unmarshal from list of strings
-// or a scalar string from scalar yaml or json property
-type Strings []string
-
-// UnmarshalJSON unmarshals scalar string or strings slice to Strings
-func (s *Strings) UnmarshalJSON(data []byte) error {
-	if len(data) == 0 {
-		return nil
-	}
-	var stringVar string
-	if err := json.Unmarshal(data, &stringVar); err == nil {
-		*s = []string{stringVar}
-		return nil
-	}
-	var stringsVar []string
-	if err := json.Unmarshal(data, &stringsVar); err != nil {
-		return trace.Wrap(err)
-	}
-	*s = stringsVar
-	return nil
-}
-
-// UnmarshalYAML is used to allow Strings to unmarshal from
-// scalar string value or from the list
-func (s *Strings) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	// try unmarshal as string
-	var val string
-	err := unmarshal(&val)
-	if err == nil {
-		*s = []string{val}
-		return nil
-	}
-
-	// try unmarshal as slice
-	var slice []string
-	err = unmarshal(&slice)
-	if err == nil {
-		*s = slice
-		return nil
-	}
-
-	return err
-}
-
-// MarshalJSON marshals to scalar value
-// if there is only one value in the list
-// to list otherwise
-func (s Strings) MarshalJSON() ([]byte, error) {
-	if len(s) == 1 {
-		return json.Marshal(s[0])
-	}
-	return json.Marshal([]string(s))
-}
-
-// MarshalYAML marshals to scalar value
-// if there is only one value in the list,
-// marshals to list otherwise
-func (s Strings) MarshalYAML() (interface{}, error) {
-	if len(s) == 1 {
-		return s[0], nil
-	}
-	return []string(s), nil
-}
-
-// Addrs returns strings list converted to address list
-func (s Strings) Addrs(defaultPort int) ([]NetAddr, error) {
+// AddrsFromStrings returns strings list converted to address list
+func AddrsFromStrings(s apiutils.Strings, defaultPort int) ([]NetAddr, error) {
 	addrs := make([]NetAddr, len(s))
 	for i, val := range s {
 		addr, err := ParseHostPortAddr(val, defaultPort)
@@ -583,9 +543,38 @@ func (s Strings) Addrs(defaultPort int) ([]NetAddr, error) {
 	return addrs, nil
 }
 
+// FileExists checks whether a file exists at a given path
+func FileExists(fp string) bool {
+	_, err := os.Stat(fp)
+	if err != nil && os.IsNotExist(err) {
+		return false
+	}
+	return true
+}
+
+// StoreErrorOf stores the error returned by f within *err.
+func StoreErrorOf(f func() error, err *error) {
+	*err = trace.NewAggregate(*err, f())
+}
+
+// ReadAtMost reads up to limit bytes from r, and reports an error
+// when limit bytes are read.
+func ReadAtMost(r io.Reader, limit int64) ([]byte, error) {
+	limitedReader := &io.LimitedReader{R: r, N: limit}
+	data, err := ioutil.ReadAll(limitedReader)
+	if err != nil {
+		return data, err
+	}
+	if limitedReader.N <= 0 {
+		return data, ErrLimitReached
+	}
+	return data, nil
+}
+
+// ErrLimitReached means that the read limit is reached.
+var ErrLimitReached = &trace.LimitExceededError{Message: "the read limit is reached"}
+
 const (
-	// HumanTimeFormatString is a human readable date formatting
-	HumanTimeFormatString = "Mon Jan _2 15:04 UTC"
 	// CertTeleportUser specifies teleport user
 	CertTeleportUser = "x-teleport-user"
 	// CertTeleportUserCA specifies teleport certificate authority

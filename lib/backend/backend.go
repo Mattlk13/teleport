@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gravitational/teleport/api/types"
+
 	"github.com/jonboulle/clockwork"
 )
 
@@ -33,7 +35,9 @@ const (
 	Forever time.Duration = 0
 )
 
-// Backend implements abstraction over local or remote storage backend
+// Backend implements abstraction over local or remote storage backend.
+// Item keys are assumed to be valid UTF8, which may be enforced by the
+// various Backend implementations.
 type Backend interface {
 	// Create creates item if it does not exist
 	Create(ctx context.Context, i Item) (*Lease, error)
@@ -156,43 +160,10 @@ type GetResult struct {
 	Items []Item
 }
 
-// OpType specifies operation type
-type OpType int
-
-const (
-	// OpInit is returned by the system whenever the system
-	// is initialized, init operation is always sent
-	// as a first event over the channel, so the client
-	// can verify that watch has been established.
-	OpInit OpType = iota
-	// OpPut is returned for Put events
-	OpPut OpType = iota
-	// OpDelete is returned for Delete events
-	OpDelete OpType = iota
-	// OpGet is used for tracking, not present in the event stream
-	OpGet OpType = iota
-)
-
-// String returns user-friendly description of the operation
-func (o OpType) String() string {
-	switch o {
-	case OpInit:
-		return "Init"
-	case OpPut:
-		return "Put"
-	case OpDelete:
-		return "Delete"
-	case OpGet:
-		return "Get"
-	default:
-		return "unknown"
-	}
-}
-
 // Event is a event containing operation with item
 type Event struct {
 	// Type is operation type
-	Type OpType
+	Type types.OpType
 	// Item is event Item
 	Item Item
 }
@@ -219,7 +190,7 @@ type Config struct {
 	Type string `yaml:"type,omitempty"`
 
 	// Params is a generic key/value property bag which allows arbitrary
-	// falues to be passed to backend
+	// values to be passed to backend
 	Params Params `yaml:",inline"`
 }
 
@@ -242,8 +213,10 @@ func (p Params) GetString(key string) string {
 // NoLimit specifies no limits
 const NoLimit = 0
 
-// RangeEnd returns end of the range for given key
-func RangeEnd(key []byte) []byte {
+// nextKey returns the next possible key.
+// If used with a key prefix, this will return
+// the end of the range for that key prefix.
+func nextKey(key []byte) []byte {
 	end := make([]byte, len(key))
 	copy(end, key)
 	for i := len(end) - 1; i >= 0; i-- {
@@ -260,6 +233,16 @@ func RangeEnd(key []byte) []byte {
 var (
 	noEnd = []byte{0}
 )
+
+// RangeEnd returns end of the range for given key.
+func RangeEnd(key []byte) []byte {
+	return nextKey(key)
+}
+
+// NextPaginationKey returns the next pagination key.
+func NextPaginationKey(r types.Resource) string {
+	return string(nextKey([]byte(r.GetName())))
+}
 
 // Items is a sortable list of backend items
 type Items []Item

@@ -1,5 +1,5 @@
 /*
-Copyright 2015 Gravitational, Inc.
+Copyright 2015-2020 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +23,11 @@ import (
 	"math"
 	"time"
 
+	"github.com/gravitational/teleport/api/types"
+	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/session"
+
+	"github.com/gravitational/trace"
 )
 
 const (
@@ -98,6 +102,10 @@ const (
 	// SessionStartTime is the timestamp at which the session began.
 	SessionStartTime = "session_start"
 
+	// SessionRecordingType is the type of session recording.
+	// Possible values are node (default), proxy, node-sync, proxy-sync, or off.
+	SessionRecordingType = "session_recording"
+
 	// SessionEndTime is the timestamp at which the session ended.
 	SessionEndTime = "session_stop"
 
@@ -115,6 +123,9 @@ const (
 	// SessionServerLabels are the labels (static and dynamic) of the server the
 	// session occurred on.
 	SessionServerLabels = "server_labels"
+
+	// SessionClusterName is the cluster name that the session occurred in
+	SessionClusterName = "cluster_name"
 
 	// SessionByteOffset is the number of bytes written to session stream since
 	// the beginning
@@ -182,6 +193,8 @@ const (
 	AccessRequestCreateEvent = "access_request.create"
 	// AccessRequestUpdateEvent is emitted when a request's state is updated.
 	AccessRequestUpdateEvent = "access_request.update"
+	// AccessRequestReviewEvent is emitted when a review is applied to a request.
+	AccessRequestReviewEvent = "access_request.review"
 	// AccessRequestDelegator is used by teleport plugins to indicate the identity
 	// which caused them to update state.
 	AccessRequestDelegator = "delegator"
@@ -189,6 +202,15 @@ const (
 	AccessRequestState = "state"
 	// AccessRequestID is the ID of an access request.
 	AccessRequestID = "id"
+
+	// BillingCardCreateEvent is emitted when a user creates a new credit card.
+	BillingCardCreateEvent = "billing.create_card"
+	// BillingCardDeleteEvent is emitted when a user deletes a credit card.
+	BillingCardDeleteEvent = "billing.delete_card"
+	// BillingCardUpdateEvent is emitted when a user updates an existing credit card.
+	BillingCardUpdateEvent = "billing.update_card"
+	// BillingInformationUpdateEvent is emitted when a user updates their billing information.
+	BillingInformationUpdateEvent = "billing.update_info"
 
 	// UpdatedBy indicates the user who modified some resource:
 	//  - updating a request state
@@ -326,6 +348,54 @@ const (
 	SAMLConnectorCreatedEvent = "saml.created"
 	// SAMLConnectorDeletedEvent fires when SAML connector is deleted.
 	SAMLConnectorDeletedEvent = "saml.deleted"
+
+	// SessionRejected fires when a user's attempt to create an authenticated
+	// session has been rejected due to exceeding a session control limit.
+	SessionRejectedEvent = "session.rejected"
+
+	// AppSessionStartEvent is emitted when a user is issued an application certificate.
+	AppSessionStartEvent = "app.session.start"
+
+	// AppSessionChunkEvent is emitted at the start of a 5 minute chunk on each
+	// proxy. This chunk is used to buffer 5 minutes of audit events at a time
+	// for applications.
+	AppSessionChunkEvent = "app.session.chunk"
+
+	// AppSessionRequestEvent is an HTTP request and response.
+	AppSessionRequestEvent = "app.session.request"
+
+	// DatabaseSessionStartEvent is emitted when a database client attempts
+	// to connect to a database.
+	DatabaseSessionStartEvent = "db.session.start"
+	// DatabaseSessionEndEvent is emitted when a database client disconnects
+	// from a database.
+	DatabaseSessionEndEvent = "db.session.end"
+	// DatabaseSessionQueryEvent is emitted when a database client executes
+	// a query.
+	DatabaseSessionQueryEvent = "db.session.query"
+	// DatabaseSessionQueryFailedEvent is emitted when database client's request
+	// to execute a database query/command was unsuccessful.
+	DatabaseSessionQueryFailedEvent = "db.session.query.failed"
+
+	// SessionRejectedReasonMaxConnections indicates that a session.rejected event
+	// corresponds to enforcement of the max_connections control.
+	SessionRejectedReasonMaxConnections = "max_connections limit reached"
+	// SessionRejectedReasonMaxSessions indicates that a session.rejected event
+	// corresponds to enforcement of the max_sessions control.
+	SessionRejectedReasonMaxSessions = "max_sessions limit reached"
+
+	// Maximum is an event field specifying a maximal value (e.g. the value
+	// of `max_connections` for a `session.rejected` event).
+	Maximum = "max"
+
+	// KubeRequestEvent fires when a proxy handles a generic kubernetes
+	// request.
+	KubeRequestEvent = "kube.request"
+
+	// MFADeviceAddEvent is an event type for users adding MFA devices.
+	MFADeviceAddEvent = "mfa.add"
+	// MFADeviceDeleteEvent is an event type for users deleting MFA devices.
+	MFADeviceDeleteEvent = "mfa.delete"
 )
 
 const (
@@ -347,6 +417,141 @@ const (
 	V3 = 3
 )
 
+// ServerMetadataGetter represents interface
+// that provides information about its server id
+type ServerMetadataGetter interface {
+	// GetServerID returns event server ID
+	GetServerID() string
+
+	// GetServerNamespace returns event server namespace
+	GetServerNamespace() string
+
+	// GetClusterName returns the originating teleport cluster name
+	GetClusterName() string
+}
+
+// ServerMetadataSetter represents interface
+// that provides information about its server id
+type ServerMetadataSetter interface {
+	// SetServerID sets server ID of the event
+	SetServerID(string)
+
+	// SetServerNamespace returns event server namespace
+	SetServerNamespace(string)
+}
+
+// SessionMetadataGetter represents interface
+// that provides information about events' session metadata
+type SessionMetadataGetter interface {
+	// GetSessionID returns event session ID
+	GetSessionID() string
+}
+
+// SessionMetadataSetter represents interface
+// that sets session metadata
+type SessionMetadataSetter interface {
+	// SetSessionID sets event session ID
+	SetSessionID(string)
+
+	// SetClusterName sets teleport cluster name
+	SetClusterName(string)
+}
+
+// SetCode is a shortcut that sets code for the audit event
+func SetCode(event apievents.AuditEvent, code string) apievents.AuditEvent {
+	event.SetCode(code)
+	return event
+}
+
+// Streamer creates and resumes event streams for session IDs
+type Streamer interface {
+	// CreateAuditStream creates event stream
+	CreateAuditStream(context.Context, session.ID) (apievents.Stream, error)
+	// ResumeAuditStream resumes the stream for session upload that
+	// has not been completed yet.
+	ResumeAuditStream(ctx context.Context, sid session.ID, uploadID string) (apievents.Stream, error)
+}
+
+// StreamPart represents uploaded stream part
+type StreamPart struct {
+	// Number is a part number
+	Number int64
+	// ETag is a part e-tag
+	ETag string
+}
+
+// StreamUpload represents stream multipart upload
+type StreamUpload struct {
+	// ID is unique upload ID
+	ID string
+	// SessionID is a session ID of the upload
+	SessionID session.ID
+	// Initiated contains the timestamp of when the upload
+	// was initiated, not always initialized
+	Initiated time.Time
+}
+
+// String returns user friendly representation of the upload
+func (u StreamUpload) String() string {
+	return fmt.Sprintf("Upload(session=%v, id=%v, initiated=%v)", u.SessionID, u.ID, u.Initiated)
+}
+
+// CheckAndSetDefaults checks and sets default values
+func (u *StreamUpload) CheckAndSetDefaults() error {
+	if u.ID == "" {
+		return trace.BadParameter("missing parameter ID")
+	}
+	if u.SessionID == "" {
+		return trace.BadParameter("missing parameter SessionID")
+	}
+	return nil
+}
+
+// MultipartUploader handles multipart uploads and downloads for session streams
+type MultipartUploader interface {
+	// CreateUpload creates a multipart upload
+	CreateUpload(ctx context.Context, sessionID session.ID) (*StreamUpload, error)
+	// CompleteUpload completes the upload
+	CompleteUpload(ctx context.Context, upload StreamUpload, parts []StreamPart) error
+	// UploadPart uploads part and returns the part
+	UploadPart(ctx context.Context, upload StreamUpload, partNumber int64, partBody io.ReadSeeker) (*StreamPart, error)
+	// ListParts returns all uploaded parts for the completed upload in sorted order
+	ListParts(ctx context.Context, upload StreamUpload) ([]StreamPart, error)
+	// ListUploads lists uploads that have been initiated but not completed with
+	// earlier uploads returned first
+	ListUploads(ctx context.Context) ([]StreamUpload, error)
+	// GetUploadMetadata gets the upload metadata
+	GetUploadMetadata(sessionID session.ID) UploadMetadata
+}
+
+// UploadMetadata contains data about the session upload
+type UploadMetadata struct {
+	// URL is the url at which the session recording is located
+	// it is free-form and uploader-specific
+	URL string
+	// SessionID is the event session ID
+	SessionID session.ID
+}
+
+// UploadMetadataGetter gets the metadata for session upload
+type UploadMetadataGetter interface {
+	GetUploadMetadata(sid session.ID) UploadMetadata
+}
+
+// StreamWriter implements io.Writer to be plugged into the multi-writer
+// associated with every session. It forwards session stream to the audit log
+type StreamWriter interface {
+	io.Writer
+	apievents.Stream
+}
+
+// StreamEmitter supports submitting single events and streaming
+// session events
+type StreamEmitter interface {
+	apievents.Emitter
+	Streamer
+}
+
 // IAuditLog is the primary (and the only external-facing) interface for AuditLogger.
 // If you wish to implement a different kind of logger (not filesystem-based), you
 // have to implement this interface
@@ -354,8 +559,12 @@ type IAuditLog interface {
 	// Closer releases connection and resources associated with log if any
 	io.Closer
 
+	// EmitAuditEventLegacy emits audit in legacy format
+	// DELETE IN: 5.0.0
+	EmitAuditEventLegacy(Event, EventFields) error
+
 	// EmitAuditEvent emits audit event
-	EmitAuditEvent(Event, EventFields) error
+	EmitAuditEvent(context.Context, apievents.AuditEvent) error
 
 	// DELETE IN: 2.7.0
 	// This method is no longer necessary as nodes and proxies >= 2.7.0
@@ -382,23 +591,34 @@ type IAuditLog interface {
 	// replay recorded session streams.
 	GetSessionEvents(namespace string, sid session.ID, after int, includePrintEvents bool) ([]EventFields, error)
 
-	// SearchEvents is a flexible way to find events. The format of a query string
-	// depends on the implementing backend. A recommended format is urlencoded
-	// (good enough for Lucene/Solr)
+	// SearchEvents is a flexible way to find events.
 	//
-	// Pagination is also defined via backend-specific query format.
+	// Event types to filter can be specified and pagination is handled by an iterator key that allows
+	// a query to be resumed.
 	//
-	// The only mandatory requirement is a date range (UTC). Results must always
-	// show up sorted by date (newest first)
-	SearchEvents(fromUTC, toUTC time.Time, query string, limit int) ([]EventFields, error)
+	// The only mandatory requirement is a date range (UTC).
+	//
+	// This function may never return more than 1 MiB of event data.
+	SearchEvents(fromUTC, toUTC time.Time, namespace string, eventTypes []string, limit int, order types.EventOrder, startKey string) ([]apievents.AuditEvent, string, error)
 
-	// SearchSessionEvents returns session related events only. This is used to
-	// find completed session.
-	SearchSessionEvents(fromUTC time.Time, toUTC time.Time, limit int) ([]EventFields, error)
+	// SearchSessionEvents is a flexible way to find session events.
+	// Only session events are returned by this function.
+	// This is used to find completed session.
+	//
+	// Event types to filter can be specified and pagination is handled by an iterator key that allows
+	// a query to be resumed.
+	//
+	// This function may never return more than 1 MiB of event data.
+	SearchSessionEvents(fromUTC time.Time, toUTC time.Time, limit int, order types.EventOrder, startKey string) ([]apievents.AuditEvent, string, error)
 
 	// WaitForDelivery waits for resources to be released and outstanding requests to
 	// complete after calling Close method
 	WaitForDelivery(context.Context) error
+
+	// StreamSessionEvents streams all events from a given session recording. An error is returned on the first
+	// channel if one is encountered. Otherwise it is simply closed when the stream ends.
+	// The event channel is not closed on error to prevent race conditions in downstream select statements.
+	StreamSessionEvents(ctx context.Context, sessionID session.ID, startIndex int64) (chan apievents.AuditEvent, chan error)
 }
 
 // EventFields instance is attached to every logged event
@@ -443,7 +663,7 @@ func (f EventFields) GetString(key string) string {
 	return v
 }
 
-// GetString returns an int representation of a logged field
+// GetInt returns an int representation of a logged field
 func (f EventFields) GetInt(key string) int {
 	val, found := f[key]
 	if !found {
@@ -459,7 +679,7 @@ func (f EventFields) GetInt(key string) int {
 	return v
 }
 
-// GetString returns an int representation of a logged field
+// GetTime returns an int representation of a logged field
 func (f EventFields) GetTime(key string) time.Time {
 	val, found := f[key]
 	if !found {

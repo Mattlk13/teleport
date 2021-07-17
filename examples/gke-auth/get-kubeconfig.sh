@@ -29,6 +29,11 @@
 
 set -eu -o pipefail
 
+echo "---"
+echo "This script is obsolete!"
+echo "Please use https://github.com/gravitational/teleport/blob/master/examples/k8s-auth/get-kubeconfig.sh instead."
+echo "---"
+
 # Allow passing in common name and username in environment. If not provided,
 # use default.
 CN=${CN:-teleport}
@@ -69,7 +74,7 @@ cat > csr <<EOF
 }
 EOF
 
-cat csr | cfssl genkey - | cfssljson -bare server
+cfssl genkey csr | cfssljson -bare server
 
 
 # Create Kubernetes CSR
@@ -81,7 +86,7 @@ metadata:
 spec:
   groups:
   - system:authenticated
-  request: $(cat server.csr | base64 | tr -d '\n')
+  request: $(base64 server.csr | tr -d '\n')
   usages:
   - digital signature
   - key encipherment
@@ -92,7 +97,7 @@ kubectl certificate approve ${REQUEST_ID}
 kubectl get csr ${REQUEST_ID} -o jsonpath='{.status.certificate}' \
     | base64 ${BASE64_DECODE_FLAG} > server.crt
 
-kubectl -n kube-system exec $(kubectl get pods -n kube-system -l k8s-app=kube-dns  -o jsonpath='{.items[0].metadata.name}') -c kubedns -- /bin/cat /var/run/secrets/kubernetes.io/serviceaccount/ca.crt > ca.crt
+kubectl -n kube-system exec "$(kubectl get pods -n kube-system -l k8s-app=kube-dns  -o jsonpath='{.items[0].metadata.name}')" -c kubedns -- /bin/cat /var/run/secrets/kubernetes.io/serviceaccount/ca.crt > ca.crt
 
 # Extract cluster IP from the current context
 CURRENT_CONTEXT=$(kubectl config current-context)
@@ -103,7 +108,7 @@ cat > kubeconfig <<EOF
 apiVersion: v1
 clusters:
 - cluster:
-    certificate-authority-data: $(cat ca.crt | base64 ${BASE64_WRAP_FLAG})
+    certificate-authority-data: $(base64 ${BASE64_WRAP_FLAG} ca.crt)
     server: ${CURRENT_CLUSTER_ADDR}
   name: k8s
 contexts:
@@ -117,8 +122,8 @@ preferences: {}
 users:
 - name: $USER
   user:
-    client-certificate-data: $(cat server.crt | base64 ${BASE64_WRAP_FLAG})
-    client-key-data: $(cat server-key.pem | base64 ${BASE64_WRAP_FLAG})
+    client-certificate-data: $(base64 ${BASE64_WRAP_FLAG} server.crt)
+    client-key-data: $(base64 ${BASE64_WRAP_FLAG} server-key.pem)
 EOF
 
 popd

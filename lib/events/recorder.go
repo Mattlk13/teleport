@@ -1,5 +1,5 @@
 /*
-Copyright 2015-2018 Gravitational, Inc.
+Copyright 2015-2020 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/gravitational/teleport"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/session"
 
@@ -33,9 +35,8 @@ import (
 // associated with every session. It forwards session stream to the audit log
 type SessionRecorder interface {
 	io.Writer
-	io.Closer
-	// GetAuditLog returns audit log associated with this log
-	GetAuditLog() IAuditLog
+	apievents.Emitter
+	Close(ctx context.Context) error
 }
 
 // DiscardRecorder discards all writes
@@ -100,7 +101,7 @@ func (cfg *ForwardRecorderConfig) CheckAndSetDefaults() error {
 		return trace.BadParameter("missing parameter DataDir")
 	}
 	if cfg.Namespace == "" {
-		cfg.Namespace = defaults.Namespace
+		cfg.Namespace = apidefaults.Namespace
 	}
 	if cfg.ForwardTo == nil {
 		cfg.ForwardTo = &DiscardAuditLog{}
@@ -122,7 +123,7 @@ func NewForwardRecorder(cfg ForwardRecorderConfig) (*ForwardRecorder, error) {
 		DataDir:        cfg.DataDir,
 		RecordSessions: cfg.RecordSessions,
 		Namespace:      cfg.Namespace,
-		ForwardTo:      cfg.ForwardTo,
+		IAuditLog:      cfg.ForwardTo,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -141,6 +142,12 @@ func NewForwardRecorder(cfg ForwardRecorderConfig) (*ForwardRecorder, error) {
 // GetAuditLog returns audit log associated with this recorder
 func (r *ForwardRecorder) GetAuditLog() IAuditLog {
 	return r.AuditLog
+}
+
+// EmitAuditEvent is not implemented
+// Events are forwarded to the auth server and is then emitted from there
+func (r *Forwarder) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
+	return trace.NotImplemented("not implemented")
 }
 
 // Write takes a chunk and writes it into the audit log

@@ -23,12 +23,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"time"
 
 	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/lib/wrappers"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/wrappers"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
@@ -39,10 +41,18 @@ var log = logrus.WithFields(logrus.Fields{
 	trace.Component: teleport.ComponentAuthority,
 })
 
-// New returns new CA from PEM encoded certificate and private
+// FromAuthority returns the CertificateAutority's TLS certificate authority from TLS key pairs.
+func FromAuthority(ca types.CertAuthority) (*CertAuthority, error) {
+	if len(ca.GetActiveKeys().TLS) == 0 {
+		return nil, trace.BadParameter("no TLS key pairs found for certificate authority")
+	}
+	return FromKeys(ca.GetActiveKeys().TLS[0].Cert, ca.GetActiveKeys().TLS[0].Key)
+}
+
+// FromKeys returns new CA from PEM encoded certificate and private
 // key. Private Key is optional, if omitted CA won't be able to
 // issue new certificates, only verify them
-func New(certPEM, keyPEM []byte) (*CertAuthority, error) {
+func FromKeys(certPEM, keyPEM []byte) (*CertAuthority, error) {
 	ca := &CertAuthority{}
 	var err error
 	ca.Cert, err = ParseCertificatePEM(certPEM)
@@ -70,6 +80,8 @@ type CertAuthority struct {
 type Identity struct {
 	// Username is a username or name of the node connection
 	Username string
+	// Impersonator is a username of a user impersonating this user
+	Impersonator string
 	// Groups is a list of groups (Teleport roles) encoded in the identity
 	Groups []string
 	// Usage is a list of usage restrictions encoded in the identity
@@ -85,18 +97,97 @@ type Identity struct {
 	// RouteToCluster specifies the target cluster
 	// if present in the session
 	RouteToCluster string
+	// KubernetesCluster specifies the target kubernetes cluster for TLS
+	// identities. This can be empty on older Teleport clients.
+	KubernetesCluster string
 	// Traits hold claim data used to populate a role at runtime.
 	Traits wrappers.Traits
+	// RouteToApp holds routing information for applications. Routing metadata
+	// allows Teleport web proxy to route HTTP requests to the appropriate
+	// cluster and Teleport application proxy within the cluster.
+	RouteToApp RouteToApp
+	// TeleportCluster is the name of the teleport cluster that this identity
+	// originated from. For TLS certs this may not be the same as cert issuer,
+	// in case of multi-hop requests that originate from a remote cluster.
+	TeleportCluster string
+	// RouteToDatabase contains routing information for databases.
+	RouteToDatabase RouteToDatabase
+	// DatabaseNames is a list of allowed database names.
+	DatabaseNames []string
+	// DatabaseUsers is a list of allowed database users.
+	DatabaseUsers []string
+	// MFAVerified is the UUID of an MFA device when this Identity was
+	// confirmed immediately after an MFA check.
+	MFAVerified string
+	// ClientIP is an observed IP of the client that this Identity represents.
+	ClientIP string
+}
+
+// RouteToApp holds routing information for applications.
+type RouteToApp struct {
+	// SessionID is a UUIDv4 used to identify application sessions created by
+	// this certificate. The reason a UUID was used instead of a hash of the
+	// SubjectPublicKeyInfo like the CA pin is for UX consistency. For example,
+	// the SessionID is emitted in the audit log, using a UUID matches how SSH
+	// sessions are identified.
+	SessionID string
+
+	// PublicAddr (and ClusterName) are used to route requests issued with this
+	// certificate to the appropriate application proxy/cluster.
+	PublicAddr string
+
+	// ClusterName (and PublicAddr) are used to route requests issued with this
+	// certificate to the appropriate application proxy/cluster.
+	ClusterName string
+
+	// Name is the app name.
+	Name string
+}
+
+// RouteToDatabase contains routing information for databases.
+type RouteToDatabase struct {
+	// ServiceName is the name of the Teleport database proxy service
+	// to route requests to.
+	ServiceName string
+	// Protocol is the database protocol.
+	//
+	// It is embedded in identity so clients can understand what type
+	// of database this is without contacting server.
+	Protocol string
+	// Username is an optional database username to serve as a default
+	// username to connect as.
+	Username string
+	// Database is an optional database name to serve as a default
+	// database to connect to.
+	Database string
+}
+
+// String returns string representation of the database routing struct.
+func (d RouteToDatabase) String() string {
+	return fmt.Sprintf("Database(Service=%v, Protocol=%v, Username=%v, Database=%v)",
+		d.ServiceName, d.Protocol, d.Username, d.Database)
+}
+
+// GetRouteToApp returns application routing data. If missing, returns an error.
+func (id *Identity) GetRouteToApp() (RouteToApp, error) {
+	if id.RouteToApp.SessionID == "" ||
+		id.RouteToApp.PublicAddr == "" ||
+		id.RouteToApp.ClusterName == "" {
+		return RouteToApp{}, trace.BadParameter("identity is missing application routing metadata")
+	}
+
+	return id.RouteToApp, nil
 }
 
 // CheckAndSetDefaults checks and sets default values
-func (i *Identity) CheckAndSetDefaults() error {
-	if i.Username == "" {
+func (id *Identity) CheckAndSetDefaults() error {
+	if id.Username == "" {
 		return trace.BadParameter("missing identity username")
 	}
-	if len(i.Groups) == 0 {
+	if len(id.Groups) == 0 {
 		return trace.BadParameter("missing identity groups")
 	}
+
 	return nil
 }
 
@@ -106,14 +197,75 @@ func (i *Identity) CheckAndSetDefaults() error {
 //
 // http://oid-info.com/get/1.3.9999
 //
+var (
+	// KubeUsersASN1ExtensionOID is an extension ID used when encoding/decoding
+	// license payload into certificates
+	KubeUsersASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 1}
 
-// KubeUsersASN1ExtensionOID is an extension ID used when encoding/decoding
-// license payload into certificates
-var KubeUsersASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 1}
+	// KubeGroupsASN1ExtensionOID is an extension ID used when encoding/decoding
+	// license payload into certificates
+	KubeGroupsASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 2}
 
-// KubeGroupsASN1ExtensionOID is an extension ID used when encoding/decoding
-// license payload into certificates
-var KubeGroupsASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 2}
+	// KubeClusterASN1ExtensionOID is an extension ID used when encoding/decoding
+	// target kubernetes cluster name into certificates.
+	KubeClusterASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 3}
+
+	// AppSessionIDASN1ExtensionOID is an extension ID used to encode the application
+	// session ID into a certificate.
+	AppSessionIDASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 4}
+
+	// AppClusterNameASN1ExtensionOID is an extension ID used to encode the application
+	// cluster name into a certificate.
+	AppClusterNameASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 5}
+
+	// AppPublicAddrASN1ExtensionOID is an extension ID used to encode the application
+	// public address into a certificate.
+	AppPublicAddrASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 6}
+
+	// TeleportClusterASN1ExtensionOID is an extension ID used when encoding/decoding
+	// origin teleport cluster name into certificates.
+	TeleportClusterASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 7}
+
+	// MFAVerifiedASN1ExtensionOID is an extension ID used when encoding/decoding
+	// the MFAVerified flag into certificates.
+	MFAVerifiedASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 8}
+
+	// ClientIPASN1ExtensionOID is an extension ID used when encoding/decoding
+	// the client IP into certificates.
+	ClientIPASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 9}
+
+	// AppNameASN1ExtensionOID is an extension ID used when encoding/decoding
+	// application name into a certificate.
+	AppNameASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 1, 10}
+
+	// DatabaseServiceNameASN1ExtensionOID is an extension ID used when encoding/decoding
+	// database service name into certificates.
+	DatabaseServiceNameASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 1}
+
+	// DatabaseProtocolASN1ExtensionOID is an extension ID used when encoding/decoding
+	// database protocol into certificates.
+	DatabaseProtocolASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 2}
+
+	// DatabaseUsernameASN1ExtensionOID is an extension ID used when encoding/decoding
+	// database username into certificates.
+	DatabaseUsernameASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 3}
+
+	// DatabaseNameASN1ExtensionOID is an extension ID used when encoding/decoding
+	// database name into certificates.
+	DatabaseNameASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 4}
+
+	// DatabaseNamesASN1ExtensionOID is an extension OID used when encoding/decoding
+	// allowed database names into certificates.
+	DatabaseNamesASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 5}
+
+	// DatabaseUsersASN1ExtensionOID is an extension OID used when encoding/decoding
+	// allowed database users into certificates.
+	DatabaseUsersASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 6}
+
+	// ImpersonatorASN1ExtensionOID is an extension OID used when encoding/decoding
+	// impersonator user
+	ImpersonatorASN1ExtensionOID = asn1.ObjectIdentifier{1, 3, 9999, 2, 7}
+)
 
 // Subject converts identity to X.509 subject name
 func (id *Identity) Subject() (pkix.Name, error) {
@@ -156,6 +308,120 @@ func (id *Identity) Subject() (pkix.Name, error) {
 			})
 	}
 
+	if id.KubernetesCluster != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  KubeClusterASN1ExtensionOID,
+				Value: id.KubernetesCluster,
+			})
+	}
+
+	// Encode application routing metadata if provided.
+	if id.RouteToApp.SessionID != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  AppSessionIDASN1ExtensionOID,
+				Value: id.RouteToApp.SessionID,
+			})
+	}
+	if id.RouteToApp.PublicAddr != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  AppPublicAddrASN1ExtensionOID,
+				Value: id.RouteToApp.PublicAddr,
+			})
+	}
+	if id.RouteToApp.ClusterName != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  AppClusterNameASN1ExtensionOID,
+				Value: id.RouteToApp.ClusterName,
+			})
+	}
+	if id.RouteToApp.Name != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  AppNameASN1ExtensionOID,
+				Value: id.RouteToApp.Name,
+			})
+	}
+	if id.TeleportCluster != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  TeleportClusterASN1ExtensionOID,
+				Value: id.TeleportCluster,
+			})
+	}
+	if id.MFAVerified != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  MFAVerifiedASN1ExtensionOID,
+				Value: id.MFAVerified,
+			})
+	}
+	if id.ClientIP != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  ClientIPASN1ExtensionOID,
+				Value: id.ClientIP,
+			})
+	}
+
+	// Encode routing metadata for databases.
+	if id.RouteToDatabase.ServiceName != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  DatabaseServiceNameASN1ExtensionOID,
+				Value: id.RouteToDatabase.ServiceName,
+			})
+	}
+	if id.RouteToDatabase.Protocol != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  DatabaseProtocolASN1ExtensionOID,
+				Value: id.RouteToDatabase.Protocol,
+			})
+	}
+	if id.RouteToDatabase.Username != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  DatabaseUsernameASN1ExtensionOID,
+				Value: id.RouteToDatabase.Username,
+			})
+	}
+	if id.RouteToDatabase.Database != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  DatabaseNameASN1ExtensionOID,
+				Value: id.RouteToDatabase.Database,
+			})
+	}
+
+	// Encode allowed database names/users used when passing them
+	// to remote clusters as user traits.
+	for i := range id.DatabaseNames {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  DatabaseNamesASN1ExtensionOID,
+				Value: id.DatabaseNames[i],
+			})
+	}
+	for i := range id.DatabaseUsers {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  DatabaseUsersASN1ExtensionOID,
+				Value: id.DatabaseUsers[i],
+			})
+	}
+
+	if id.Impersonator != "" {
+		subject.ExtraNames = append(subject.ExtraNames,
+			pkix.AttributeTypeAndValue{
+				Type:  ImpersonatorASN1ExtensionOID,
+				Value: id.Impersonator,
+			})
+	}
+
 	return subject, nil
 }
 
@@ -189,6 +455,81 @@ func FromSubject(subject pkix.Name, expires time.Time) (*Identity, error) {
 			val, ok := attr.Value.(string)
 			if ok {
 				id.KubernetesGroups = append(id.KubernetesGroups, val)
+			}
+		case attr.Type.Equal(KubeClusterASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.KubernetesCluster = val
+			}
+		case attr.Type.Equal(AppSessionIDASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.RouteToApp.SessionID = val
+			}
+		case attr.Type.Equal(AppPublicAddrASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.RouteToApp.PublicAddr = val
+			}
+		case attr.Type.Equal(AppClusterNameASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.RouteToApp.ClusterName = val
+			}
+		case attr.Type.Equal(AppNameASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.RouteToApp.Name = val
+			}
+		case attr.Type.Equal(TeleportClusterASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.TeleportCluster = val
+			}
+		case attr.Type.Equal(MFAVerifiedASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.MFAVerified = val
+			}
+		case attr.Type.Equal(ClientIPASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.ClientIP = val
+			}
+		case attr.Type.Equal(DatabaseServiceNameASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.RouteToDatabase.ServiceName = val
+			}
+		case attr.Type.Equal(DatabaseProtocolASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.RouteToDatabase.Protocol = val
+			}
+		case attr.Type.Equal(DatabaseUsernameASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.RouteToDatabase.Username = val
+			}
+		case attr.Type.Equal(DatabaseNameASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.RouteToDatabase.Database = val
+			}
+		case attr.Type.Equal(DatabaseNamesASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.DatabaseNames = append(id.DatabaseNames, val)
+			}
+		case attr.Type.Equal(DatabaseUsersASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.DatabaseUsers = append(id.DatabaseUsers, val)
+			}
+		case attr.Type.Equal(ImpersonatorASN1ExtensionOID):
+			val, ok := attr.Value.(string)
+			if ok {
+				id.Impersonator = val
 			}
 		}
 	}
@@ -224,7 +565,7 @@ type CertificateRequest struct {
 // CheckAndSetDefaults checks and sets default values
 func (c *CertificateRequest) CheckAndSetDefaults() error {
 	if c.Clock == nil {
-		return trace.BadParameter("missing parameter Clock")
+		c.Clock = clockwork.NewRealClock()
 	}
 	if c.PublicKey == nil {
 		return trace.BadParameter("missing parameter PublicKey")

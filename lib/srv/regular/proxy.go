@@ -29,16 +29,37 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
+	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/reversetunnel"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv"
 	"github.com/gravitational/teleport/lib/sshutils"
 	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
 	"github.com/pborman/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
+)
+
+var ( // failedConnectingToNode counts failed attempts to connect to a node
+	proxiedSessions = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: teleport.MetricProxySSHSessions,
+			Help: "Number of active sessions through this proxy",
+		},
+	)
+
+	failedConnectingToNode = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: teleport.MetricFailedConnectToNodeAttempts,
+			Help: "Number of failed attempts to connect to a node",
+		},
+	)
+
+	prometheusCollectors = []prometheus.Collector{proxiedSessions, failedConnectingToNode}
 )
 
 // proxySubsys implements an SSH subsystem for proxying listening sockets from
@@ -75,7 +96,7 @@ func parseProxySubsysRequest(request string) (proxySubsysRequest, error) {
 		return proxySubsysRequest{}, trace.BadParameter(paramMessage)
 	}
 	requestBody := strings.TrimPrefix(request, prefix)
-	namespace := defaults.Namespace
+	namespace := apidefaults.Namespace
 	var err error
 	parts := strings.Split(requestBody, "@")
 	switch {
@@ -143,7 +164,7 @@ func (p *proxySubsysRequest) String() string {
 // SetDefaults sets default values.
 func (p *proxySubsysRequest) SetDefaults() {
 	if p.namespace == "" {
-		p.namespace = defaults.Namespace
+		p.namespace = apidefaults.Namespace
 	}
 }
 
@@ -151,6 +172,11 @@ func (p *proxySubsysRequest) SetDefaults() {
 // a port forwarding request, used to implement ProxyJump feature in proxy
 // and reuse the code
 func newProxySubsys(ctx *srv.ServerContext, srv *Server, req proxySubsysRequest) (*proxySubsys, error) {
+	err := utils.RegisterPrometheusCollectors(prometheusCollectors...)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	req.SetDefaults()
 	if req.clusterName == "" && ctx.Identity.RouteToCluster != "" {
 		log.Debugf("Proxy subsystem: routing user %q to cluster %q based on the route to cluster extension.",
@@ -159,7 +185,7 @@ func newProxySubsys(ctx *srv.ServerContext, srv *Server, req proxySubsysRequest)
 		req.clusterName = ctx.Identity.RouteToCluster
 	}
 	if req.clusterName != "" && srv.proxyTun != nil {
-		_, err := srv.proxyTun.GetSite(req.clusterName)
+		_, err := srv.tunnelWithRoles(ctx).GetSite(req.clusterName)
 		if err != nil {
 			return nil, trace.BadParameter("invalid format for proxy request: unknown cluster %q", req.clusterName)
 		}
@@ -198,14 +224,12 @@ func (t *proxySubsys) Start(sconn *ssh.ServerConn, ch ssh.Channel, req *ssh.Requ
 	var (
 		site       reversetunnel.RemoteSite
 		err        error
-		tunnel     = t.srv.proxyTun
+		tunnel     = t.srv.tunnelWithRoles(ctx)
 		clientAddr = sconn.RemoteAddr()
 	)
 	// did the client pass us a true client IP ahead of time via an environment variable?
 	// (usually the web client would do that)
-	ctx.Lock()
 	trueClientIP, ok := ctx.GetEnv(sshutils.TrueClientAddrVar)
-	ctx.Unlock()
 	if ok {
 		a, err := utils.ParseAddr(trueClientIP)
 		if err == nil {
@@ -224,7 +248,10 @@ func (t *proxySubsys) Start(sconn *ssh.ServerConn, ch ssh.Channel, req *ssh.Requ
 	if t.host != "" {
 		// no site given? use the 1st one:
 		if site == nil {
-			sites := tunnel.GetSites()
+			sites, err := tunnel.GetSites()
+			if err != nil {
+				return trace.Wrap(err)
+			}
 			if len(sites) == 0 {
 				t.log.Error("Not connected to any remote clusters")
 				return trace.NotFound("no connected sites")
@@ -243,13 +270,13 @@ func (t *proxySubsys) Start(sconn *ssh.ServerConn, ch ssh.Channel, req *ssh.Requ
 // auth server of the requested remote site
 func (t *proxySubsys) proxyToSite(
 	ctx *srv.ServerContext, site reversetunnel.RemoteSite, remoteAddr net.Addr, ch ssh.Channel) error {
-
 	conn, err := site.DialAuthServer()
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	t.log.Infof("Connected to auth server: %v", conn.RemoteAddr())
 
+	proxiedSessions.Inc()
 	go func() {
 		var err error
 		defer func() {
@@ -264,8 +291,7 @@ func (t *proxySubsys) proxyToSite(
 			t.close(err)
 		}()
 		defer conn.Close()
-		_, err = io.Copy(conn, srv.NewTrackingReader(ctx, ch))
-
+		_, err = io.Copy(conn, ch)
 	}()
 
 	return nil
@@ -283,14 +309,14 @@ func (t *proxySubsys) proxyToHost(
 	// network resolution (by IP or DNS)
 	//
 	var (
-		servers []services.Server
+		servers []types.Server
 		err     error
 	)
 	localCluster, _ := t.srv.authService.GetClusterName()
 	// going to "local" CA? lets use the caching 'auth service' directly and avoid
 	// hitting the reverse tunnel link (it can be offline if the CA is down)
 	if site.GetName() == localCluster.GetName() {
-		servers, err = t.srv.authService.GetNodes(t.namespace, services.SkipValidation())
+		servers, err = t.srv.authService.GetNodes(ctx.CancelContext(), t.namespace)
 		if err != nil {
 			t.log.Warn(err)
 		}
@@ -300,7 +326,7 @@ func (t *proxySubsys) proxyToHost(
 		if err != nil {
 			t.log.Warn(err)
 		} else {
-			servers, err = siteClient.GetNodes(t.namespace, services.SkipValidation())
+			servers, err = siteClient.GetNodes(ctx.CancelContext(), t.namespace)
 			if err != nil {
 				t.log.Warn(err)
 			}
@@ -318,7 +344,7 @@ func (t *proxySubsys) proxyToHost(
 	hostIsUUID := uuid.Parse(t.host) != nil
 
 	// enumerate and try to find a server with self-registered with a matching name/IP:
-	var server services.Server
+	var server types.Server
 	matches := 0
 	for i := range servers {
 		// If the host parameter is a UUID and it matches the Node ID,
@@ -342,7 +368,7 @@ func (t *proxySubsys) proxyToHost(
 			t.log.Errorf("Failed to parse address %q: %v.", servers[i].GetAddr(), err)
 			continue
 		}
-		if t.host == ip || t.host == servers[i].GetHostname() || utils.SliceContainsStr(ips, ip) {
+		if t.host == ip || t.host == servers[i].GetHostname() || apiutils.SliceContainsStr(ips, ip) {
 			if !specifiedPort || t.port == port {
 				server = servers[i]
 				matches++
@@ -391,6 +417,8 @@ func (t *proxySubsys) proxyToHost(
 				return trace.Wrap(err)
 			}
 			principals = append(principals, host)
+		} else if server.GetUseTunnel() {
+			serverAddr = reversetunnel.LocalNode
 		}
 	} else {
 		if !specifiedPort {
@@ -415,8 +443,10 @@ func (t *proxySubsys) proxyToHost(
 		Address:      t.host,
 		ServerID:     serverID,
 		Principals:   principals,
+		ConnType:     types.NodeTunnel,
 	})
 	if err != nil {
+		failedConnectingToNode.Inc()
 		return trace.Wrap(err)
 	}
 
@@ -424,6 +454,7 @@ func (t *proxySubsys) proxyToHost(
 	// address to the SSH server
 	t.doHandshake(remoteAddr, ch, conn)
 
+	proxiedSessions.Inc()
 	go func() {
 		var err error
 		defer func() {
@@ -438,7 +469,7 @@ func (t *proxySubsys) proxyToHost(
 			t.close(err)
 		}()
 		defer conn.Close()
-		_, err = io.Copy(conn, srv.NewTrackingReader(ctx, ch))
+		_, err = io.Copy(conn, ch)
 	}()
 
 	return nil
@@ -446,6 +477,7 @@ func (t *proxySubsys) proxyToHost(
 
 func (t *proxySubsys) close(err error) {
 	t.closeOnce.Do(func() {
+		proxiedSessions.Dec()
 		t.error = err
 		close(t.closeC)
 	})

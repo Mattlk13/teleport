@@ -1,5 +1,5 @@
 /*
-Copyright 2018-2019 Gravitational, Inc.
+Copyright 2018-2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,8 @@ import (
 	"time"
 
 	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/lib/defaults"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
@@ -60,10 +61,10 @@ type KubeCSRResponse struct {
 
 // ProcessKubeCSR processes CSR request against Kubernetes CA, returns
 // signed certificate if successful.
-func (s *AuthServer) ProcessKubeCSR(req KubeCSR) (*KubeCSRResponse, error) {
-	if !modules.GetModules().SupportsKubernetes() {
+func (s *Server) ProcessKubeCSR(req KubeCSR) (*KubeCSRResponse, error) {
+	if !modules.GetModules().Features().Kubernetes {
 		return nil, trace.AccessDenied(
-			"this teleport cluster does not support kubernetes, please contact system administrator for support")
+			"this Teleport cluster is not licensed for Kubernetes, please contact the cluster administrator")
 	}
 	if err := req.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
@@ -78,8 +79,8 @@ func (s *AuthServer) ProcessKubeCSR(req KubeCSR) (*KubeCSRResponse, error) {
 	// with special provisions.
 	log.Debugf("Generating certificate to access remote Kubernetes clusters.")
 
-	hostCA, err := s.GetCertAuthority(services.CertAuthID{
-		Type:       services.HostCA,
+	hostCA, err := s.GetCertAuthority(types.CertAuthID{
+		Type:       types.HostCA,
 		DomainName: req.ClusterName,
 	}, false)
 	if err != nil {
@@ -105,23 +106,39 @@ func (s *AuthServer) ProcessKubeCSR(req KubeCSR) (*KubeCSRResponse, error) {
 		return nil, trace.Wrap(err)
 	}
 
+	roleNames := id.Groups
+	// This is a remote user, map roles to local roles first.
+	if id.TeleportCluster != clusterName.GetClusterName() {
+		ca, err := s.GetCertAuthority(types.CertAuthID{Type: types.UserCA, DomainName: id.TeleportCluster}, false)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		roleNames, err = services.MapRoles(ca.CombinedMapping(), id.Groups)
+		if err != nil {
+			return nil, trace.AccessDenied("failed to map roles for remote user %q from cluster %q with remote roles %v", id.Username, id.TeleportCluster, id.Groups)
+		}
+		if len(roleNames) == 0 {
+			return nil, trace.AccessDenied("no roles mapped for remote user %q from cluster %q with remote roles %v", id.Username, id.TeleportCluster, id.Groups)
+		}
+	}
+
 	// Extract user roles from the identity (from the CSR Subject).
-	roles, err := services.FetchRoles(id.Groups, s, id.Traits)
+	roles, err := services.FetchRoles(roleNames, s, id.Traits)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	// Get the correct cert TTL based on roles.
-	ttl := roles.AdjustSessionTTL(defaults.CertDuration)
+	ttl := roles.AdjustSessionTTL(apidefaults.CertDuration)
 
-	userCA, err := s.Trust.GetCertAuthority(services.CertAuthID{
-		Type:       services.UserCA,
+	userCA, err := s.Trust.GetCertAuthority(types.CertAuthID{
+		Type:       types.UserCA,
 		DomainName: clusterName.GetClusterName(),
 	}, true)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	// generate TLS certificate
-	tlsAuthority, err := userCA.TLSCA()
+	tlsAuthority, err := tlsca.FromAuthority(userCA)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -140,9 +157,8 @@ func (s *AuthServer) ProcessKubeCSR(req KubeCSR) (*KubeCSRResponse, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	re := &KubeCSRResponse{Cert: tlsCert}
-	for _, keyPair := range hostCA.GetTLSKeyPairs() {
-		re.CertAuthorities = append(re.CertAuthorities, keyPair.Cert)
-	}
-	return re, nil
+	return &KubeCSRResponse{
+		Cert:            tlsCert,
+		CertAuthorities: services.GetTLSCerts(hostCA),
+	}, nil
 }

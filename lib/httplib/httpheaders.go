@@ -63,11 +63,18 @@ func SetIndexHTMLHeaders(h http.Header) {
 
 	// Set content policy flags
 	var cspValue = strings.Join([]string{
-		"script-src 'self'",
-		// 'unsafe-inline' needed for reactjs inline styles
+		"default-src 'self'",
+		// cloud version uses stripe.com to update billing information
+		"script-src 'self' https://js.stripe.com",
+		"frame-src https://js.stripe.com",
+		"frame-ancestors 'none'",
+		// 'unsafe-inline' is required by CSS-in-JS to work
 		"style-src 'self' 'unsafe-inline'",
 		"object-src 'none'",
 		"img-src 'self' data: blob:",
+		"font-src 'self' data:",
+		"base-uri 'self'",
+		"form-action 'self'",
 	}, ";")
 
 	h.Set("Content-Security-Policy", cspValue)

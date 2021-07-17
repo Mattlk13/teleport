@@ -1,5 +1,5 @@
 /*
-Copyright 2015 Gravitational, Inc.
+Copyright 2015-2020 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,23 +25,26 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
+	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/bpf"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/labels"
 	"github.com/gravitational/teleport/lib/limiter"
 	"github.com/gravitational/teleport/lib/pam"
+	restricted "github.com/gravitational/teleport/lib/restrictedsession"
 	"github.com/gravitational/teleport/lib/reversetunnel"
 	"github.com/gravitational/teleport/lib/services"
 	rsession "github.com/gravitational/teleport/lib/session"
@@ -53,12 +56,22 @@ import (
 	"github.com/gravitational/trace"
 
 	"github.com/jonboulle/clockwork"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 )
 
-var log = logrus.WithFields(logrus.Fields{
-	trace.Component: teleport.ComponentNode,
-})
+var (
+	log = logrus.WithFields(logrus.Fields{
+		trace.Component: teleport.ComponentNode,
+	})
+
+	userSessionLimitHitCount = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: teleport.MetricUserMaxConcurrentSessionsHit,
+			Help: "Number of times a user exceeded their max concurrent ssh connections",
+		},
+	)
+)
 
 // Server implements SSH server that uses configuration backend and
 // certificate-based authentication
@@ -79,12 +92,14 @@ type Server struct {
 	sessionServer rsession.Service
 	limiter       *limiter.Limiter
 
-	labels      map[string]string                //static server labels
-	cmdLabels   map[string]services.CommandLabel //dymanic server labels
-	labelsMutex *sync.Mutex
+	// labels are static labels.
+	labels map[string]string
+
+	// dynamicLabels are the result of command execution.
+	dynamicLabels *labels.Dynamic
 
 	proxyMode bool
-	proxyTun  reversetunnel.Server
+	proxyTun  reversetunnel.Tunnel
 
 	advertiseAddr   *utils.NetAddr
 	proxyPublicAddr utils.NetAddr
@@ -101,9 +116,8 @@ type Server struct {
 	// ctx is broadcasting context closure
 	ctx context.Context
 
-	// alog points to the AuditLog this server uses to report
-	// auditable events
-	alog events.IAuditLog
+	// StreamEmitter points to the auth service and emits audit events
+	events.StreamEmitter
 
 	// clock is a system clock
 	clock clockwork.Clock
@@ -150,6 +164,22 @@ type Server struct {
 
 	// ebpf is the service used for enhanced session recording.
 	ebpf bpf.BPF
+
+	// restrictedMgr is the service used for restricting access to kernel objects
+	restrictedMgr restricted.Manager
+
+	// onHeartbeat is a callback for heartbeat status.
+	onHeartbeat func(error)
+
+	// utmpPath is the path to the user accounting database.
+	utmpPath string
+
+	// wtmpPath is the path to the user accounting log.
+	wtmpPath string
+
+	// allowTCPForwarding indicates whether the ssh server is allowed to offer
+	// TCP port forwarding.
+	allowTCPForwarding bool
 }
 
 // GetClock returns server clock implementation
@@ -166,13 +196,6 @@ func (s *Server) GetNamespace() string {
 	return s.namespace
 }
 
-func (s *Server) GetAuditLog() events.IAuditLog {
-	if s.isAuditedAtProxy() {
-		return events.NewDiscardAuditLog()
-	}
-	return s.alog
-}
-
 func (s *Server) GetAccessPoint() auth.AccessPoint {
 	return s.authService
 }
@@ -182,6 +205,11 @@ func (s *Server) GetSessionServer() rsession.Service {
 		return rsession.NewDiscardSessionServer()
 	}
 	return s.sessionServer
+}
+
+// GetUtmpPath returns the optional override of the utmp and wtmp path.
+func (s *Server) GetUtmpPath() (string, string) {
+	return s.utmpPath, s.wtmpPath
 }
 
 // GetPAM returns the PAM configuration for this server.
@@ -200,16 +228,21 @@ func (s *Server) GetBPF() bpf.BPF {
 	return s.ebpf
 }
 
+// GetBPF returns the BPF service used by enhanced session recording.
+func (s *Server) GetRestrictedSessionManager() restricted.Manager {
+	return s.restrictedMgr
+}
+
 // isAuditedAtProxy returns true if sessions are being recorded at the proxy
 // and this is a Teleport node.
 func (s *Server) isAuditedAtProxy() bool {
 	// always be safe, better to double record than not record at all
-	clusterConfig, err := s.GetAccessPoint().GetClusterConfig()
+	recConfig, err := s.GetAccessPoint().GetSessionRecordingConfig(s.ctx)
 	if err != nil {
 		return false
 	}
 
-	isRecordAtProxy := clusterConfig.GetSessionRecording() == services.RecordAtProxy
+	isRecordAtProxy := services.IsRecordAtProxy(recConfig.GetMode())
 	isTeleportNode := s.Component() == teleport.ComponentNode
 
 	if isRecordAtProxy && isTeleportNode {
@@ -251,8 +284,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // Start starts server
 func (s *Server) Start() error {
-	if len(s.getCommandLabels()) > 0 {
-		s.updateLabels()
+	// If the server has dynamic labels defined, start a loop that will
+	// asynchronously keep them updated.
+	if s.dynamicLabels != nil {
+		go s.dynamicLabels.Start()
 	}
 
 	// If the server requested connections to it arrive over a reverse tunnel,
@@ -275,9 +310,12 @@ func (s *Server) Start() error {
 
 // Serve servers service on started listener
 func (s *Server) Serve(l net.Listener) error {
-	if len(s.getCommandLabels()) > 0 {
-		s.updateLabels()
+	// If the server has dynamic labels defined, start a loop that will
+	// asynchronously keep them updated.
+	if s.dynamicLabels != nil {
+		go s.dynamicLabels.Start()
 	}
+
 	go s.heartbeat.Run()
 	return s.srv.Serve(l)
 }
@@ -294,7 +332,25 @@ func (s *Server) HandleConnection(conn net.Conn) {
 }
 
 // RotationGetter returns rotation state
-type RotationGetter func(role teleport.Role) (*services.Rotation, error)
+type RotationGetter func(role types.SystemRole) (*types.Rotation, error)
+
+// SetUtmpPath is a functional server option to override the user accounting database and log path.
+func SetUtmpPath(utmpPath, wtmpPath string) ServerOption {
+	return func(s *Server) error {
+		s.utmpPath = utmpPath
+		s.wtmpPath = wtmpPath
+		return nil
+	}
+}
+
+// SetClock is a functional server option to override the internal
+// clock
+func SetClock(clock clockwork.Clock) ServerOption {
+	return func(s *Server) error {
+		s.clock = clock
+		return nil
+	}
+}
 
 // SetRotationGetter sets rotation state getter
 func SetRotationGetter(getter RotationGetter) ServerOption {
@@ -322,7 +378,7 @@ func SetSessionServer(sessionServer rsession.Service) ServerOption {
 }
 
 // SetProxyMode starts this server in SSH proxying mode
-func SetProxyMode(tsrv reversetunnel.Server) ServerOption {
+func SetProxyMode(tsrv reversetunnel.Tunnel) ServerOption {
 	return func(s *Server) error {
 		// always set proxy mode to true,
 		// because in some tests reverse tunnel is disabled,
@@ -334,22 +390,32 @@ func SetProxyMode(tsrv reversetunnel.Server) ServerOption {
 }
 
 // SetLabels sets dynamic and static labels that server will report to the
-// auth servers
-func SetLabels(labels map[string]string,
-	cmdLabels services.CommandLabels) ServerOption {
+// auth servers.
+func SetLabels(staticLabels map[string]string, cmdLabels services.CommandLabels) ServerOption {
 	return func(s *Server) error {
-		// make sure to clone labels to avoid
-		// concurrent writes to the map during reloads
-		cmdLabels = cmdLabels.Clone()
-		for name, label := range cmdLabels {
-			if label.GetPeriod() < time.Second {
-				label.SetPeriod(time.Second)
-				cmdLabels[name] = label
-				log.Warningf("label period can't be less that 1 second. Period for label '%v' was set to 1 second", name)
+		var err error
+
+		// clone and validate labels and cmdLabels.  in theory,
+		// only cmdLabels should experience concurrent writes,
+		// but this operation is only run once on startup
+		// so a little defensive cloning is harmless.
+		labelsClone := make(map[string]string, len(staticLabels))
+		for name, label := range staticLabels {
+			if !types.IsValidLabelKey(name) {
+				return trace.BadParameter("invalid label key: %q", name)
 			}
+			labelsClone[name] = label
 		}
-		s.labels = labels
-		s.cmdLabels = cmdLabels
+		s.labels = labelsClone
+
+		// Create dynamic labels.
+		s.dynamicLabels, err = labels.NewDynamic(s.ctx, &labels.DynamicConfig{
+			Labels: cmdLabels,
+		})
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
 		return nil
 	}
 }
@@ -362,10 +428,10 @@ func SetLimiter(limiter *limiter.Limiter) ServerOption {
 	}
 }
 
-// SetAuditLog assigns an audit log interfaces to this server
-func SetAuditLog(alog events.IAuditLog) ServerOption {
+// SetEmitter assigns an audit event emitter for this server
+func SetEmitter(emitter events.StreamEmitter) ServerOption {
 	return func(s *Server) error {
-		s.alog = alog
+		s.StreamEmitter = emitter
 		return nil
 	}
 }
@@ -442,6 +508,30 @@ func SetBPF(ebpf bpf.BPF) ServerOption {
 	}
 }
 
+func SetRestrictedSessionManager(m restricted.Manager) ServerOption {
+	return func(s *Server) error {
+		s.restrictedMgr = m
+		return nil
+	}
+}
+
+func SetOnHeartbeat(fn func(error)) ServerOption {
+	return func(s *Server) error {
+		s.onHeartbeat = fn
+		return nil
+	}
+}
+
+// SetAllowTCPForwarding sets the TCP port forwarding mode that this server is
+// allowed to offer. The default value is SSHPortForwardingModeAll, i.e. port
+// forwarding is allowed.
+func SetAllowTCPForwarding(allow bool) ServerOption {
+	return func(s *Server) error {
+		s.allowTCPForwarding = allow
+		return nil
+	}
+}
+
 // New returns an unstarted server
 func New(addr utils.NetAddr,
 	hostname string,
@@ -450,7 +540,12 @@ func New(addr utils.NetAddr,
 	dataDir string,
 	advertiseAddr string,
 	proxyPublicAddr utils.NetAddr,
-	options ...ServerOption) (*Server, error) {
+	options ...ServerOption,
+) (*Server, error) {
+	err := utils.RegisterPrometheusCollectors(userSessionLimitHitCount)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 
 	// read the host UUID:
 	uuid, err := utils.ReadOrMakeHostUUID(dataDir)
@@ -460,18 +555,18 @@ func New(addr utils.NetAddr,
 
 	ctx, cancel := context.WithCancel(context.TODO())
 	s := &Server{
-		addr:            addr,
-		authService:     authService,
-		hostname:        hostname,
-		labelsMutex:     &sync.Mutex{},
-		proxyPublicAddr: proxyPublicAddr,
-		uuid:            uuid,
-		cancel:          cancel,
-		ctx:             ctx,
-		clock:           clockwork.NewRealClock(),
-		dataDir:         dataDir,
+		addr:               addr,
+		authService:        authService,
+		hostname:           hostname,
+		proxyPublicAddr:    proxyPublicAddr,
+		uuid:               uuid,
+		cancel:             cancel,
+		ctx:                ctx,
+		clock:              clockwork.NewRealClock(),
+		dataDir:            dataDir,
+		allowTCPForwarding: true,
 	}
-	s.limiter, err = limiter.NewLimiter(limiter.LimiterConfig{})
+	s.limiter, err = limiter.NewLimiter(limiter.Config{})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -489,8 +584,8 @@ func New(addr utils.NetAddr,
 	}
 
 	// TODO(klizhentas): replace function arguments with struct
-	if s.alog == nil {
-		return nil, trace.BadParameter("setup valid AuditLog parameter using SetAuditLog")
+	if s.StreamEmitter == nil {
+		return nil, trace.BadParameter("setup valid Emitter parameter using SetEmitter")
 	}
 
 	if s.namespace == "" {
@@ -515,16 +610,18 @@ func New(addr utils.NetAddr,
 	}
 
 	// add in common auth handlers
-	s.authHandlers = &srv.AuthHandlers{
-		Entry: logrus.WithFields(logrus.Fields{
-			trace.Component:       component,
-			trace.ComponentFields: logrus.Fields{},
-		}),
+	authHandlerConfig := srv.AuthHandlerConfig{
 		Server:      s,
 		Component:   component,
-		AuditLog:    s.alog,
 		AccessPoint: s.authService,
 		FIPS:        s.fips,
+		Emitter:     s.StreamEmitter,
+		Clock:       s.clock,
+	}
+
+	s.authHandlers, err = srv.NewAuthHandlers(&authHandlerConfig)
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
 
 	// common term handlers
@@ -538,6 +635,7 @@ func New(addr utils.NetAddr,
 		sshutils.AuthMethods{PublicKey: s.authHandlers.UserKeyAuth},
 		sshutils.SetLimiter(s.limiter),
 		sshutils.SetRequestHandler(s),
+		sshutils.SetNewConnHandler(s),
 		sshutils.SetCiphers(s.ciphers),
 		sshutils.SetKEXAlgorithms(s.kexAlgorithms),
 		sshutils.SetMACAlgorithms(s.macAlgorithms),
@@ -560,11 +658,12 @@ func New(addr utils.NetAddr,
 		Component:       component,
 		Announcer:       s.authService,
 		GetServerInfo:   s.getServerInfo,
-		KeepAlivePeriod: defaults.ServerKeepAliveTTL,
-		AnnouncePeriod:  defaults.ServerAnnounceTTL/2 + utils.RandomDuration(defaults.ServerAnnounceTTL/10),
-		ServerTTL:       defaults.ServerAnnounceTTL,
+		KeepAlivePeriod: apidefaults.ServerKeepAliveTTL,
+		AnnouncePeriod:  apidefaults.ServerAnnounceTTL/2 + utils.RandomDuration(apidefaults.ServerAnnounceTTL/10),
+		ServerTTL:       apidefaults.ServerAnnounceTTL,
 		CheckPeriod:     defaults.HeartbeatCheckPeriod,
 		Clock:           s.clock,
+		OnHeartbeat:     s.onHeartbeat,
 	})
 	if err != nil {
 		s.srv.Close()
@@ -575,7 +674,16 @@ func New(addr utils.NetAddr,
 }
 
 func (s *Server) getNamespace() string {
-	return services.ProcessNamespace(s.namespace)
+	return types.ProcessNamespace(s.namespace)
+}
+
+func (s *Server) tunnelWithRoles(ctx *srv.ServerContext) reversetunnel.Tunnel {
+	return reversetunnel.NewTunnelWithRoles(s.proxyTun, ctx.Identity.RoleSet, s.authService)
+}
+
+// Context returns server shutdown context
+func (s *Server) Context() context.Context {
+	return s.ctx
 }
 
 func (s *Server) Component() string {
@@ -640,31 +748,40 @@ func (s *Server) AdvertiseAddr() string {
 	return net.JoinHostPort(ahost, aport)
 }
 
-func (s *Server) getRole() teleport.Role {
+func (s *Server) getRole() types.SystemRole {
 	if s.proxyMode {
-		return teleport.RoleProxy
+		return types.RoleProxy
 	}
-	return teleport.RoleNode
+	return types.RoleNode
+}
+
+// getDynamicLabels returns all dynamic labels. If no dynamic labels are
+// defined, return an empty set.
+func (s *Server) getDynamicLabels() map[string]types.CommandLabelV2 {
+	if s.dynamicLabels == nil {
+		return make(map[string]types.CommandLabelV2)
+	}
+	return types.LabelsToV2(s.dynamicLabels.Get())
 }
 
 // GetInfo returns a services.Server that represents this server.
-func (s *Server) GetInfo() services.Server {
+func (s *Server) GetInfo() types.Server {
 	// Only set the address for non-tunnel nodes.
 	var addr string
 	if !s.useTunnel {
 		addr = s.AdvertiseAddr()
 	}
 
-	return &services.ServerV2{
-		Kind:    services.KindNode,
-		Version: services.V2,
-		Metadata: services.Metadata{
+	return &types.ServerV2{
+		Kind:    types.KindNode,
+		Version: types.V2,
+		Metadata: types.Metadata{
 			Name:      s.ID(),
 			Namespace: s.getNamespace(),
 			Labels:    s.labels,
 		},
-		Spec: services.ServerSpecV2{
-			CmdLabels: services.LabelsToV2(s.getCommandLabels()),
+		Spec: types.ServerSpecV2{
+			CmdLabels: s.getDynamicLabels(),
 			Addr:      addr,
 			Hostname:  s.hostname,
 			UseTunnel: s.useTunnel,
@@ -673,7 +790,7 @@ func (s *Server) GetInfo() services.Server {
 	}
 }
 
-func (s *Server) getServerInfo() (services.Server, error) {
+func (s *Server) getServerInfo() (types.Resource, error) {
 	server := s.GetInfo()
 	if s.getRotation != nil {
 		rotation, err := s.getRotation(s.getRole())
@@ -685,61 +802,14 @@ func (s *Server) getServerInfo() (services.Server, error) {
 			server.SetRotation(*rotation)
 		}
 	}
-	server.SetTTL(s.clock, defaults.ServerAnnounceTTL)
+	server.SetExpiry(s.clock.Now().UTC().Add(apidefaults.ServerAnnounceTTL))
 	server.SetPublicAddr(s.proxyPublicAddr.String())
 	return server, nil
 }
 
-func (s *Server) updateLabels() {
-	for name, label := range s.getCommandLabels() {
-		go s.periodicUpdateLabel(name, label.Clone())
-	}
-}
-
+// syncUpdateLabels synchronously updates dynamic labels. Only used in tests.
 func (s *Server) syncUpdateLabels() {
-	for name, label := range s.getCommandLabels() {
-		s.updateLabel(name, label)
-	}
-}
-
-func (s *Server) updateLabel(name string, label services.CommandLabel) {
-	out, err := exec.Command(label.GetCommand()[0], label.GetCommand()[1:]...).Output()
-	if err != nil {
-		log.Errorf(err.Error())
-		label.SetResult(err.Error() + " output: " + string(out))
-	} else {
-		label.SetResult(strings.TrimSpace(string(out)))
-	}
-	s.setCommandLabel(name, label)
-}
-
-func (s *Server) periodicUpdateLabel(name string, label services.CommandLabel) {
-	t := time.NewTicker(label.GetPeriod())
-	defer t.Stop()
-	for {
-		s.updateLabel(name, label.Clone())
-		select {
-		case <-t.C:
-		case <-s.ctx.Done():
-			return
-		}
-	}
-}
-
-func (s *Server) setCommandLabel(name string, value services.CommandLabel) {
-	s.labelsMutex.Lock()
-	defer s.labelsMutex.Unlock()
-	s.cmdLabels[name] = value
-}
-
-func (s *Server) getCommandLabels() map[string]services.CommandLabel {
-	s.labelsMutex.Lock()
-	defer s.labelsMutex.Unlock()
-	out := make(map[string]services.CommandLabel, len(s.cmdLabels))
-	for key, val := range s.cmdLabels {
-		out[key] = val.Clone()
-	}
-	return out
+	s.dynamicLabels.Sync()
 }
 
 // serveAgent will build the a sock path for this user and serve an SSH agent on unix socket.
@@ -795,22 +865,6 @@ func (s *Server) serveAgent(ctx *srv.ServerContext) error {
 	return nil
 }
 
-// EmitAuditEvent logs a given event to the audit log attached to the
-// server who owns these sessions
-func (s *Server) EmitAuditEvent(event events.Event, fields events.EventFields) {
-	log.Debugf("server.EmitAuditEvent(%v)", event.Name)
-	alog := s.alog
-	if alog != nil {
-		// record the event time with ms precision
-		fields[events.EventTime] = s.clock.Now().In(time.UTC).Round(time.Millisecond)
-		if err := alog.EmitAuditEvent(event, fields); err != nil {
-			log.Error(trace.DebugReport(err))
-		}
-	} else {
-		log.Warn("SSH server has no audit log")
-	}
-}
-
 // HandleRequest processes global out-of-band requests. Global out-of-band
 // requests are processed in order (this way the originator knows which
 // request we are responding to). If Teleport does not support the request
@@ -834,6 +888,92 @@ func (s *Server) HandleRequest(r *ssh.Request) {
 		}
 		log.Debugf("Discarding %q global request: %+v", r.Type, r)
 	}
+}
+
+// HandleNewConn is called by sshutils.Server once for each new incoming connection,
+// prior to handling any channels or requests.  Currently this callback's only
+// function is to apply concurrent session control limits.
+func (s *Server) HandleNewConn(ctx context.Context, ccx *sshutils.ConnectionContext) (context.Context, error) {
+	// we don't currently have any work to do in non-node contexts.
+	if s.Component() != teleport.ComponentNode {
+		return ctx, nil
+	}
+
+	identityContext, err := s.authHandlers.CreateIdentityContext(ccx.ServerConn)
+	if err != nil {
+		return ctx, trace.Wrap(err)
+	}
+
+	maxConnections := identityContext.RoleSet.MaxConnections()
+
+	if maxConnections == 0 {
+		// concurrent session control is not active, nothing
+		// else needs to be done here.
+		return ctx, nil
+	}
+
+	netConfig, err := s.authService.GetClusterNetworkingConfig(ctx)
+	if err != nil {
+		return ctx, trace.Wrap(err)
+	}
+
+	lock, err := services.AcquireSemaphoreLock(ctx, services.SemaphoreLockConfig{
+		Service: s.authService,
+		Expiry:  netConfig.GetSessionControlTimeout(),
+		Params: types.AcquireSemaphoreRequest{
+			SemaphoreKind: types.SemaphoreKindConnection,
+			SemaphoreName: identityContext.TeleportUser,
+			MaxLeases:     maxConnections,
+			Holder:        s.uuid,
+		},
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), teleport.MaxLeases) {
+			// user has exceeded their max concurrent ssh connections.
+			userSessionLimitHitCount.Inc()
+			if err := s.EmitAuditEvent(s.ctx, &apievents.SessionReject{
+				Metadata: apievents.Metadata{
+					Type: events.SessionRejectedEvent,
+					Code: events.SessionRejectedCode,
+				},
+				UserMetadata: apievents.UserMetadata{
+					Login:        identityContext.Login,
+					User:         identityContext.TeleportUser,
+					Impersonator: identityContext.Impersonator,
+				},
+				ConnectionMetadata: apievents.ConnectionMetadata{
+					Protocol:   events.EventProtocolSSH,
+					LocalAddr:  ccx.ServerConn.LocalAddr().String(),
+					RemoteAddr: ccx.ServerConn.RemoteAddr().String(),
+				},
+				ServerMetadata: apievents.ServerMetadata{
+					ServerID:        s.uuid,
+					ServerNamespace: s.GetNamespace(),
+				},
+				Reason:  events.SessionRejectedReasonMaxConnections,
+				Maximum: maxConnections,
+			}); err != nil {
+				log.WithError(err).Warn("Failed to emit session reject event.")
+			}
+			err = trace.AccessDenied("too many concurrent ssh connections for user %q (max=%d)",
+				identityContext.TeleportUser,
+				maxConnections,
+			)
+		}
+		return ctx, trace.Wrap(err)
+	}
+	go lock.KeepAlive(ctx)
+	// ensure that losing the lock closes the connection context.  Under normal
+	// conditions, cancellation propagates from the connection context to the
+	// lock, but if we lose the lock due to some error (e.g. poor connectivity
+	// to auth server) then cancellation propagates in the other direction.
+	go func() {
+		// TODO(fspmarshall): If lock was lost due to error, find a way to propagate
+		// an error message to user.
+		<-lock.Done()
+		ccx.Close()
+	}()
+	return ctx, nil
 }
 
 // HandleNewChan is called when new channel is opened
@@ -886,13 +1026,55 @@ func (s *Server) HandleNewChan(ctx context.Context, ccx *sshutils.ConnectionCont
 	// Channels of type "session" handle requests that are involved in running
 	// commands on a server, subsystem requests, and agent forwarding.
 	case teleport.ChanSession:
+		var decr func()
+		if max := identityContext.RoleSet.MaxSessions(); max != 0 {
+			d, ok := ccx.IncrSessions(max)
+			if !ok {
+				// user has exceeded their max concurrent ssh sessions.
+				if err := s.EmitAuditEvent(s.ctx, &apievents.SessionReject{
+					Metadata: apievents.Metadata{
+						Type: events.SessionRejectedEvent,
+						Code: events.SessionRejectedCode,
+					},
+					UserMetadata: apievents.UserMetadata{
+						Login:        identityContext.Login,
+						User:         identityContext.TeleportUser,
+						Impersonator: identityContext.Impersonator,
+					},
+					ConnectionMetadata: apievents.ConnectionMetadata{
+						Protocol:   events.EventProtocolSSH,
+						LocalAddr:  ccx.ServerConn.LocalAddr().String(),
+						RemoteAddr: ccx.ServerConn.RemoteAddr().String(),
+					},
+					ServerMetadata: apievents.ServerMetadata{
+						ServerID:        s.uuid,
+						ServerNamespace: s.GetNamespace(),
+					},
+					Reason:  events.SessionRejectedReasonMaxSessions,
+					Maximum: max,
+				}); err != nil {
+					log.WithError(err).Warn("Failed to emit session reject event.")
+				}
+				rejectChannel(nch, ssh.Prohibited, fmt.Sprintf("too many session channels for user %q (max=%d)", identityContext.TeleportUser, max))
+				return
+			}
+			decr = d
+		}
 		ch, requests, err := nch.Accept()
 		if err != nil {
 			log.Warnf("Unable to accept channel: %v.", err)
 			rejectChannel(nch, ssh.ConnectionFailed, fmt.Sprintf("unable to accept channel: %v", err))
+			if decr != nil {
+				decr()
+			}
 			return
 		}
-		go s.handleSessionRequests(ctx, ccx, identityContext, ch, requests)
+		go func() {
+			s.handleSessionRequests(ctx, ccx, identityContext, ch, requests)
+			if decr != nil {
+				decr()
+			}
+		}()
 	// Channels of type "direct-tcpip" handles request for port forwarding.
 	case teleport.ChanDirectTCPIP:
 		req, err := sshutils.ParseDirectTCPIPReq(nch.ExtraData())
@@ -913,6 +1095,35 @@ func (s *Server) HandleNewChan(ctx context.Context, ccx *sshutils.ConnectionCont
 	}
 }
 
+// canPortForward determines if port forwarding is allowed for the current
+// user/role/node combo. Returns nil if port forwarding is allowed, non-nil
+// if denied.
+func (s *Server) canPortForward(scx *srv.ServerContext, channel ssh.Channel) error {
+	// Is the node configured to allow port forwarding?
+	if !s.allowTCPForwarding {
+		return trace.AccessDenied("node does not allow port forwarding")
+	}
+
+	// Check if the role allows port forwarding for this user.
+	err := s.authHandlers.CheckPortForward(scx.DstAddr, scx)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// stderrWriter wraps an ssh.Channel in an implementation of io.StringWriter
+// that sends anything written back the client over its stderr stream
+type stderrWriter struct {
+	channel ssh.Channel
+}
+
+func (w *stderrWriter) WriteString(s string) (int, error) {
+	writeStderr(w.channel, s)
+	return len(s), nil
+}
+
 // handleDirectTCPIPRequest handles port forwarding requests.
 func (s *Server) handleDirectTCPIPRequest(ctx context.Context, ccx *sshutils.ConnectionContext, identityContext srv.IdentityContext, channel ssh.Channel, req *sshutils.DirectTCPIPReq) {
 	// Create context for this channel. This context will be closed when
@@ -930,9 +1141,11 @@ func (s *Server) handleDirectTCPIPRequest(ctx context.Context, ccx *sshutils.Con
 	scx.DstAddr = net.JoinHostPort(req.Host, strconv.Itoa(int(req.Port)))
 	defer scx.Close()
 
-	// Check if the role allows port forwarding for this user.
-	err = s.authHandlers.CheckPortForward(scx.DstAddr, scx)
-	if err != nil {
+	channel = scx.TrackActivity(channel)
+
+	// Bail out now if TCP port forwarding is not allowed for this node/user/role
+	// combo
+	if err = s.canPortForward(scx, channel); err != nil {
 		writeStderr(channel, err.Error())
 		return
 	}
@@ -995,6 +1208,7 @@ func (s *Server) handleDirectTCPIPRequest(ctx context.Context, ccx *sshutils.Con
 	}()
 
 	// Block until copy is complete and the child process is done executing.
+Loop:
 	for i := 0; i < 2; i++ {
 		select {
 		case err := <-errorCh:
@@ -1002,9 +1216,9 @@ func (s *Server) handleDirectTCPIPRequest(ctx context.Context, ccx *sshutils.Con
 				log.Warnf("Connection problem in \"direct-tcpip\" channel: %v %T.", trace.DebugReport(err), err)
 			}
 		case <-ctx.Done():
-			break
+			break Loop
 		case <-s.ctx.Done():
-			break
+			break Loop
 		}
 	}
 	err = cmd.Wait()
@@ -1014,14 +1228,27 @@ func (s *Server) handleDirectTCPIPRequest(ctx context.Context, ccx *sshutils.Con
 	}
 
 	// Emit a port forwarding event.
-	s.EmitAuditEvent(events.PortForward, events.EventFields{
-		events.PortForwardAddr:    scx.DstAddr,
-		events.PortForwardSuccess: true,
-		events.EventLogin:         scx.Identity.Login,
-		events.EventUser:          scx.Identity.TeleportUser,
-		events.LocalAddr:          scx.ServerConn.LocalAddr().String(),
-		events.RemoteAddr:         scx.ServerConn.RemoteAddr().String(),
-	})
+	if err := s.EmitAuditEvent(s.ctx, &apievents.PortForward{
+		Metadata: apievents.Metadata{
+			Type: events.PortForwardEvent,
+			Code: events.PortForwardCode,
+		},
+		UserMetadata: apievents.UserMetadata{
+			Login:        scx.Identity.Login,
+			User:         scx.Identity.TeleportUser,
+			Impersonator: scx.Identity.Impersonator,
+		},
+		ConnectionMetadata: apievents.ConnectionMetadata{
+			LocalAddr:  scx.ServerConn.LocalAddr().String(),
+			RemoteAddr: scx.ServerConn.RemoteAddr().String(),
+		},
+		Addr: scx.DstAddr,
+		Status: apievents.Status{
+			Success: true,
+		},
+	}); err != nil {
+		log.WithError(err).Warn("Failed to emit port forward event.")
+	}
 }
 
 // handleSessionRequests handles out of band session requests once the session
@@ -1041,11 +1268,18 @@ func (s *Server) handleSessionRequests(ctx context.Context, ccx *sshutils.Connec
 	scx.ChannelType = teleport.ChanSession
 	defer scx.Close()
 
-	clusterConfig, err := s.GetAccessPoint().GetClusterConfig()
+	ch = scx.TrackActivity(ch)
+
+	netConfig, err := s.GetAccessPoint().GetClusterNetworkingConfig(ctx)
 	if err != nil {
-		log.Errorf("Unable to fetch cluster config: %v.", err)
-		writeStderr(ch, "Unable to fetch cluster configuration.")
+		log.Errorf("Unable to fetch cluster networking config: %v.", err)
+		writeStderr(ch, "Unable to fetch cluster networking configuration.")
 		return
+	}
+
+	if scx.Monitor != nil {
+		scx.Monitor.IdleTimeoutMessage = netConfig.GetClientIdleTimeoutMessage()
+		scx.Monitor.MessageWriter = &stderrWriter{channel: ch}
 	}
 
 	// The keep-alive loop will keep pinging the remote server and after it has
@@ -1055,8 +1289,8 @@ func (s *Server) handleSessionRequests(ctx context.Context, ccx *sshutils.Connec
 		Conns: []srv.RequestSender{
 			scx.ServerConn,
 		},
-		Interval:     clusterConfig.GetKeepAliveInterval(),
-		MaxCount:     clusterConfig.GetKeepAliveCountMax(),
+		Interval:     netConfig.GetKeepAliveInterval(),
+		MaxCount:     netConfig.GetKeepAliveCountMax(),
 		CloseContext: ctx,
 		CloseCancel:  scx.CancelFunc(),
 	})
@@ -1136,7 +1370,7 @@ func (s *Server) dispatch(ch ssh.Channel, req *ssh.Request, ctx *srv.ServerConte
 			// recording proxy mode.
 			err := s.handleAgentForwardProxy(req, ctx)
 			if err != nil {
-				log.Debug(err)
+				log.Warn(err)
 			}
 			return nil
 		default:
@@ -1173,7 +1407,7 @@ func (s *Server) dispatch(ch ssh.Channel, req *ssh.Request, ctx *srv.ServerConte
 		// processing requests.
 		err := s.handleAgentForwardNode(req, ctx)
 		if err != nil {
-			log.Debug(err)
+			log.Warn(err)
 		}
 		return nil
 	default:
@@ -1212,7 +1446,7 @@ func (s *Server) handleAgentForwardNode(req *ssh.Request, ctx *srv.ServerContext
 func (s *Server) handleAgentForwardProxy(req *ssh.Request, ctx *srv.ServerContext) error {
 	// Forwarding an agent to the proxy is only supported when the proxy is in
 	// recording mode.
-	if ctx.ClusterConfig.GetSessionRecording() != services.RecordAtProxy {
+	if services.IsRecordAtProxy(ctx.SessionRecordingConfig.GetMode()) == false {
 		return trace.BadParameter("agent forwarding to proxy only supported in recording mode")
 	}
 
@@ -1288,7 +1522,7 @@ func (s *Server) handleRecordingProxy(req *ssh.Request) {
 
 	if req.WantReply {
 		// get the cluster config, if we can't get it, reply false
-		clusterConfig, err := s.authService.GetClusterConfig()
+		recConfig, err := s.authService.GetSessionRecordingConfig(s.ctx)
 		if err != nil {
 			err := req.Reply(false, nil)
 			if err != nil {
@@ -1299,7 +1533,7 @@ func (s *Server) handleRecordingProxy(req *ssh.Request) {
 
 		// reply true that we were able to process the message and reply with a
 		// bool if we are in recording mode or not
-		recordingProxy = clusterConfig.GetSessionRecording() == services.RecordAtProxy
+		recordingProxy = services.IsRecordAtProxy(recConfig.GetMode())
 		err = req.Reply(true, []byte(strconv.FormatBool(recordingProxy)))
 		if err != nil {
 			log.Warnf("Unable to respond to global request (%v, %v): %v: %v", req.Type, req.WantReply, recordingProxy, err)
@@ -1332,10 +1566,12 @@ func (s *Server) handleProxyJump(ctx context.Context, ccx *sshutils.ConnectionCo
 	scx.AddCloser(ch)
 	defer scx.Close()
 
-	clusterConfig, err := s.GetAccessPoint().GetClusterConfig()
+	ch = scx.TrackActivity(ch)
+
+	recConfig, err := s.GetAccessPoint().GetSessionRecordingConfig(ctx)
 	if err != nil {
-		log.Errorf("Unable to fetch cluster config: %v.", err)
-		writeStderr(ch, "Unable to fetch cluster configuration.")
+		log.Errorf("Unable to fetch session recording config: %v.", err)
+		writeStderr(ch, "Unable to fetch session recording configuration.")
 		return
 	}
 
@@ -1364,13 +1600,20 @@ func (s *Server) handleProxyJump(ctx context.Context, ccx *sshutils.ConnectionCo
 	// "out of band", before SSH client actually asks for it
 	// which is a hack, but the only way we can think of making it work,
 	// ideas are appreciated.
-	if clusterConfig.GetSessionRecording() == services.RecordAtProxy {
+	if services.IsRecordAtProxy(recConfig.GetMode()) {
 		err = s.handleAgentForwardProxy(&ssh.Request{}, scx)
 		if err != nil {
 			log.Warningf("Failed to request agent in recording mode: %v", err)
 			writeStderr(ch, "Failed to request agent")
 			return
 		}
+	}
+
+	netConfig, err := s.GetAccessPoint().GetClusterNetworkingConfig(ctx)
+	if err != nil {
+		log.Errorf("Unable to fetch cluster networking config: %v.", err)
+		writeStderr(ch, "Unable to fetch cluster networking configuration.")
+		return
 	}
 
 	// The keep-alive loop will keep pinging the remote server and after it has
@@ -1380,8 +1623,8 @@ func (s *Server) handleProxyJump(ctx context.Context, ccx *sshutils.ConnectionCo
 		Conns: []srv.RequestSender{
 			scx.ServerConn,
 		},
-		Interval:     clusterConfig.GetKeepAliveInterval(),
-		MaxCount:     clusterConfig.GetKeepAliveCountMax(),
+		Interval:     netConfig.GetKeepAliveInterval(),
+		MaxCount:     netConfig.GetKeepAliveCountMax(),
 		CloseContext: ctx,
 		CloseCancel:  scx.CancelFunc(),
 	})
@@ -1418,7 +1661,11 @@ func (s *Server) handleProxyJump(ctx context.Context, ccx *sshutils.ConnectionCo
 
 func (s *Server) replyError(ch ssh.Channel, req *ssh.Request, err error) {
 	log.Error(err)
-	message := trace.UserMessage(err)
+	// Terminate the error with a newline when writing to remote channel's
+	// stderr so the output does not mix with the rest of the output if the remote
+	// side is not doing additional formatting for extended data.
+	// See github.com/gravitational/teleport/issues/4542
+	message := utils.FormatErrorWithNewline(err)
 	writeStderr(ch, message)
 	if req.WantReply {
 		if err := req.Reply(false, []byte(message)); err != nil {
@@ -1442,7 +1689,7 @@ func (s *Server) parseSubsystemRequest(req *ssh.Request, ctx *srv.ServerContext)
 }
 
 func writeStderr(ch ssh.Channel, msg string) {
-	if _, err := fmt.Fprint(ch.Stderr(), msg); err != nil {
+	if _, err := io.WriteString(ch.Stderr(), msg); err != nil {
 		log.Warnf("Failed writing to ssh.Channel.Stderr(): %v", err)
 	}
 }

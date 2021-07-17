@@ -21,7 +21,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/srv"
 
 	"github.com/gravitational/trace"
@@ -52,12 +52,15 @@ func (t *proxySitesSubsys) Wait() error {
 // service.Site structures, and writes it serialized as JSON back to the SSH client
 func (t *proxySitesSubsys) Start(sconn *ssh.ServerConn, ch ssh.Channel, req *ssh.Request, ctx *srv.ServerContext) error {
 	log.Debugf("proxysites.start(%v)", ctx)
-	remoteSites := t.srv.proxyTun.GetSites()
+	remoteSites, err := t.srv.tunnelWithRoles(ctx).GetSites()
+	if err != nil {
+		return trace.Wrap(err)
+	}
 
 	// build an arary of services.Site structures:
-	retval := make([]services.Site, 0, len(remoteSites))
+	retval := make([]types.Site, 0, len(remoteSites))
 	for _, s := range remoteSites {
-		retval = append(retval, services.Site{
+		retval = append(retval, types.Site{
 			Name:          s.GetName(),
 			Status:        s.GetStatus(),
 			LastConnected: s.GetLastConnected(),

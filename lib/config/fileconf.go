@@ -1,5 +1,5 @@
 /*
-Copyright 2015-2018 Gravitational, Inc.
+Copyright 2015-2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,17 +22,25 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/types"
+	apiutils "github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/api/utils/tlsutils"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/bpf"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/pam"
+	restricted "github.com/gravitational/teleport/lib/restrictedsession"
 	"github.com/gravitational/teleport/lib/service"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
@@ -40,129 +48,6 @@ import (
 	"github.com/gravitational/trace"
 
 	"gopkg.in/yaml.v2"
-)
-
-const (
-	// randomTokenLenBytes is the length of random token generated for the example config
-	randomTokenLenBytes = 24
-)
-
-var (
-	// all possible valid YAML config keys
-	// true  = has sub-keys
-	// false = does not have sub-keys (a leaf)
-	validKeys = map[string]bool{
-		"proxy_protocol":          false,
-		"namespace":               true,
-		"cluster_name":            true,
-		"trusted_clusters":        true,
-		"pid_file":                true,
-		"cert_file":               true,
-		"private_key_file":        true,
-		"cert":                    true,
-		"private_key":             true,
-		"checking_keys":           true,
-		"checking_key_files":      true,
-		"signing_keys":            true,
-		"signing_key_files":       true,
-		"allowed_logins":          true,
-		"teleport":                true,
-		"enabled":                 true,
-		"ssh_service":             true,
-		"proxy_service":           true,
-		"auth_service":            true,
-		"kubernetes":              true,
-		"kubeconfig_file":         true,
-		"auth_token":              true,
-		"auth_servers":            true,
-		"domain_name":             true,
-		"storage":                 false,
-		"nodename":                true,
-		"log":                     true,
-		"period":                  true,
-		"connection_limits":       true,
-		"max_connections":         true,
-		"max_users":               true,
-		"rates":                   true,
-		"commands":                true,
-		"labels":                  false,
-		"output":                  true,
-		"severity":                true,
-		"role":                    true,
-		"name":                    true,
-		"type":                    true,
-		"data_dir":                true,
-		"web_listen_addr":         true,
-		"tunnel_listen_addr":      true,
-		"ssh_listen_addr":         true,
-		"listen_addr":             true,
-		"ca_cert_file":            false,
-		"https_key_file":          true,
-		"https_cert_file":         true,
-		"advertise_ip":            true,
-		"authorities":             true,
-		"keys":                    true,
-		"reverse_tunnels":         true,
-		"addresses":               true,
-		"oidc_connectors":         true,
-		"id":                      true,
-		"issuer_url":              true,
-		"client_id":               true,
-		"client_secret":           true,
-		"redirect_url":            true,
-		"acr_values":              true,
-		"provider":                true,
-		"tokens":                  true,
-		"region":                  true,
-		"table_name":              true,
-		"access_key":              true,
-		"secret_key":              true,
-		"u2f":                     true,
-		"app_id":                  true,
-		"facets":                  true,
-		"authentication":          true,
-		"second_factor":           false,
-		"oidc":                    true,
-		"display":                 false,
-		"scope":                   false,
-		"claims_to_roles":         true,
-		"dynamic_config":          false,
-		"seed_config":             false,
-		"public_addr":             false,
-		"ssh_public_addr":         false,
-		"tunnel_public_addr":      false,
-		"cache":                   true,
-		"ttl":                     false,
-		"issuer":                  false,
-		"permit_user_env":         false,
-		"ciphers":                 false,
-		"kex_algos":               false,
-		"mac_algos":               false,
-		"ca_signature_algo":       false,
-		"connector_name":          false,
-		"session_recording":       false,
-		"read_capacity_units":     false,
-		"write_capacity_units":    false,
-		"license_file":            false,
-		"proxy_checks_host_keys":  false,
-		"audit_table_name":        false,
-		"audit_sessions_uri":      false,
-		"audit_events_uri":        false,
-		"pam":                     true,
-		"service_name":            false,
-		"client_idle_timeout":     false,
-		"disconnect_expired_cert": false,
-		"ciphersuites":            false,
-		"ca_pin":                  false,
-		"keep_alive_interval":     false,
-		"keep_alive_count_max":    false,
-		"local_auth":              false,
-		"enhanced_recording":      false,
-		"command_buffer_size":     false,
-		"disk_buffer_size":        false,
-		"network_buffer_size":     false,
-		"cgroup_path":             false,
-	}
 )
 
 var validCASigAlgos = []string{
@@ -180,9 +65,16 @@ type FileConfig struct {
 	Auth   Auth  `yaml:"auth_service,omitempty"`
 	SSH    SSH   `yaml:"ssh_service,omitempty"`
 	Proxy  Proxy `yaml:"proxy_service,omitempty"`
-}
+	Kube   Kube  `yaml:"kubernetes_service,omitempty"`
 
-type YAMLMap map[interface{}]interface{}
+	// Apps is the "app_service" section in Teleport file configuration which
+	// defines application access configuration.
+	Apps Apps `yaml:"app_service,omitempty"`
+
+	// Databases is the "db_service" section in Teleport configuration file
+	// that defined database access configuration.
+	Databases Databases `yaml:"db_service,omitempty"`
+}
 
 // ReadFromFile reads Teleport configuration from a file. Currently only YAML
 // format is supported
@@ -200,7 +92,7 @@ func ReadFromString(configString string) (*FileConfig, error) {
 	data, err := base64.StdEncoding.DecodeString(configString)
 	if err != nil {
 		return nil, trace.BadParameter(
-			"confiugraion should be base64 encoded: %v", err)
+			"configuration should be base64 encoded: %v", err)
 	}
 	return ReadConfig(bytes.NewBuffer(data))
 }
@@ -213,101 +105,82 @@ func ReadConfig(reader io.Reader) (*FileConfig, error) {
 		return nil, trace.Wrap(err, "failed reading Teleport configuration")
 	}
 	var fc FileConfig
-	if err = yaml.Unmarshal(bytes, &fc); err != nil {
+
+	if err := yaml.UnmarshalStrict(bytes, &fc); err != nil {
+		// Remove all newlines in the YAML error, to avoid escaping when printing.
+		return nil, trace.BadParameter("failed parsing the config file: %s", strings.Replace(err.Error(), "\n", "", -1))
+	}
+	if err := fc.CheckAndSetDefaults(); err != nil {
 		return nil, trace.BadParameter("failed to parse Teleport configuration: %v", err)
-	}
-	// don't start Teleport with invalid ciphers, kex algorithms, or mac algorithms.
-	err = fc.Check()
-	if err != nil {
-		return nil, trace.BadParameter("failed to parse Teleport configuration: %v", err)
-	}
-	// now check for unknown (misspelled) config keys:
-	var validateKeys func(m YAMLMap) error
-	validateKeys = func(m YAMLMap) error {
-		var recursive, ok bool
-		var key string
-		for k, v := range m {
-			if key, ok = k.(string); ok {
-				if recursive, ok = validKeys[key]; !ok {
-					return trace.BadParameter("unrecognized configuration key: '%v'", key)
-				}
-				if recursive {
-					if m2, ok := v.(YAMLMap); ok {
-						if err := validateKeys(m2); err != nil {
-							return err
-						}
-					}
-				}
-			}
-		}
-		return nil
-	}
-	// validate configuration keys:
-	var tmp YAMLMap
-	if err = yaml.Unmarshal(bytes, &tmp); err != nil {
-		return nil, trace.BadParameter("error parsing YAML config")
-	}
-	if err = validateKeys(tmp); err != nil {
-		return nil, trace.Wrap(err)
 	}
 	return &fc, nil
 }
 
-// MakeSampleFileConfig returns a sample config structure populated by defaults,
-// useful to generate sample configuration files
-func MakeSampleFileConfig() (fc *FileConfig, err error) {
-	conf := service.MakeDefaultConfig()
+// SampleFlags specifies standalone configuration parameters
+type SampleFlags struct {
+	// ClusterName is an optional cluster name
+	ClusterName string
+	// LicensePath adds license path to config
+	LicensePath string
+	// ACMEEmail is acme email
+	ACMEEmail string
+	// ACMEEnabled turns on ACME
+	ACMEEnabled bool
+}
 
-	// generate a secure random token
-	randomJoinToken, err := utils.CryptoRandomHex(randomTokenLenBytes)
-	if err != nil {
-		return nil, trace.Wrap(err)
+// MakeSampleFileConfig returns a sample config to start
+// a standalone server
+func MakeSampleFileConfig(flags SampleFlags) (fc *FileConfig, err error) {
+	if flags.ACMEEnabled && flags.ClusterName == "" {
+		return nil, trace.BadParameter("please provide --cluster-name when using acme, for example --cluster-name=example.com")
 	}
 
-	// sample global config:
+	conf := service.MakeDefaultConfig()
+
 	var g Global
 	g.NodeName = conf.Hostname
-	g.AuthToken = randomJoinToken
-	g.CAPin = "sha256:ca-pin-hash-goes-here"
 	g.Logger.Output = "stderr"
 	g.Logger.Severity = "INFO"
-	g.AuthServers = []string{fmt.Sprintf("%s:%d", defaults.Localhost, defaults.AuthListenPort)}
+	g.Logger.Format.Output = "text"
 	g.DataDir = defaults.DataDir
 
-	// sample SSH config:
+	// SSH config:
 	var s SSH
 	s.EnabledFlag = "yes"
 	s.ListenAddress = conf.SSH.Addr.Addr
 	s.Commands = []CommandLabel{
 		{
 			Name:    "hostname",
-			Command: []string{"/usr/bin/hostname"},
+			Command: []string{"hostname"},
 			Period:  time.Minute,
-		},
-		{
-			Name:    "arch",
-			Command: []string{"/usr/bin/uname", "-p"},
-			Period:  time.Hour,
 		},
 	}
 	s.Labels = map[string]string{
-		"db_type": "postgres",
-		"db_role": "master",
+		"env": "example",
 	}
 
-	// sample Auth config:
+	// Auth config:
 	var a Auth
 	a.ListenAddress = conf.Auth.SSHAddr.Addr
+	a.ClusterName = ClusterName(flags.ClusterName)
 	a.EnabledFlag = "yes"
-	a.StaticTokens = []StaticToken{StaticToken(fmt.Sprintf("proxy,node:%s", randomJoinToken))}
-	a.LicenseFile = "/path/to/license-if-using-teleport-enterprise.pem"
+
+	if flags.LicensePath != "" {
+		a.LicenseFile = flags.LicensePath
+	}
 
 	// sample proxy config:
 	var p Proxy
 	p.EnabledFlag = "yes"
 	p.ListenAddress = conf.Proxy.SSHAddr.Addr
-	p.WebAddr = conf.Proxy.WebAddr.Addr
-	p.TunAddr = conf.Proxy.ReverseTunnelListenAddr.Addr
+	if flags.ACMEEnabled {
+		p.ACME.EnabledFlag = "yes"
+		p.ACME.Email = flags.ACMEEmail
+		// ACME uses TLS-ALPN-01 challenge that requires port 443
+		// https://letsencrypt.org/docs/challenge-types/#tls-alpn-01
+		p.PublicAddr = apiutils.Strings{net.JoinHostPort(flags.ClusterName, fmt.Sprintf("%d", teleport.StandardHTTPSPort))}
+		p.WebAddr = fmt.Sprintf(":%d", teleport.StandardHTTPSPort)
+	}
 
 	fc = &FileConfig{
 		Global: g,
@@ -327,29 +200,34 @@ func (conf *FileConfig) DebugDumpToYAML() string {
 	return string(bytes)
 }
 
-// Check ensures that the ciphers, kex algorithms, and mac algorithms set
-// are supported by golang.org/x/crypto/ssh. This ensures we don't start
-// Teleport with invalid configuration.
-func (conf *FileConfig) Check() error {
+// CheckAndSetDefaults sets defaults and ensures that the ciphers, kex
+// algorithms, and mac algorithms set are supported by golang.org/x/crypto/ssh.
+// This ensures we don't start Teleport with invalid configuration.
+func (conf *FileConfig) CheckAndSetDefaults() error {
+	conf.Auth.defaultEnabled = true
+	conf.Proxy.defaultEnabled = true
+	conf.SSH.defaultEnabled = true
+	conf.Kube.defaultEnabled = false
+
 	var sc ssh.Config
 	sc.SetDefaults()
 
 	for _, c := range conf.Ciphers {
-		if !utils.SliceContainsStr(sc.Ciphers, c) {
+		if !apiutils.SliceContainsStr(sc.Ciphers, c) {
 			return trace.BadParameter("cipher algorithm %q is not supported; supported algorithms: %q", c, sc.Ciphers)
 		}
 	}
 	for _, k := range conf.KEXAlgorithms {
-		if !utils.SliceContainsStr(sc.KeyExchanges, k) {
+		if !apiutils.SliceContainsStr(sc.KeyExchanges, k) {
 			return trace.BadParameter("KEX algorithm %q is not supported; supported algorithms: %q", k, sc.KeyExchanges)
 		}
 	}
 	for _, m := range conf.MACAlgorithms {
-		if !utils.SliceContainsStr(sc.MACs, m) {
+		if !apiutils.SliceContainsStr(sc.MACs, m) {
 			return trace.BadParameter("MAC algorithm %q is not supported; supported algorithms: %q", m, sc.MACs)
 		}
 	}
-	if conf.CASignatureAlgorithm != nil && !utils.SliceContainsStr(validCASigAlgos, *conf.CASignatureAlgorithm) {
+	if conf.CASignatureAlgorithm != nil && !apiutils.SliceContainsStr(validCASigAlgos, *conf.CASignatureAlgorithm) {
 		return trace.BadParameter("CA signature algorithm %q is not supported; supported algorithms: %q", *conf.CASignatureAlgorithm, validCASigAlgos)
 	}
 
@@ -370,13 +248,63 @@ type ConnectionLimits struct {
 	Rates          []ConnectionRate `yaml:"rates,omitempty"`
 }
 
+// LegacyLog contains the old format of the 'format' field
+// It is kept here for backwards compatibility and should always be maintained
+// The custom yaml unmarshaler should automatically convert it into the new
+// expected format.
+type LegacyLog struct {
+	// Output defines where logs go. It can be one of the following: "stderr", "stdout" or
+	// a path to a log file
+	Output string `yaml:"output,omitempty"`
+	// Severity defines how verbose the log will be. Possible values are "error", "info", "warn"
+	Severity string `yaml:"severity,omitempty"`
+	// Format lists the output fields from KnownFormatFields. Example format: [timestamp, component, caller]
+	Format []string `yaml:"format,omitempty"`
+}
+
 // Log configures teleport logging
 type Log struct {
 	// Output defines where logs go. It can be one of the following: "stderr", "stdout" or
 	// a path to a log file
 	Output string `yaml:"output,omitempty"`
-	// Severity defines how verbose the log will be. Possible valus are "error", "info", "warn"
+	// Severity defines how verbose the log will be. Possible values are "error", "info", "warn"
 	Severity string `yaml:"severity,omitempty"`
+	// Format defines the logs output format and extra fields
+	Format LogFormat `yaml:"format,omitempty"`
+}
+
+// LogFormat specifies the logs output format and extra fields
+type LogFormat struct {
+	// Output defines the output format. Possible values are 'text' and 'json'.
+	Output string `yaml:"output,omitempty"`
+	// ExtraFields lists the output fields from KnownFormatFields. Example format: [timestamp, component, caller]
+	ExtraFields []string `yaml:"extra_fields,omitempty"`
+}
+
+func (l *Log) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	// the next two lines are needed because of an infinite loop issue
+	// https://github.com/go-yaml/yaml/issues/107
+	type logYAML Log
+	log := (*logYAML)(l)
+	if err := unmarshal(log); err != nil {
+		if _, ok := err.(*yaml.TypeError); !ok {
+			return err
+		}
+
+		var legacyLog LegacyLog
+		if lerr := unmarshal(&legacyLog); lerr != nil {
+			// return the original unmarshal error
+			return err
+		}
+
+		l.Output = legacyLog.Output
+		l.Severity = legacyLog.Severity
+		l.Format.Output = "text"
+		l.Format.ExtraFields = legacyLog.Format
+		return nil
+	}
+
+	return nil
 }
 
 // Global is 'teleport' (global) section of the config file
@@ -416,6 +344,9 @@ type Global struct {
 
 	// CAPin is the SKPI hash of the CA used to verify the Auth Server.
 	CAPin string `yaml:"ca_pin"`
+
+	// DiagAddr is the address to expose a diagnostics HTTP endpoint.
+	DiagAddr string `yaml:"diag_addr"`
 }
 
 // CachePolicy is used to control  local cache
@@ -441,7 +372,7 @@ func (c *CachePolicy) Enabled() bool {
 	if c.EnabledFlag == "" {
 		return true
 	}
-	enabled, _ := utils.ParseBool(c.EnabledFlag)
+	enabled, _ := apiutils.ParseBool(c.EnabledFlag)
 	return enabled
 }
 
@@ -474,8 +405,9 @@ func (c *CachePolicy) Parse() (*service.CachePolicy, error) {
 
 // Service is a common configuration of a teleport service
 type Service struct {
-	EnabledFlag   string `yaml:"enabled,omitempty"`
-	ListenAddress string `yaml:"listen_addr,omitempty"`
+	defaultEnabled bool
+	EnabledFlag    string `yaml:"enabled,omitempty"`
+	ListenAddress  string `yaml:"listen_addr,omitempty"`
 }
 
 // Configured determines if a given "_service" section has been specified
@@ -485,10 +417,10 @@ func (s *Service) Configured() bool {
 
 // Enabled determines if a given "_service" section has been set to 'true'
 func (s *Service) Enabled() bool {
-	if s.EnabledFlag == "" {
-		return true
+	if !s.Configured() {
+		return s.defaultEnabled
 	}
-	v, err := utils.ParseBool(s.EnabledFlag)
+	v, err := apiutils.ParseBool(s.EnabledFlag)
 	if err != nil {
 		return false
 	}
@@ -497,17 +429,19 @@ func (s *Service) Enabled() bool {
 
 // Disabled returns 'true' if the service has been deliberately turned off
 func (s *Service) Disabled() bool {
-	return s.Configured() && !s.Enabled()
+	if !s.Configured() {
+		return !s.defaultEnabled
+	}
+	return !s.Enabled()
 }
 
 // Auth is 'auth_service' section of the config file
 type Auth struct {
 	Service `yaml:",inline"`
 
-	// ProxyProtocol turns on support for HAProxy proxy protocol
-	// this is the option that has be turned on only by administrator,
-	// as only admin knows whether service is in front of trusted load balancer
-	// or not.
+	// ProxyProtocol enables support for HAProxy proxy protocol version 1 when it is turned 'on'.
+	// Verify whether the service is in front of a trusted load balancer.
+	// The default value is 'on'.
 	ProxyProtocol string `yaml:"proxy_protocol,omitempty"`
 
 	// ClusterName is the name of the CA who manages this cluster
@@ -529,15 +463,11 @@ type Auth struct {
 
 	// ProxyChecksHostKeys is used when the proxy is in recording mode and
 	// determines if the proxy will check the host key of the client or not.
-	ProxyChecksHostKeys string `yaml:"proxy_checks_host_keys,omitempty"`
+	ProxyChecksHostKeys *types.BoolOption `yaml:"proxy_checks_host_keys,omitempty"`
 
 	// LicenseFile is a path to the license file. The path can be either absolute or
 	// relative to the global data dir
 	LicenseFile string `yaml:"license_file,omitempty"`
-
-	// FOR INTERNAL USE:
-	// Authorities : 3rd party certificate authorities (CAs) this auth service trusts.
-	Authorities []Authority `yaml:"authorities,omitempty"`
 
 	// FOR INTERNAL USE:
 	// ReverseTunnels is a list of SSH tunnels to 3rd party proxy services (used to talk
@@ -553,10 +483,6 @@ type Auth struct {
 	// Deprecated: Remove in Teleport 2.4.1.
 	OIDCConnectors []OIDCConnector `yaml:"oidc_connectors,omitempty"`
 
-	// Configuration for "universal 2nd factor"
-	// Deprecated: Remove in Teleport 2.4.1.
-	U2F U2F `yaml:"u2f,omitempty"`
-
 	// DynamicConfig determines when file configuration is pushed to the backend. Setting
 	// it here overrides defaults.
 	// Deprecated: Remove in Teleport 2.4.1.
@@ -564,14 +490,18 @@ type Auth struct {
 
 	// PublicAddr sets SSH host principals and TLS DNS names to auth
 	// server certificates
-	PublicAddr utils.Strings `yaml:"public_addr,omitempty"`
+	PublicAddr apiutils.Strings `yaml:"public_addr,omitempty"`
 
 	// ClientIdleTimeout sets global cluster default setting for client idle timeouts
-	ClientIdleTimeout services.Duration `yaml:"client_idle_timeout,omitempty"`
+	ClientIdleTimeout types.Duration `yaml:"client_idle_timeout,omitempty"`
 
 	// DisconnectExpiredCert provides disconnect expired certificate setting -
 	// if true, connections with expired client certificates will get disconnected
-	DisconnectExpiredCert services.Bool `yaml:"disconnect_expired_cert,omitempty"`
+	DisconnectExpiredCert *types.BoolOption `yaml:"disconnect_expired_cert,omitempty"`
+
+	// SessionControlTimeout specifies the maximum amount of time a node can be out
+	// of contact with the auth server before it starts terminating controlled sessions.
+	SessionControlTimeout types.Duration `yaml:"session_control_timeout,omitempty"`
 
 	// KubeconfigFile is an optional path to kubeconfig file,
 	// if specified, teleport will use API server address and
@@ -580,11 +510,16 @@ type Auth struct {
 
 	// KeepAliveInterval set the keep-alive interval for server to client
 	// connections.
-	KeepAliveInterval services.Duration `yaml:"keep_alive_interval,omitempty"`
+	KeepAliveInterval types.Duration `yaml:"keep_alive_interval,omitempty"`
 
 	// KeepAliveCountMax set the number of keep-alive messages that can be
 	// missed before the server disconnects the client.
 	KeepAliveCountMax int64 `yaml:"keep_alive_count_max,omitempty"`
+
+	// ClientIdleTimeoutMessage is sent to the client when the inactivity timeout
+	// expires. The empty string implies no message should be sent prior to
+	// disconnection.
+	ClientIdleTimeoutMessage string `yaml:"client_idle_timeout_message,omitempty"`
 }
 
 // TrustedCluster struct holds configuration values under "trusted_clusters" key
@@ -600,19 +535,19 @@ type TrustedCluster struct {
 
 type ClusterName string
 
-func (c ClusterName) Parse() (services.ClusterName, error) {
+func (c ClusterName) Parse() (types.ClusterName, error) {
 	if string(c) == "" {
 		return nil, nil
 	}
-	return services.NewClusterName(services.ClusterNameSpecV2{
+	return services.NewClusterNameWithRandomID(types.ClusterNameSpecV2{
 		ClusterName: string(c),
 	})
 }
 
 type StaticTokens []StaticToken
 
-func (t StaticTokens) Parse() (services.StaticTokens, error) {
-	staticTokens := []services.ProvisionTokenV1{}
+func (t StaticTokens) Parse() (types.StaticTokens, error) {
+	staticTokens := []types.ProvisionTokenV1{}
 
 	for _, token := range t {
 		st, err := token.Parse()
@@ -622,7 +557,7 @@ func (t StaticTokens) Parse() (services.StaticTokens, error) {
 		staticTokens = append(staticTokens, *st)
 	}
 
-	return services.NewStaticTokens(services.StaticTokensSpecV2{
+	return types.NewStaticTokens(types.StaticTokensSpecV2{
 		StaticTokens: staticTokens,
 	})
 }
@@ -632,13 +567,13 @@ type StaticToken string
 // Parse is applied to a string in "role,role,role:token" format. It breaks it
 // apart and constructs a services.ProvisionToken which contains the token,
 // role, and expiry (infinite).
-func (t StaticToken) Parse() (*services.ProvisionTokenV1, error) {
+func (t StaticToken) Parse() (*types.ProvisionTokenV1, error) {
 	parts := strings.Split(string(t), ":")
 	if len(parts) != 2 {
 		return nil, trace.BadParameter("invalid static token spec: %q", t)
 	}
 
-	roles, err := teleport.ParseRoles(parts[0])
+	roles, err := types.ParseTeleportRoles(parts[0])
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -648,7 +583,7 @@ func (t StaticToken) Parse() (*services.ProvisionTokenV1, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	return &services.ProvisionTokenV1{
+	return &types.ProvisionTokenV1{
 		Token:   token,
 		Roles:   roles,
 		Expires: time.Unix(0, 0).UTC(),
@@ -657,52 +592,70 @@ func (t StaticToken) Parse() (*services.ProvisionTokenV1, error) {
 
 // AuthenticationConfig describes the auth_service/authentication section of teleport.yaml
 type AuthenticationConfig struct {
-	Type          string                 `yaml:"type"`
-	SecondFactor  string                 `yaml:"second_factor,omitempty"`
-	ConnectorName string                 `yaml:"connector_name,omitempty"`
-	U2F           *UniversalSecondFactor `yaml:"u2f,omitempty"`
+	Type              string                     `yaml:"type"`
+	SecondFactor      constants.SecondFactorType `yaml:"second_factor,omitempty"`
+	ConnectorName     string                     `yaml:"connector_name,omitempty"`
+	U2F               *UniversalSecondFactor     `yaml:"u2f,omitempty"`
+	RequireSessionMFA bool                       `yaml:"require_session_mfa,omitempty"`
 
 	// LocalAuth controls if local authentication is allowed.
-	LocalAuth *services.Bool `yaml:"local_auth"`
+	LocalAuth *types.BoolOption `yaml:"local_auth"`
 }
 
-// Parse returns a services.AuthPreference (type, second factor, U2F).
-func (a *AuthenticationConfig) Parse() (services.AuthPreference, error) {
+// Parse returns a types.AuthPreference (type, second factor, U2F).
+func (a *AuthenticationConfig) Parse() (types.AuthPreference, error) {
 	var err error
 
-	var u services.U2F
+	var u types.U2F
 	if a.U2F != nil {
-		u = a.U2F.Parse()
+		u, err = a.U2F.Parse()
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 
-	ap, err := services.NewAuthPreference(services.AuthPreferenceSpecV2{
-		Type:          a.Type,
-		SecondFactor:  a.SecondFactor,
-		ConnectorName: a.ConnectorName,
-		U2F:           &u,
+	return types.NewAuthPreferenceFromConfigFile(types.AuthPreferenceSpecV2{
+		Type:              a.Type,
+		SecondFactor:      a.SecondFactor,
+		ConnectorName:     a.ConnectorName,
+		U2F:               &u,
+		RequireSessionMFA: a.RequireSessionMFA,
+		AllowLocalAuth:    a.LocalAuth,
 	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	// check to make sure the configuration is valid
-	err = ap.CheckAndSetDefaults()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return ap, nil
 }
 
 type UniversalSecondFactor struct {
-	AppID  string   `yaml:"app_id"`
-	Facets []string `yaml:"facets"`
+	AppID                string   `yaml:"app_id"`
+	Facets               []string `yaml:"facets"`
+	DeviceAttestationCAs []string `yaml:"device_attestation_cas"`
 }
 
-func (u *UniversalSecondFactor) Parse() services.U2F {
-	return services.U2F{
+func (u *UniversalSecondFactor) Parse() (types.U2F, error) {
+	res := types.U2F{
 		AppID:  u.AppID,
 		Facets: u.Facets,
 	}
+	// DeviceAttestationCAs are either file paths or raw PEM blocks.
+	for _, ca := range u.DeviceAttestationCAs {
+		_, parseErr := tlsutils.ParseCertificatePEM([]byte(ca))
+		if parseErr == nil {
+			// Successfully parsed as a PEM block, add it.
+			res.DeviceAttestationCAs = append(res.DeviceAttestationCAs, ca)
+			continue
+		}
+
+		// Try reading as a file and parsing that.
+		data, err := ioutil.ReadFile(ca)
+		if err != nil {
+			return res, trace.BadParameter("device_attestation_cas value %q is not a valid x509 certificate (%v) and can't be read as a file (%v)", ca, parseErr, err)
+		}
+
+		if _, err := tlsutils.ParseCertificatePEM(data); err != nil {
+			return res, trace.BadParameter("device_attestation_cas file %q contains an invalid x509 certificate: %v", ca, err)
+		}
+		res.DeviceAttestationCAs = append(res.DeviceAttestationCAs, string(data))
+	}
+	return res, nil
 }
 
 // SSH is 'ssh_service' section of the config file
@@ -714,10 +667,30 @@ type SSH struct {
 	PermitUserEnvironment bool              `yaml:"permit_user_env,omitempty"`
 	PAM                   *PAM              `yaml:"pam,omitempty"`
 	// PublicAddr sets SSH host principals for SSH service
-	PublicAddr utils.Strings `yaml:"public_addr,omitempty"`
+	PublicAddr apiutils.Strings `yaml:"public_addr,omitempty"`
 
 	// BPF is used to configure BPF-based auditing for this node.
 	BPF *BPF `yaml:"enhanced_recording,omitempty"`
+
+	// RestrictedSession is used to restrict access to kernel objects
+	RestrictedSession *RestrictedSession `yaml:"restricted_session,omitempty"`
+
+	// MaybeAllowTCPForwarding enables or disables TCP port forwarding. We're
+	// using a pointer-to-bool here because the system default is to allow TCP
+	// forwarding, we need to distinguish between an unset value and a false
+	// value so we can an override unset value with `true`.
+	//
+	// Don't read this value directly: call the AllowTCPForwarding method
+	// instead.
+	MaybeAllowTCPForwarding *bool `yaml:"port_forwarding,omitempty"`
+}
+
+// AllowTCPForwarding checks whether the config file allows TCP forwarding or not.
+func (ssh *SSH) AllowTCPForwarding() bool {
+	if ssh.MaybeAllowTCPForwarding == nil {
+		return true
+	}
+	return *ssh.MaybeAllowTCPForwarding
 }
 
 // CommandLabel is `command` section of `ssh_service` in the config file
@@ -734,6 +707,14 @@ type PAM struct {
 
 	// ServiceName is the name of the PAM policy to apply.
 	ServiceName string `yaml:"service_name"`
+
+	// UsePAMAuth specifies whether to trigger the "auth" PAM modules from the
+	// policy.
+	UsePAMAuth bool `yaml:"use_pam_auth"`
+
+	// Environment represents environment variables to pass to PAM.
+	// These may contain role-style interpolation syntax.
+	Environment map[string]string `yaml:"environment,omitempty"`
 }
 
 // Parse returns a parsed pam.Config.
@@ -742,10 +723,12 @@ func (p *PAM) Parse() *pam.Config {
 	if serviceName == "" {
 		serviceName = defaults.ServiceName
 	}
-	enabled, _ := utils.ParseBool(p.Enabled)
+	enabled, _ := apiutils.ParseBool(p.Enabled)
 	return &pam.Config{
 		Enabled:     enabled,
 		ServiceName: serviceName,
+		UsePAMAuth:  p.UsePAMAuth,
+		Environment: p.Environment,
 	}
 }
 
@@ -769,7 +752,7 @@ type BPF struct {
 
 // Parse will parse the enhanced session recording configuration.
 func (b *BPF) Parse() *bpf.Config {
-	enabled, _ := utils.ParseBool(b.Enabled)
+	enabled, _ := apiutils.ParseBool(b.Enabled)
 	return &bpf.Config{
 		Enabled:           enabled,
 		CommandBufferSize: b.CommandBufferSize,
@@ -777,6 +760,135 @@ func (b *BPF) Parse() *bpf.Config {
 		NetworkBufferSize: b.NetworkBufferSize,
 		CgroupPath:        b.CgroupPath,
 	}
+}
+
+// RestrictedSession is a configuration for limiting access to kernel objects
+type RestrictedSession struct {
+	// Enabled enables or disables enforcemant for this node.
+	Enabled string `yaml:"enabled"`
+
+	// EventsBufferSize is the size in bytes of the channel to report events
+	// from the kernel to us.
+	EventsBufferSize *int `yaml:"events_buffer_size,omitempty"`
+}
+
+// Parse will parse the enhanced session recording configuration.
+func (r *RestrictedSession) Parse() (*restricted.Config, error) {
+	enabled, err := apiutils.ParseBool(r.Enabled)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return &restricted.Config{
+		Enabled:          enabled,
+		EventsBufferSize: r.EventsBufferSize,
+	}, nil
+}
+
+// Databases represents the database proxy service configuration.
+//
+// In the configuration file this section will be "db_service".
+type Databases struct {
+	// Service contains common service fields.
+	Service `yaml:",inline"`
+	// Databases is a list of databases proxied by the service.
+	Databases []*Database `yaml:"databases"`
+}
+
+// Database represents a single database proxied by the service.
+type Database struct {
+	// Name is the name for the database proxy service.
+	Name string `yaml:"name"`
+	// Description is an optional free-form database description.
+	Description string `yaml:"description,omitempty"`
+	// Protocol is the database type e.g. postgres, mysql, etc.
+	Protocol string `yaml:"protocol"`
+	// URI is the database address to connect to.
+	URI string `yaml:"uri"`
+	// CACertFile is an optional path to the database CA certificate.
+	CACertFile string `yaml:"ca_cert_file,omitempty"`
+	// StaticLabels is a map of database static labels.
+	StaticLabels map[string]string `yaml:"static_labels,omitempty"`
+	// DynamicLabels is a list of database dynamic labels.
+	DynamicLabels []CommandLabel `yaml:"dynamic_labels,omitempty"`
+	// AWS contains AWS specific settings for RDS/Aurora/Redshift databases.
+	AWS DatabaseAWS `yaml:"aws"`
+	// GCP contains GCP specific settings for Cloud SQL databases.
+	GCP DatabaseGCP `yaml:"gcp"`
+}
+
+// DatabaseAWS contains AWS specific settings for RDS/Aurora databases.
+type DatabaseAWS struct {
+	// Region is a cloud region for RDS/Aurora database endpoint.
+	Region string `yaml:"region,omitempty"`
+	// Redshift contains Redshift specific settings.
+	Redshift DatabaseAWSRedshift `yaml:"redshift"`
+}
+
+// DatabaseAWSRedshift contains AWS Redshift specific settings.
+type DatabaseAWSRedshift struct {
+	// ClusterID is the Redshift cluster identifier.
+	ClusterID string `yaml:"cluster_id,omitempty"`
+}
+
+// DatabaseGCP contains GCP specific settings for Cloud SQL databases.
+type DatabaseGCP struct {
+	// ProjectID is the GCP project ID where the database is deployed.
+	ProjectID string `yaml:"project_id,omitempty"`
+	// InstanceID is the Cloud SQL database instance ID.
+	InstanceID string `yaml:"instance_id,omitempty"`
+}
+
+// Apps represents the configuration for the collection of applications this
+// service will start. In file configuration this would be the "app_service"
+// section.
+type Apps struct {
+	// Service contains fields common to all services like "enabled" and
+	// "listen_addr".
+	Service `yaml:",inline"`
+
+	// DebugApp turns on a header debugging application.
+	DebugApp bool `yaml:"debug_app"`
+
+	// Apps is a list of applications that will be run by this service.
+	Apps []*App `yaml:"apps"`
+}
+
+// App is the specific application that will be proxied by the application
+// service.
+type App struct {
+	// Name of the application.
+	Name string `yaml:"name"`
+
+	// Description is an optional free-form app description.
+	Description string `yaml:"description,omitempty"`
+
+	// URI is the internal address of the application.
+	URI string `yaml:"uri"`
+
+	// Public address of the application. This is the address users will access
+	// the application at.
+	PublicAddr string `yaml:"public_addr"`
+
+	// Labels is a map of static labels to apply to this application.
+	StaticLabels map[string]string `yaml:"labels,omitempty"`
+
+	// Commands is a list of dynamic labels to apply to this application.
+	DynamicLabels []CommandLabel `yaml:"commands,omitempty"`
+
+	// InsecureSkipVerify is used to skip validating the servers certificate.
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+
+	// Rewrite defines a block that is used to rewrite requests and responses.
+	Rewrite *Rewrite `yaml:"rewrite,omitempty"`
+}
+
+// Rewrite is a list of rewriting rules to apply to requests and responses.
+type Rewrite struct {
+	// Redirect is a list of hosts that should be rewritten to the public address.
+	Redirect []string `yaml:"redirect"`
+	// Headers is a list of extra headers to inject in the request.
+	Headers []string `yaml:"headers,omitempty"`
 }
 
 // Proxy is a `proxy_service` section of the config file:
@@ -796,35 +908,120 @@ type Proxy struct {
 	// as only admin knows whether service is in front of trusted load balancer
 	// or not.
 	ProxyProtocol string `yaml:"proxy_protocol,omitempty"`
-	// Kube configures kubernetes protocol support of the proxy
-	Kube Kube `yaml:"kubernetes,omitempty"`
+	// KubeProxy configures kubernetes protocol support of the proxy
+	Kube KubeProxy `yaml:"kubernetes,omitempty"`
+	// KubeAddr is a shorthand for enabling the Kubernetes endpoint without a
+	// local Kubernetes cluster.
+	KubeAddr string `yaml:"kube_listen_addr,omitempty"`
+	// KubePublicAddr is a public address of the kubernetes endpoint.
+	KubePublicAddr apiutils.Strings `yaml:"kube_public_addr,omitempty"`
 
 	// PublicAddr sets the hostport the proxy advertises for the HTTP endpoint.
 	// The hosts in PublicAddr are included in the list of host principals
 	// on the SSH certificate.
-	PublicAddr utils.Strings `yaml:"public_addr,omitempty"`
+	PublicAddr apiutils.Strings `yaml:"public_addr,omitempty"`
 
 	// SSHPublicAddr sets the hostport the proxy advertises for the SSH endpoint.
 	// The hosts in PublicAddr are included in the list of host principals
 	// on the SSH certificate.
-	SSHPublicAddr utils.Strings `yaml:"ssh_public_addr,omitempty"`
+	SSHPublicAddr apiutils.Strings `yaml:"ssh_public_addr,omitempty"`
 
 	// TunnelPublicAddr sets the hostport the proxy advertises for the tunnel
 	// endpoint. The hosts in PublicAddr are included in the list of host
 	// principals on the SSH certificate.
-	TunnelPublicAddr utils.Strings `yaml:"tunnel_public_addr,omitempty"`
+	TunnelPublicAddr apiutils.Strings `yaml:"tunnel_public_addr,omitempty"`
+
+	// KeyPairs is a list of x509 key pairs the proxy will load.
+	KeyPairs []KeyPair `yaml:"https_keypairs"`
+
+	// ACME configures ACME protocol support
+	ACME ACME `yaml:"acme"`
+
+	// MySQLAddr is MySQL proxy listen address.
+	MySQLAddr string `yaml:"mysql_listen_addr,omitempty"`
+	// MySQLPublicAddr is the hostport the proxy advertises for MySQL
+	// client connections.
+	MySQLPublicAddr apiutils.Strings `yaml:"mysql_public_addr,omitempty"`
+	// PostgresPublicAddr is the hostport the proxy advertises for Postgres
+	// client connections.
+	PostgresPublicAddr apiutils.Strings `yaml:"postgres_public_addr,omitempty"`
+}
+
+// ACME configures ACME protocol - automatic X.509 certificates
+type ACME struct {
+	// EnabledFlag is whether ACME should be enabled
+	EnabledFlag string `yaml:"enabled,omitempty"`
+	// Email is the email that will receive problems with certificate renewals
+	Email string `yaml:"email,omitempty"`
+	// URI is ACME server URI
+	URI string `yaml:"uri,omitempty"`
+}
+
+// Parse parses ACME section values
+func (a ACME) Parse() (*service.ACME, error) {
+	// ACME is disabled by default
+	out := service.ACME{}
+	if a.EnabledFlag == "" {
+		return &out, nil
+	}
+
+	var err error
+	out.Enabled, err = apiutils.ParseBool(a.EnabledFlag)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	out.Email = a.Email
+	if a.URI != "" {
+		_, err := url.Parse(a.URI)
+		if err != nil {
+			return nil, trace.Wrap(err, "acme.uri should be a valid URI, for example %v", acme.LetsEncryptURL)
+		}
+	}
+	out.URI = a.URI
+
+	return &out, nil
+}
+
+// KeyPair represents a path on disk to a private key and certificate.
+type KeyPair struct {
+	// PrivateKey is the path on disk to a PEM encoded private key,
+	PrivateKey string `yaml:"key_file"`
+	// Certificate is the path on disk to a PEM encoded x509 certificate.
+	Certificate string `yaml:"cert_file"`
+}
+
+// KubeProxy is a `kubernetes` section in `proxy_service`.
+type KubeProxy struct {
+	// Service is a generic service configuration section
+	Service `yaml:",inline"`
+	// PublicAddr is a publicly advertised address of the kubernetes proxy
+	PublicAddr apiutils.Strings `yaml:"public_addr,omitempty"`
+	// KubeconfigFile is an optional path to kubeconfig file,
+	// if specified, teleport will use API server address and
+	// trusted certificate authority information from it
+	KubeconfigFile string `yaml:"kubeconfig_file,omitempty"`
+	// ClusterName is the name of a kubernetes cluster this proxy is running
+	// in. If set, this proxy will handle kubernetes requests for the cluster.
+	ClusterName string `yaml:"cluster_name,omitempty"`
 }
 
 // Kube is a `kubernetes_service`
 type Kube struct {
 	// Service is a generic service configuration section
 	Service `yaml:",inline"`
-	// PublicAddr is a publicly advertised address of the kubernetes proxy
-	PublicAddr utils.Strings `yaml:"public_addr,omitempty"`
+	// PublicAddr is a publicly advertised address of the kubernetes service
+	PublicAddr apiutils.Strings `yaml:"public_addr,omitempty"`
 	// KubeconfigFile is an optional path to kubeconfig file,
 	// if specified, teleport will use API server address and
 	// trusted certificate authority information from it
 	KubeconfigFile string `yaml:"kubeconfig_file,omitempty"`
+	// KubeClusterName is the name of a kubernetes cluster this service is
+	// running in. If set, this proxy will handle kubernetes requests for the
+	// cluster.
+	KubeClusterName string `yaml:"kube_cluster_name,omitempty"`
+	// Static and dynamic labels for RBAC on kubernetes clusters.
+	StaticLabels  map[string]string `yaml:"labels,omitempty"`
+	DynamicLabels []CommandLabel    `yaml:"commands,omitempty"`
 }
 
 // ReverseTunnel is a SSH reverse tunnel maintained by one cluster's
@@ -835,7 +1032,7 @@ type ReverseTunnel struct {
 }
 
 // ConvertAndValidate returns validated services.ReverseTunnel or nil and error otherwize
-func (t *ReverseTunnel) ConvertAndValidate() (services.ReverseTunnel, error) {
+func (t *ReverseTunnel) ConvertAndValidate() (types.ReverseTunnel, error) {
 	for i := range t.Addresses {
 		addr, err := utils.ParseHostPortAddr(t.Addresses[i], defaults.SSHProxyTunnelListenPort)
 		if err != nil {
@@ -844,70 +1041,14 @@ func (t *ReverseTunnel) ConvertAndValidate() (services.ReverseTunnel, error) {
 		t.Addresses[i] = addr.String()
 	}
 
-	out := services.NewReverseTunnel(t.DomainName, t.Addresses)
-	if err := out.Check(); err != nil {
+	out, err := types.NewReverseTunnel(t.DomainName, t.Addresses)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if err := services.ValidateReverseTunnel(out); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return out, nil
-}
-
-// Authority is a host or user certificate authority that
-// can check and if it has private key stored as well, sign it too
-type Authority struct {
-	// Type is either user or host certificate authority
-	Type services.CertAuthType `yaml:"type"`
-	// DomainName identifies domain name this authority serves,
-	// for host authorities that means base hostname of all servers,
-	// for user authorities that means organization name
-	DomainName string `yaml:"domain_name"`
-	// Checkers is a list of SSH public keys that can be used to check
-	// certificate signatures in OpenSSH authorized keys format
-	CheckingKeys []string `yaml:"checking_keys"`
-	// CheckingKeyFiles is a list of files
-	CheckingKeyFiles []string `yaml:"checking_key_files"`
-	// SigningKeys is a list of PEM-encoded private keys used for signing
-	SigningKeys []string `yaml:"signing_keys"`
-	// SigningKeyFiles is a list of paths to PEM encoded private keys used for signing
-	SigningKeyFiles []string `yaml:"signing_key_files"`
-	// AllowedLogins is a list of allowed logins for users within
-	// this certificate authority
-	AllowedLogins []string `yaml:"allowed_logins"`
-}
-
-// Parse reads values and returns parsed CertAuthority
-func (a *Authority) Parse() (services.CertAuthority, services.Role, error) {
-	ca := &services.CertAuthorityV1{
-		AllowedLogins: a.AllowedLogins,
-		DomainName:    a.DomainName,
-		Type:          a.Type,
-	}
-
-	for _, path := range a.CheckingKeyFiles {
-		keyBytes, err := utils.ReadPath(path)
-		if err != nil {
-			return nil, nil, trace.Wrap(err)
-		}
-		ca.CheckingKeys = append(ca.CheckingKeys, keyBytes)
-	}
-
-	for _, val := range a.CheckingKeys {
-		ca.CheckingKeys = append(ca.CheckingKeys, []byte(val))
-	}
-
-	for _, path := range a.SigningKeyFiles {
-		keyBytes, err := utils.ReadPath(path)
-		if err != nil {
-			return nil, nil, trace.Wrap(err)
-		}
-		ca.SigningKeys = append(ca.SigningKeys, keyBytes)
-	}
-
-	for _, val := range a.SigningKeys {
-		ca.SigningKeys = append(ca.SigningKeys, []byte(val))
-	}
-
-	new, role := services.ConvertV1CertAuthority(ca)
-	return new, role, nil
 }
 
 // ClaimMapping is OIDC claim mapping that maps
@@ -919,9 +1060,6 @@ type ClaimMapping struct {
 	Value string `yaml:"value"`
 	// Roles is a list of teleport roles to match
 	Roles []string `yaml:"roles,omitempty"`
-	// RoleTemplate is a template for a role that will be filled
-	// with data from claims.
-	RoleTemplate *services.RoleV2 `yaml:"role_template,omitempty"`
 }
 
 // OIDCConnector specifies configuration fo Open ID Connect compatible external
@@ -955,70 +1093,42 @@ type OIDCConnector struct {
 }
 
 // Parse parses config struct into services connector and checks if it's valid
-func (o *OIDCConnector) Parse() (services.OIDCConnector, error) {
+func (o *OIDCConnector) Parse() (types.OIDCConnector, error) {
 	if o.Display == "" {
 		o.Display = o.ID
 	}
 
-	var mappings []services.ClaimMapping
+	var mappings []types.ClaimMapping
 	for _, c := range o.ClaimsToRoles {
 		var roles []string
 		if len(c.Roles) > 0 {
 			roles = append(roles, c.Roles...)
 		}
 
-		mappings = append(mappings, services.ClaimMapping{
-			Claim:        c.Claim,
-			Value:        c.Value,
-			Roles:        roles,
-			RoleTemplate: c.RoleTemplate,
+		mappings = append(mappings, types.ClaimMapping{
+			Claim: c.Claim,
+			Value: c.Value,
+			Roles: roles,
 		})
 	}
 
-	other := &services.OIDCConnectorV1{
-		ID:            o.ID,
-		Display:       o.Display,
+	v2, err := types.NewOIDCConnector(o.ID, types.OIDCConnectorSpecV2{
 		IssuerURL:     o.IssuerURL,
 		ClientID:      o.ClientID,
 		ClientSecret:  o.ClientSecret,
 		RedirectURL:   o.RedirectURL,
+		Display:       o.Display,
 		Scope:         o.Scope,
 		ClaimsToRoles: mappings,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
-	v2 := other.V2()
+
 	v2.SetACR(o.ACR)
 	v2.SetProvider(o.Provider)
-	if err := v2.Check(); err != nil {
+	if err := v2.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return v2, nil
-}
-
-type U2F struct {
-	AppID  string   `yaml:"app_id,omitempty"`
-	Facets []string `yaml:"facets,omitempty"`
-}
-
-// Parse parses values in the U2F configuration section and validates its content.
-func (u *U2F) Parse() (*services.U2F, error) {
-	// If no appID specified, default to hostname
-	appID := u.AppID
-	if appID == "" {
-		hostname, err := os.Hostname()
-		if err != nil {
-			return nil, trace.Wrap(err, "failed to automatically determine U2F AppID from hostname")
-		}
-		appID = fmt.Sprintf("https://%s:%d", strings.ToLower(hostname), defaults.HTTPListenPort)
-	}
-
-	// If no facets specified, default to AppID
-	facets := u.Facets
-	if len(facets) == 0 {
-		facets = []string{appID}
-	}
-
-	return &services.U2F{
-		AppID:  appID,
-		Facets: facets,
-	}, nil
 }

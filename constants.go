@@ -17,8 +17,11 @@ limitations under the License.
 package teleport
 
 import (
+	"fmt"
 	"strings"
 	"time"
+
+	"github.com/coreos/go-semver/semver"
 )
 
 // WebAPIVersion is a current webapi version
@@ -49,6 +52,13 @@ const (
 
 	// SSHSessionID is the UUID of the current session.
 	SSHSessionID = "SSH_SESSION_ID"
+)
+
+const (
+	// HTTPNextProtoTLS is the NPN/ALPN protocol negotiated during
+	// HTTP/1.1.'s TLS setup.
+	// https://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xhtml#alpn-protocol-ids
+	HTTPNextProtoTLS = "http/1.1"
 )
 
 const (
@@ -84,6 +94,9 @@ const (
 	// ComponentServer is a server subcomponent of some services
 	ComponentServer = "server"
 
+	// ComponentACME is ACME protocol controller
+	ComponentACME = "acme"
+
 	// ComponentReverseTunnelServer is reverse tunnel server
 	// that together with agent establish a bi-directional SSH revers tunnel
 	// to bypass firewall restrictions
@@ -97,8 +110,8 @@ const (
 	// ComponentLabel is a component label name used in reporting
 	ComponentLabel = "component"
 
-	// ComponentKube is a kubernetes proxy
-	ComponentKube = "proxy:kube"
+	// ComponentProxyKube is a kubernetes proxy
+	ComponentProxyKube = "proxy:kube"
 
 	// ComponentAuth is the cluster CA node (auth server API)
 	ComponentAuth = "auth"
@@ -117,6 +130,18 @@ const (
 
 	// ComponentProxy is SSH proxy (SSH server forwarding connections)
 	ComponentProxy = "proxy"
+
+	// ComponentApp is the application proxy service.
+	ComponentApp = "app:service"
+
+	// ComponentDatabase is the database proxy service.
+	ComponentDatabase = "db:service"
+
+	// ComponentAppProxy is the application handler within the web proxy service.
+	ComponentAppProxy = "app:web"
+
+	// ComponentWebProxy is the web handler within the web proxy service.
+	ComponentWebProxy = "web"
 
 	// ComponentDiagnostic is a diagnostic service
 	ComponentDiagnostic = "diag"
@@ -209,8 +234,17 @@ const (
 	// ComponentBPF is the eBPF packagae.
 	ComponentBPF = "bpf"
 
+	// ComponentRestrictedSession is restriction of user access to kernel objects
+	ComponentRestrictedSession = "restrictedsess"
+
 	// ComponentCgroup is the cgroup package.
 	ComponentCgroup = "cgroups"
+
+	// ComponentKube is an Kubernetes API gateway.
+	ComponentKube = "kubernetes"
+
+	// ComponentSAML is a SAML service provider.
+	ComponentSAML = "saml"
 
 	// DebugEnvVar tells tests to use verbose debug output
 	DebugEnvVar = "DEBUG"
@@ -233,15 +267,6 @@ const (
 	// is not defined)
 	SafeTerminalType = "xterm"
 
-	// ConnectorOIDC means connector type OIDC
-	ConnectorOIDC = "oidc"
-
-	// ConnectorSAML means connector type SAML
-	ConnectorSAML = "saml"
-
-	// ConnectorGithub means connector type Github
-	ConnectorGithub = "github"
-
 	// DataDirParameterName is the name of the data dir configuration parameter passed
 	// to all backends during initialization
 	DataDirParameterName = "data_dir"
@@ -254,33 +279,6 @@ const (
 	// the proxy is recording sessions or not.
 	RecordingProxyReqType = "recording-proxy@teleport.com"
 
-	// OTP means One-time Password Algorithm for Two-Factor Authentication.
-	OTP = "otp"
-
-	// TOTP means Time-based One-time Password Algorithm. for Two-Factor Authentication.
-	TOTP = "totp"
-
-	// HOTP means HMAC-based One-time Password Algorithm.for Two-Factor Authentication.
-	HOTP = "hotp"
-
-	// U2F means Universal 2nd Factor.for Two-Factor Authentication.
-	U2F = "u2f"
-
-	// OFF means no second factor.for Two-Factor Authentication.
-	OFF = "off"
-
-	// Local means authentication will happen locally within the Teleport cluster.
-	Local = "local"
-
-	// OIDC means authentication will happen remotely using an OIDC connector.
-	OIDC = ConnectorOIDC
-
-	// SAML means authentication will happen remotely using a SAML connector.
-	SAML = ConnectorSAML
-
-	// Github means authentication will happen remotely using a Github connector.
-	Github = ConnectorGithub
-
 	// JSON means JSON serialization format
 	JSON = "json"
 
@@ -290,17 +288,14 @@ const (
 	// Text means text serialization format
 	Text = "text"
 
+	// PTY is a raw pty session capture format
+	PTY = "pty"
+
+	// Names is for formatting node names in plain text
+	Names = "names"
+
 	// LinuxAdminGID is the ID of the standard adm group on linux
 	LinuxAdminGID = 4
-
-	// LinuxOS is the GOOS constant used for Linux.
-	LinuxOS = "linux"
-
-	// WindowsOS is the GOOS constant used for Microsoft Windows.
-	WindowsOS = "windows"
-
-	// DarwinOS is the GOOS constant for Apple macOS/darwin.
-	DarwinOS = "darwin"
 
 	// DirMaskSharedGroup is the mask for a directory accessible
 	// by the owner and group
@@ -323,6 +318,12 @@ const (
 	// SchemeGCS is GCS file scheme, means upload or download to GCS like object
 	// storage
 	SchemeGCS = "gs"
+
+	// GCSTestURI turns on GCS tests
+	GCSTestURI = "TEST_GCS_URI"
+
+	// AWSRunTests turns on tests executed against AWS directly
+	AWSRunTests = "TEST_AWS"
 
 	// Region is AWS region parameter
 	Region = "region"
@@ -351,14 +352,24 @@ const (
 	// HumanDateFormat is a human readable date formatting
 	HumanDateFormat = "Jan _2 15:04 UTC"
 
-	// HumanDateFormatSeconds is a human readable date formatting with seconds
-	HumanDateFormatSeconds = "Jan _2 15:04:05 UTC"
-
 	// HumanDateFormatMilli is a human readable date formatting with milliseconds
 	HumanDateFormatMilli = "Jan _2 15:04:05.000 UTC"
 
 	// DebugLevel is a debug logging level name
 	DebugLevel = "debug"
+
+	// MinimumEtcdVersion is the minimum version of etcd supported by Teleport
+	MinimumEtcdVersion = "3.3.0"
+)
+
+// OTPType is the type of the One-time Password Algorithm.
+type OTPType string
+
+const (
+	// TOTP means Time-based One-time Password Algorithm (for Two-Factor Authentication)
+	TOTP = OTPType("totp")
+	// HOTP means HMAC-based One-time Password Algorithm (for Two-Factor Authentication)
+	HOTP = OTPType("hotp")
 )
 
 const (
@@ -405,6 +416,15 @@ const (
 	// CertExtensionTeleportActiveRequests is used to track which privilege
 	// escalation requests were used to construct the certificate.
 	CertExtensionTeleportActiveRequests = "teleport-active-requests"
+	// CertExtensionMFAVerified is used to mark certificates issued after an MFA
+	// check.
+	CertExtensionMFAVerified = "mfa-verified"
+	// CertExtensionClientIP is used to embed the IP of the client that created
+	// the certificate.
+	CertExtensionClientIP = "client-ip"
+	// CertExtensionImpersonator is set when one user has requested certificates
+	// for another user
+	CertExtensionImpersonator = "impersonator"
 )
 
 const (
@@ -412,6 +432,9 @@ const (
 	NetIQ = "netiq"
 	// ADFS is Microsoft Active Directory Federation Services
 	ADFS = "adfs"
+	// Ping is the common backend for all Ping Identity-branded identity
+	// providers (including PingOne, PingFederate, etc).
+	Ping = "ping"
 )
 
 const (
@@ -429,27 +452,33 @@ const MaxEnvironmentFileLines = 1000
 // typically only enforced against resources that are likely to arbitrarily grow (e.g. PluginData).
 const MaxResourceSize = 1000000
 
+// MaxHTTPRequestSize is the maximum accepted size (in bytes) of the body of
+// a received HTTP request.  This limit is meant to be used with utils.ReadAtMost
+// to prevent resource exhaustion attacks.
+const MaxHTTPRequestSize = 10 * 1024 * 1024
+
+// MaxHTTPResponseSize is the maximum accepted size (in bytes) of the body of
+// a received HTTP response.  This limit is meant to be used with utils.ReadAtMost
+// to prevent resource exhaustion attacks.
+const MaxHTTPResponseSize = 10 * 1024 * 1024
+
 const (
 	// CertificateFormatOldSSH is used to make Teleport interoperate with older
 	// versions of OpenSSH.
 	CertificateFormatOldSSH = "oldssh"
 
-	// CertificateFormatStandard is used for normal Teleport operation without any
-	// compatibility modes.
-	CertificateFormatStandard = "standard"
-
 	// CertificateFormatUnspecified is used to check if the format was specified
 	// or not.
 	CertificateFormatUnspecified = ""
-
-	// DurationNever is human friendly shortcut that is interpreted as a Duration of 0
-	DurationNever = "never"
 )
 
 const (
 	// TraitInternalPrefix is the role variable prefix that indicates it's for
 	// local accounts.
 	TraitInternalPrefix = "internal"
+
+	// TraitExternalPrefix is the role variable prefix that indicates the data comes from an external identity provider.
+	TraitExternalPrefix = "external"
 
 	// TraitLogins is the name the role variable used to store
 	// allowed logins.
@@ -463,6 +492,14 @@ const (
 	// allowed kubernetes users
 	TraitKubeUsers = "kubernetes_users"
 
+	// TraitDBNames is the name of the role variable used to store
+	// allowed database names.
+	TraitDBNames = "db_names"
+
+	// TraitDBUsers is the name of the role variable used to store
+	// allowed database users.
+	TraitDBUsers = "db_users"
+
 	// TraitInternalLoginsVariable is the variable used to store allowed
 	// logins for local accounts.
 	TraitInternalLoginsVariable = "{{internal.logins}}"
@@ -474,6 +511,14 @@ const (
 	// TraitInternalKubeUsersVariable is the variable used to store allowed
 	// kubernetes users for local accounts.
 	TraitInternalKubeUsersVariable = "{{internal.kubernetes_users}}"
+
+	// TraitInternalDBNamesVariable is the variable used to store allowed
+	// database names for local accounts.
+	TraitInternalDBNamesVariable = "{{internal.db_names}}"
+
+	// TraitInternalDBUsersVariable is the variable used to store allowed
+	// database users for local accounts.
+	TraitInternalDBUsersVariable = "{{internal.db_users}}"
 )
 
 const (
@@ -493,19 +538,36 @@ const SCP = "scp"
 // Root is *nix system administrator account name.
 const Root = "root"
 
-// DefaultRole is the name of the default admin role for all local users if
-// another role is not explicitly assigned (Enterprise only).
+// AdminRoleName is the name of the default admin role for all local users if
+// another role is not explicitly assigned
 const AdminRoleName = "admin"
 
-// DefaultImplicitRole is implicit role that gets added to all service.RoleSet
-// objects.
-const DefaultImplicitRole = "default-implicit-role"
+const (
+	// PresetEditorRoleName is a name of a preset role that allows
+	// editing cluster configuration.
+	PresetEditorRoleName = "editor"
 
-// APIDomain is a default domain name for Auth server API
-const APIDomain = "teleport.cluster.local"
+	// PresetAccessRoleName is a name of a preset role that allows
+	// accessing cluster resources.
+	PresetAccessRoleName = "access"
+
+	// PresetAuditorRoleName is a name of a preset role that allows
+	// reading cluster events and playing back session records.
+	PresetAuditorRoleName = "auditor"
+)
+
+// OSSMigratedV6 is a label to mark migrated OSS users and resources
+const OSSMigratedV6 = "migrate-v6.0"
 
 // MinClientVersion is the minimum client version required by the server.
-const MinClientVersion = "3.0.0"
+var MinClientVersion string
+
+func init() {
+	// Per https://github.com/gravitational/teleport/blob/master/rfd/0012-teleport-versioning.md,
+	// only one major version backwards is supported for clients.
+	ver := semver.New(Version)
+	MinClientVersion = fmt.Sprintf("%d.0.0", ver.Major-1)
+}
 
 const (
 	// RemoteClusterStatusOffline indicates that cluster is considered as
@@ -553,23 +615,8 @@ const (
 	// KubeCAPath is a hardcode of mounted CA inside every pod of K8s
 	KubeCAPath = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
-	// KubeKindCSR is a certificate signing requests
-	KubeKindCSR = "CertificateSigningRequest"
-
-	// KubeKindPod is a kubernetes pod
-	KubeKindPod = "Pod"
-
-	// KubeMetadataNameSelector is a selector for name metadata in API requests
-	KubeMetadataNameSelector = "metadata.name"
-
-	// KubeMetadataLabelSelector is a selector for label
-	KubeMetadataLabelSelector = "metadata.label"
-
 	// KubeRunTests turns on kubernetes tests
 	KubeRunTests = "TEST_KUBE"
-
-	// KubeSystemMasters is a name of the builtin kubernets group for master nodes
-	KubeSystemMasters = "system:masters"
 
 	// KubeSystemAuthenticated is a builtin group that allows
 	// any user to access common API methods, e.g. discovery methods
@@ -579,16 +626,25 @@ const (
 	// UsageKubeOnly specifies certificate usage metadata
 	// that limits certificate to be only used for kubernetes proxying
 	UsageKubeOnly = "usage:kube"
+
+	// UsageAppOnly specifies a certificate metadata that only allows it to be
+	// used for proxying applications.
+	UsageAppsOnly = "usage:apps"
+
+	// UsageDatabaseOnly specifies certificate usage metadata that only allows
+	// it to be used for proxying database connections.
+	UsageDatabaseOnly = "usage:db"
 )
 
 const (
-	// UseOfClosedNetworkConnection is a special string some parts of
-	// go standard lib are using that is the only way to identify some errors
-	UseOfClosedNetworkConnection = "use of closed network connection"
-
 	// NodeIsAmbiguous serves as an identifying error string indicating that
 	// the proxy subsystem found multiple nodes matching the specified hostname.
 	NodeIsAmbiguous = "err-node-is-ambiguous"
+
+	// MaxLeases serves as an identifying error string indicating that the
+	// semaphore system is rejecting an acquisition attempt due to max
+	// leases having already been reached.
+	MaxLeases = "err-max-leases"
 )
 
 const (
@@ -604,23 +660,6 @@ const (
 	// BrowserNone is the string used to suppress the opening of a browser in
 	// response to 'tsh login' commands.
 	BrowserNone = "none"
-)
-
-const (
-	// EnhancedRecordingMinKernel is the minimum kernel version for the enhanced
-	// recording feature.
-	EnhancedRecordingMinKernel = "4.18.0"
-
-	// EnhancedRecordingCommand is a role option that implies command events are
-	// captured.
-	EnhancedRecordingCommand = "command"
-
-	// EnhancedRecordingDisk is a role option that implies disk events are captured.
-	EnhancedRecordingDisk = "disk"
-
-	// EnhancedRecordingNetwork is a role option that implies network events
-	// are captured.
-	EnhancedRecordingNetwork = "network"
 )
 
 const (
@@ -661,3 +700,21 @@ const (
 
 // UserSystem defines a user as system.
 const UserSystem = "system"
+
+const (
+	// internal application being proxied.
+	AppJWTHeader = "teleport-jwt-assertion"
+
+	// AppCFHeader is a compatibility header.
+	AppCFHeader = "cf-access-token"
+
+	// HostHeader is the name of the Host header.
+	HostHeader = "Host"
+)
+
+// UserSingleUseCertTTL is a TTL for per-connection user certificates.
+const UserSingleUseCertTTL = time.Minute
+
+// StandardHTTPSPort is the default port used for the https URI scheme,
+// cf. RFC 7230 § 2.7.2.
+const StandardHTTPSPort = 443

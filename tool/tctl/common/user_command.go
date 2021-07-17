@@ -1,5 +1,5 @@
 /*
-Copyright 2015-2017 Gravitational, Inc.
+Copyright 2015-2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,11 +26,12 @@ import (
 
 	"github.com/gravitational/kingpin"
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/asciitable"
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/service"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/trace"
 )
 
@@ -39,11 +40,19 @@ import (
 type UserCommand struct {
 	config        *service.Config
 	login         string
-	allowedLogins string
+	allowedLogins []string
+	createRoles   []string
 	kubeUsers     string
 	kubeGroups    string
-	roles         string
-	ttl           time.Duration
+
+	// DELETE IN (7.0)
+	// We keep legacy flags used in tctl users add --k8s-users command
+	legacyAllowedLogins string
+
+	ttl time.Duration
+
+	// updateRoles is used for update users command
+	updateRoles string
 
 	// format is the output format, e.g. text or json
 	format string
@@ -64,12 +73,26 @@ func (u *UserCommand) Initialize(app *kingpin.Application, config *service.Confi
 
 	u.userAdd = users.Command("add", "Generate a user invitation token "+helpPrefix)
 	u.userAdd.Arg("account", "Teleport user account name").Required().StringVar(&u.login)
-	u.userAdd.Arg("local-logins", "Local UNIX users this account can log in as [login]").
-		Default("").StringVar(&u.allowedLogins)
-	u.userAdd.Flag("k8s-users", "Kubernetes users to assign to a user.").
-		Default("").StringVar(&u.kubeUsers)
-	u.userAdd.Flag("k8s-groups", "Kubernetes groups to assign to a user.").
-		Default("").StringVar(&u.kubeGroups)
+
+	u.userAdd.Flag("logins", "List of allowed logins for the new user").StringsVar(&u.allowedLogins)
+
+	// DELETE IN (7.x)
+	// Delete these legacy flags after OSS migration to RBAC
+	if modules.GetModules().BuildType() == modules.BuildOSS {
+		// Roles flag is not required in OSS
+		u.userAdd.Flag("roles", "List of roles for the new user to assume").StringsVar(&u.createRoles)
+
+		u.userAdd.Arg("local-logins", "Local UNIX users this account can log in as [login]").
+			Default("").StringVar(&u.legacyAllowedLogins)
+		u.userAdd.Flag("k8s-users", "Kubernetes users to assign to a user.").
+			Default("").StringVar(&u.kubeUsers)
+		u.userAdd.Flag("k8s-groups", "Kubernetes groups to assign to a user.").
+			Default("").StringVar(&u.kubeGroups)
+	} else {
+		// Roles flag is required in Enterprise
+		u.userAdd.Flag("roles", "List of roles for the new user to assume").Required().StringsVar(&u.createRoles)
+	}
+
 	u.userAdd.Flag("ttl", fmt.Sprintf("Set expiration time for token, default is %v, maximum is %v",
 		defaults.SignupTokenTTL, defaults.MaxSignupTokenTTL)).
 		Default(fmt.Sprintf("%v", defaults.SignupTokenTTL)).DurationVar(&u.ttl)
@@ -79,7 +102,7 @@ func (u *UserCommand) Initialize(app *kingpin.Application, config *service.Confi
 	u.userUpdate = users.Command("update", "Update properties for existing user").Hidden()
 	u.userUpdate.Arg("login", "Teleport user login").Required().StringVar(&u.login)
 	u.userUpdate.Flag("set-roles", "Roles to assign to this user").
-		Default("").StringVar(&u.roles)
+		Default("").StringVar(&u.updateRoles)
 
 	u.userList = users.Command("ls", "List all user accounts "+helpPrefix)
 	u.userList.Flag("format", "Output format, 'text' or 'json'").Hidden().Default(teleport.Text).StringVar(&u.format)
@@ -136,10 +159,10 @@ func (u *UserCommand) ResetPassword(client auth.ClientI) error {
 }
 
 // PrintResetPasswordToken prints ResetPasswordToken
-func (u *UserCommand) PrintResetPasswordToken(token services.ResetPasswordToken, format string) error {
+func (u *UserCommand) PrintResetPasswordToken(token types.ResetPasswordToken, format string) error {
 	err := u.printResetPasswordToken(token,
 		format,
-		"User %v has been reset. Share this URL with the user to complete password reset, link is valid for %v:\n%v\n\n",
+		"User %q has been reset. Share this URL with the user to complete password reset, link is valid for %v:\n%v\n\n",
 	)
 
 	if err != nil {
@@ -150,10 +173,10 @@ func (u *UserCommand) PrintResetPasswordToken(token services.ResetPasswordToken,
 }
 
 // PrintResetPasswordTokenAsInvite prints ResetPasswordToken as Invite
-func (u *UserCommand) PrintResetPasswordTokenAsInvite(token services.ResetPasswordToken, format string) error {
+func (u *UserCommand) PrintResetPasswordTokenAsInvite(token types.ResetPasswordToken, format string) error {
 	err := u.printResetPasswordToken(token,
 		format,
-		"User %v has been created but requires a password. Share this URL with the user to complete user setup, link is valid for %v:\n%v\n\n")
+		"User %q has been created but requires a password. Share this URL with the user to complete user setup, link is valid for %v:\n%v\n\n")
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -161,59 +184,133 @@ func (u *UserCommand) PrintResetPasswordTokenAsInvite(token services.ResetPasswo
 	return nil
 }
 
-func (u *UserCommand) printResetPasswordToken(token services.ResetPasswordToken, format string, messageFormat string) error {
-	url, err := url.Parse(token.GetURL())
+// PrintResetPasswordToken prints ResetPasswordToken
+func (u *UserCommand) printResetPasswordToken(token types.ResetPasswordToken, format string, messageFormat string) (err error) {
+	switch strings.ToLower(u.format) {
+	case teleport.JSON:
+		err = printTokenAsJSON(token)
+	case teleport.Text:
+		err = printTokenAsText(token, messageFormat)
+	default:
+		err = printTokenAsText(token, messageFormat)
+	}
+
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	if format == teleport.Text {
-		ttl := token.Expiry().Sub(time.Now().UTC()).Round(time.Second)
-		fmt.Printf(messageFormat, token.GetUser(), ttl, url)
-		fmt.Printf("NOTE: Make sure %v points at a Teleport proxy which users can access.\n", url.Host)
-	} else if u.format == teleport.JSON {
-		err := printTokenAsJSON(token)
-		if err != nil {
+	return nil
+}
+
+// Add implements `tctl users add` for the enterprise edition. Unlike the OSS
+// version, this one requires --roles flag to be set
+func (u *UserCommand) Add(client auth.ClientI) error {
+	// DELETE IN (7.x)
+	// Delete these legacy flags after OSS migration to RBAC.
+	if modules.GetModules().BuildType() == modules.BuildOSS {
+		switch {
+		case u.legacyAllowedLogins != "":
+			// A caller has attempted to mix legacy and new format.
+			if len(u.allowedLogins) != 0 || len(u.createRoles) != 0 {
+				return trace.BadParameter(
+					`please use --roles and --logins flags instead of deprecated positional arguments.`)
+			}
+			return u.legacyAdd(client)
+
+			// This is a legacy OSS scenario: `tctl users add bob`
+			// with no other arguments. In this case, CLI assumed allowed logins
+			// to be `bob` as well.
+		case len(u.allowedLogins) == 0 && len(u.createRoles) == 0:
+			return u.legacyAdd(client)
+		}
+	}
+
+	// --roles is required argument, we are not using Required() modifier
+	// to merge multiple CLI flag combinations, make it required again
+	// and make it required on a server too
+	// DELETE IN (7.0)
+	if len(u.createRoles) == 0 {
+		return trace.BadParameter("please use --roles to assign a user to roles")
+	}
+
+	u.createRoles = flattenSlice(u.createRoles)
+	u.allowedLogins = flattenSlice(u.allowedLogins)
+
+	// Validate roles (server does not do this yet).
+	for _, roleName := range u.createRoles {
+		if _, err := client.GetRole(context.TODO(), roleName); err != nil {
 			return trace.Wrap(err)
 		}
 	}
 
+	traits := map[string][]string{
+		teleport.TraitLogins:     u.allowedLogins,
+		teleport.TraitKubeUsers:  flattenSlice([]string{u.kubeUsers}),
+		teleport.TraitKubeGroups: flattenSlice([]string{u.kubeGroups}),
+	}
+
+	user, err := types.NewUser(u.login)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	user.SetTraits(traits)
+	user.SetRoles(u.createRoles)
+
+	if err := client.CreateUser(context.TODO(), user); err != nil {
+		return trace.Wrap(err)
+
+	}
+
+	token, err := client.CreateResetPasswordToken(context.TODO(), auth.CreateResetPasswordTokenRequest{
+		Name: u.login,
+		TTL:  u.ttl,
+		Type: auth.ResetPasswordTokenTypeInvite,
+	})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := u.PrintResetPasswordTokenAsInvite(token, u.format); err != nil {
+		return trace.Wrap(err)
+	}
+
 	return nil
 }
 
-// Add creates a new sign-up token and prints a token URL to stdout.
-// A user is not created until he visits the sign-up URL and completes the process
-func (u *UserCommand) Add(client auth.ClientI) error {
+// addLegacy creates a new sign-up token and prints a token URL to stdout.
+// A user is not created until they visit the sign-up URL and completes the
+// process
+func (u *UserCommand) legacyAdd(client auth.ClientI) error {
+	fmt.Printf(`NOTE: Teleport 6.0 added RBAC in Open Source edition.
+
+In the future, please create a role and use a new format with --roles flag:
+
+$ tctl users add "%v" --roles=[add your role here]
+
+We will deprecate the old format in the next release of Teleport.
+Meanwhile we are going to assign user %q to role %q created during migration.
+
+`, u.login, u.login, teleport.AdminRoleName)
+
 	// If no local logins were specified, default to 'login' for SSH and k8s
 	// logins.
-	if u.allowedLogins == "" {
-		u.allowedLogins = u.login
+	if u.legacyAllowedLogins == "" {
+		u.legacyAllowedLogins = u.login
 	}
 	if u.kubeUsers == "" {
 		u.kubeUsers = u.login
 	}
-	var kubeGroups []string
-	if u.kubeGroups != "" {
-		kubeGroups = strings.Split(u.kubeGroups, ",")
-	}
 
-	// make sure that user does not exist
-	_, err := client.GetUser(u.login, false)
-	if err == nil {
-		if err == nil {
-			return trace.BadParameter("user(%v) already registered", u.login)
-		}
-	}
-
-	user, err := services.NewUser(u.login)
+	user, err := types.NewUser(u.login)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	traits := map[string][]string{
-		teleport.TraitLogins:     strings.Split(u.allowedLogins, ","),
-		teleport.TraitKubeUsers:  strings.Split(u.kubeUsers, ","),
-		teleport.TraitKubeGroups: kubeGroups,
+		teleport.TraitLogins:     flattenSlice([]string{u.legacyAllowedLogins}),
+		teleport.TraitKubeUsers:  flattenSlice([]string{u.kubeUsers}),
+		teleport.TraitKubeGroups: flattenSlice([]string{u.kubeGroups}),
 	}
 
 	user.SetTraits(traits)
@@ -240,12 +337,35 @@ func (u *UserCommand) Add(client auth.ClientI) error {
 	return nil
 }
 
-func printTokenAsJSON(token services.ResetPasswordToken) error {
+// flattenSlice takes a slice of strings like ["one,two", "three"] and returns
+// ["one", "two", "three"]
+func flattenSlice(slice []string) (retval []string) {
+	for i := range slice {
+		for _, role := range strings.Split(slice[i], ",") {
+			retval = append(retval, strings.TrimSpace(role))
+		}
+	}
+	return retval
+}
+
+func printTokenAsJSON(token types.ResetPasswordToken) error {
 	out, err := json.MarshalIndent(token, "", "  ")
 	if err != nil {
 		return trace.Wrap(err, "failed to marshal reset password token")
 	}
 	fmt.Print(string(out))
+	return nil
+}
+
+func printTokenAsText(token types.ResetPasswordToken, messageFormat string) error {
+	url, err := url.Parse(token.GetURL())
+	if err != nil {
+		return trace.Wrap(err, "failed to parse reset password token url")
+	}
+
+	ttl := trimDurationZeroSuffix(token.Expiry().Sub(time.Now().UTC()))
+	fmt.Printf(messageFormat, token.GetUser(), ttl, url)
+	fmt.Printf("NOTE: Make sure %v points at a Teleport proxy which users can access.\n", url.Host)
 	return nil
 }
 
@@ -255,9 +375,9 @@ func (u *UserCommand) Update(client auth.ClientI) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	roles := strings.Split(u.roles, ",")
+	roles := flattenSlice([]string{u.updateRoles})
 	for _, role := range roles {
-		if _, err := client.GetRole(role); err != nil {
+		if _, err := client.GetRole(context.TODO(), role); err != nil {
 			return trace.Wrap(err)
 		}
 	}
@@ -280,10 +400,11 @@ func (u *UserCommand) List(client auth.ClientI) error {
 			fmt.Println("No users found")
 			return nil
 		}
-		t := asciitable.MakeTable([]string{"User", "Allowed logins"})
+		t := asciitable.MakeTable([]string{"User", "Roles"})
 		for _, u := range users {
-			logins := u.GetTraits()[teleport.TraitLogins]
-			t.AddRow([]string{u.GetName(), strings.Join(logins, ",")})
+			t.AddRow([]string{
+				u.GetName(), strings.Join(u.GetRoles(), ","),
+			})
 		}
 		fmt.Println(t.AsBuffer().String())
 	} else {
@@ -306,4 +427,16 @@ func (u *UserCommand) Delete(client auth.ClientI) error {
 		fmt.Printf("User %q has been deleted\n", l)
 	}
 	return nil
+}
+
+func trimDurationZeroSuffix(d time.Duration) string {
+	s := d.Round(time.Second).String()
+	switch {
+	case strings.HasSuffix(s, "h0m0s"):
+		return strings.TrimSuffix(s, "0m0s")
+	case strings.HasSuffix(s, "m0s"):
+		return strings.TrimSuffix(s, "0s")
+	default:
+		return s
+	}
 }

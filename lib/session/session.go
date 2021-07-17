@@ -27,14 +27,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/services"
 
-	"github.com/docker/docker/pkg/term"
-	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/moby/term"
 	"github.com/pborman/uuid"
+
+	"github.com/gravitational/trace"
 )
 
 // ID is a unique session ID.
@@ -421,16 +422,15 @@ func (s *server) UpdateSession(req UpdateRequest) error {
 				continue
 			}
 			return trace.Wrap(err)
-		} else {
-			return nil
 		}
+		return nil
 	}
 	return trace.ConnectionProblem(nil, "failed concurrently update the session")
 }
 
 // DeleteSession removes an active session from the backend.
 func (s *server) DeleteSession(namespace string, id ID) error {
-	if !services.IsValidNamespace(namespace) {
+	if !types.IsValidNamespace(namespace) {
 		return trace.BadParameter("invalid namespace %q", namespace)
 	}
 	err := id.Check()
@@ -453,7 +453,7 @@ type discardSessionServer struct {
 // NewDiscardSessionServer returns a new discarding session server. It's used
 // with the recording proxy so that nodes don't register active sessions to
 // the backend.
-func NewDiscardSessionServer() *discardSessionServer {
+func NewDiscardSessionServer() Service {
 	return &discardSessionServer{}
 }
 

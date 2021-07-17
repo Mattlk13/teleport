@@ -1,5 +1,3 @@
-// +build firestore
-
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +18,8 @@ package firestore
 
 import (
 	"context"
+	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -27,22 +27,45 @@ import (
 	"github.com/gravitational/teleport/lib/backend/test"
 	"github.com/gravitational/teleport/lib/utils"
 
+	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
+	adminpb "google.golang.org/genproto/googleapis/firestore/admin/v1"
+	"google.golang.org/protobuf/proto"
 	"gopkg.in/check.v1"
 )
+
+func TestMain(m *testing.M) {
+	utils.InitLoggerForTests()
+	os.Exit(m.Run())
+}
+
+// TestMarshal tests index operation metadata marshal and unmarshal
+// to verify backwards compatibility. Gogoproto is incompatible with ApiV2 protoc-gen-go code.
+//
+// Track the issue here: https://github.com/gogo/protobuf/issues/678
+//
+func TestMarshal(t *testing.T) {
+	meta := adminpb.IndexOperationMetadata{}
+	data, err := proto.Marshal(&meta)
+	assert.NoError(t, err)
+	out := adminpb.IndexOperationMetadata{}
+	err = proto.Unmarshal(data, &out)
+	assert.NoError(t, err)
+}
 
 func TestFirestoreDB(t *testing.T) { check.TestingT(t) }
 
 type FirestoreSuite struct {
-	bk             *FirestoreBackend
-	suite          test.BackendSuite
-	collectionName string
+	bk    *Backend
+	suite test.BackendSuite
 }
 
 var _ = check.Suite(&FirestoreSuite{})
 
 func (s *FirestoreSuite) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests(testing.Verbose())
-	var err error
+	if !emulatorRunning() {
+		c.Skip("Firestore emulator is not running, start it with: gcloud beta emulators firestore start --host-port=localhost:8618")
+	}
 
 	newBackend := func() (backend.Backend, error) {
 		return New(context.Background(), map[string]interface{}{
@@ -54,9 +77,21 @@ func (s *FirestoreSuite) SetUpSuite(c *check.C) {
 	}
 	bk, err := newBackend()
 	c.Assert(err, check.IsNil)
-	s.bk = bk.(*FirestoreBackend)
+	s.bk = bk.(*Backend)
 	s.suite.B = s.bk
 	s.suite.NewBackend = newBackend
+	clock := clockwork.NewFakeClock()
+	s.bk.clock = clock
+	s.suite.Clock = clock
+}
+
+func emulatorRunning() bool {
+	con, err := net.Dial("tcp", "localhost:8618")
+	if err != nil {
+		return false
+	}
+	con.Close()
+	return true
 }
 
 func (s *FirestoreSuite) TearDownTest(c *check.C) {
@@ -76,7 +111,9 @@ func (s *FirestoreSuite) TearDownTest(c *check.C) {
 }
 
 func (s *FirestoreSuite) TearDownSuite(c *check.C) {
-	s.bk.Close()
+	if s.bk != nil {
+		s.bk.Close()
+	}
 }
 
 func (s *FirestoreSuite) TestCRUD(c *check.C) {
@@ -112,5 +149,45 @@ func (s *FirestoreSuite) TestWatchersClose(c *check.C) {
 }
 
 func (s *FirestoreSuite) TestLocking(c *check.C) {
-	s.suite.Locking(c)
+	s.suite.Locking(c, s.bk)
+}
+
+func (s *FirestoreSuite) TestReadLegacyRecord(c *check.C) {
+	item := backend.Item{
+		Key:     []byte("legacy-record"),
+		Value:   []byte("foo"),
+		Expires: s.bk.clock.Now().Add(time.Minute).Round(time.Second).UTC(),
+		ID:      s.bk.clock.Now().UTC().UnixNano(),
+	}
+
+	// Write using legacy record format, emulating data written by an older
+	// version of this backend.
+	ctx := context.Background()
+	rl := legacyRecord{
+		Key:       string(item.Key),
+		Value:     string(item.Value),
+		Expires:   item.Expires.UTC().Unix(),
+		Timestamp: s.bk.clock.Now().UTC().Unix(),
+		ID:        item.ID,
+	}
+	_, err := s.bk.svc.Collection(s.bk.CollectionName).Doc(s.bk.keyToDocumentID(item.Key)).Set(ctx, rl)
+	c.Assert(err, check.IsNil)
+
+	// Read the data back and make sure it matches the original item.
+	got, err := s.bk.Get(ctx, item.Key)
+	c.Assert(err, check.IsNil)
+	c.Assert(got.Key, check.DeepEquals, item.Key)
+	c.Assert(got.Value, check.DeepEquals, item.Value)
+	c.Assert(got.ID, check.DeepEquals, item.ID)
+	c.Assert(got.Expires.Equal(item.Expires), check.Equals, true)
+
+	// Read the data back using a range query too.
+	gotRange, err := s.bk.GetRange(ctx, item.Key, item.Key, 1)
+	c.Assert(err, check.IsNil)
+	c.Assert(len(gotRange.Items), check.Equals, 1)
+	got = &gotRange.Items[0]
+	c.Assert(got.Key, check.DeepEquals, item.Key)
+	c.Assert(got.Value, check.DeepEquals, item.Value)
+	c.Assert(got.ID, check.DeepEquals, item.ID)
+	c.Assert(got.Expires.Equal(item.Expires), check.Equals, true)
 }

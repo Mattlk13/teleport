@@ -32,6 +32,18 @@ import (
 	"github.com/pborman/uuid"
 )
 
+const (
+	// LoginSuccessRedirectURL is a redirect URL when login was successful without errors.
+	LoginSuccessRedirectURL = "/web/msg/info/login_success"
+
+	// LoginFailedRedirectURL is the default redirect URL when an SSO error was encountered.
+	LoginFailedRedirectURL = "/web/msg/error/login"
+
+	// LoginFailedBadCallbackRedirectURL is a redirect URL when an SSO error specific to
+	// auth connector's callback was encountered.
+	LoginFailedBadCallbackRedirectURL = "/web/msg/error/login/callback"
+)
+
 // Redirector handles SSH redirect flow with the Teleport server
 type Redirector struct {
 	// SSHLoginSSO contains SSH login parameters
@@ -134,12 +146,13 @@ func (rd *Redirector) Start() error {
 	u.RawQuery = query.Encode()
 
 	out, err := rd.proxyClient.PostJSON(rd.context, rd.proxyClient.Endpoint("webapi", rd.Protocol, "login", "console"), SSOLoginConsoleReq{
-		RedirectURL:    u.String(),
-		PublicKey:      rd.PubKey,
-		CertTTL:        rd.TTL,
-		ConnectorID:    rd.ConnectorID,
-		Compatibility:  rd.Compatibility,
-		RouteToCluster: rd.RouteToCluster,
+		RedirectURL:       u.String(),
+		PublicKey:         rd.PubKey,
+		CertTTL:           rd.TTL,
+		ConnectorID:       rd.ConnectorID,
+		Compatibility:     rd.Compatibility,
+		RouteToCluster:    rd.RouteToCluster,
+		KubernetesCluster: rd.KubernetesCluster,
 	})
 	if err != nil {
 		return trace.Wrap(err)
@@ -217,9 +230,9 @@ func (rd *Redirector) Close() error {
 // and sends a result to the channel and redirect users to error page
 func (rd *Redirector) wrapCallback(fn func(http.ResponseWriter, *http.Request) (*auth.SSHLoginResponse, error)) http.Handler {
 	clone := *rd.proxyURL
-	clone.Path = "/web/msg/error/login_failed"
+	clone.Path = LoginFailedRedirectURL
 	errorURL := clone.String()
-	clone.Path = "/web/msg/info/login_success"
+	clone.Path = LoginSuccessRedirectURL
 	successURL := clone.String()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

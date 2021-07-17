@@ -7,12 +7,12 @@ license:
 
 # Docker image to use
 image:
-  #Used if license is enabled
+  # Used if license is enabled
   enterpriseRepository: quay.io/gravitational/teleport-ent
-  #Used if license is disabled
+  # Used if license is disabled
   communityRepository: quay.io/gravitational/teleport
-  #Version of Teleport
-  tag: 4.2.10
+  # Version of Teleport
+  tag: "6"
   pullPolicy: IfNotPresent
   # Optionally specify an array of imagePullSecrets.
   # Secrets must be manually created in the namespace.
@@ -22,17 +22,15 @@ image:
 
 labels: {}
 
-
 # Teleport Proxy configuration
 proxy:
   tls:
-    # We assume TLS is terminated in front of the proxy by default
+    # We assume that Teleport will handle TLS termination by default
     enabled: true
     # Set this to false if you want to use Teleport's generated self-signed certificates
     usetlssecret: true
     # tweak this if you have multiple proxies in a single namespace
     secretName: tls-web
-
 
 # Teleport configuration
 # See the admin guide for full details
@@ -43,27 +41,31 @@ proxy:
 #
 config:
   # used for cluster name, advertise_ip, and public addresses
-  # If high availability is set it is only used for the proxy
+  # If High Availability is set it is only used for the proxy
   public_address: teleport.example.com
   #used for listen addreses in proxy, auth and ssh
   listen_addr: 0.0.0.0
 
-  # Set to true  to have separate proxy and auth instances for high availability.
-  # You must use non-dir storage for high availability or you can only have 1 auth instance .
+  # Set to true to have separate proxy and auth instances for high availability.
+  # You must use non-dir storage for High Availability or you can only have 1 auth instance.
   highAvailability: false
-  # High availability configuration with proxy and auth servers. No SSH configured service.
+  # High Availability configuration with proxy and auth servers. No configured SSH service.
   proxyCount: 2
   authCount: 2
-  authServiceType: ClusterIP
   auth_public_address: auth.example.com
+  authService:
+    type: ClusterIP
+    labels: {}
+    annotations: {}
+    externalTrafficPolicy: ""
+    loadBalancerSourceRanges: []
 
-# Set for proxies in high availability, single proxy and ssh service only deployments
-# auth_service_connection: 
+# Set for proxies in High Availability, single proxy and ssh service only deployments
+# auth_service_connection:
 #   auth_token: dogs-are-much-nicer-than-cats
 #   auth_servers:
 #   - teleportauth:3025
 #   - auth.example.com:3025
-
 
   teleport:
     pid_file: /var/run/teleport.pid
@@ -73,7 +75,7 @@ config:
     data_dir: /var/lib/teleport
     storage:
       type: dir
-            
+
     # Teleport throttles all connections to avoid abuse. These settings allow
     # you to adjust the default limits
     connection_limits:
@@ -89,23 +91,35 @@ config:
       # We recommend to use tools like `pwgen` to generate sufficiently random
       # tokens of 32+ byte length.
       tokens:
-      - proxy,node:dogs-are-much-nicer-than-cats
+      - proxy,node,kube:dogs-are-much-nicer-than-cats
       - trusted_cluster:trains-are-superior-to-cars
 
-    # Determines if SSH sessions to cluster nodes are forcefully terminated
-    # after no activity from a client (idle client).
-    # Examples: "30m", "1h" or "1h30m"
+      # Determines if SSH sessions to cluster nodes are forcefully terminated
+      # after no activity from a client (idle client).
+      # Examples: "30m", "1h" or "1h30m"
       client_idle_timeout: never
 
-    # Determines if the clients will be forcefully disconnected when their
-    # certificates expire in the middle of an active SSH session. (default is 'no')
+      # Determines if the clients will be forcefully disconnected when their
+      # certificates expire in the middle of an active SSH session. (default is 'no')
       disconnect_expired_cert: no
 
-    # Determines the interval at which Teleport will send keep-alive messages.
-    # keep_alive_count_max is the number of missed keep-alive messages before
-    # the server tears down the connection to the client.
+      # Determines the interval at which Teleport will send keep-alive messages.
+      # keep_alive_count_max is the number of missed keep-alive messages before
+      # the server tears down the connection to the client.
       keep_alive_interval: 5m
       keep_alive_count_max: 3
+
+      # Optional Session control timeout
+      # session_control_timeout: 2m # default
+
+      # Optional setting for configuring session recording. Possible values are:
+      #     "node"  : sessions will be recorded on the node level (the default)
+      #     "proxy" : recording on the proxy level, see "recording proxy mode" section.
+      #     "off"   : session recording is turned off
+      #     "node-sync" : sessions recording will be streamed from node -> auth -> storage
+      #     "proxy-sync : sessions recording will be streamed from proxy -> auth -> storage
+      #
+      # session_recording: "node-sync"
 
     ssh_service:
       enabled: yes
@@ -120,47 +134,66 @@ config:
         type: auth
 
       enhanced_recording:
-       # Enable or disable enhanced auditing for this node. Default value:
-       # false.  See 
+        # Enable or disable enhanced auditing for this node. Default value:
+        # false.  See
         enabled: false
 
-       # command_buffer_size is optional with a default value of 8 pages.
+        # command_buffer_size is optional with a default value of 8 pages.
         command_buffer_size: 8
 
-       # disk_buffer_size is optional with default value of 128 pages.
+        # disk_buffer_size is optional with default value of 128 pages.
         disk_buffer_size: 128
 
-       # network_buffer_size is optional with default value of 8 pages.
+        # network_buffer_size is optional with default value of 8 pages.
         network_buffer_size: 8
 
-       # Controls where cgroupv2 hierarchy is mounted. Default value:
-       # /cgroup2.
+        # Controls where cgroupv2 hierarchy is mounted. Default value:
+        # /cgroup2.
         cgroup_path: /cgroup2
 
-    # configures PAM integration. Note that additional volumes of the PAM configuration
-    # will be required.
+      # Configures PAM integration. Note that additional volumes of the PAM configuration
+      # will be required.
       pam:
         enabled: no
         service_name: teleport
 
     proxy_service:
       enabled: yes
-    #Used if  proxy.tls.usetlssecret is set to true, otherwise the values are not included in teleport.yaml
+      # Used if  proxy.tls.usetlssecret is set to true, otherwise the values are not included in teleport.yaml
       https_key_file: /var/lib/certs/tls.key
       https_cert_file: /var/lib/certs/tls.crt
+      # Specify a different hostname for the ssh and tunnel public address (if different to config.public_address)
+      # ssh_public_addr: teleportssh.example.com
+      # tunnel_public_addr: teleporttunnel.example.com
 
-    # kubernetes section configures
-    # kubernetes proxy protocol support
+      # kubernetes section configures kubernetes proxy protocol support
       kubernetes:
         enabled: yes
+        # Specify a different hostname for the k8s public address (if different to config.public_address)
+        # public_addr: teleportkubernetes.example.com
 
-#Alternatively you can provide your teleport configuration under teleportConfig with static text.  No variable substituion
+      # TLS certificates for the HTTPS connection.
+      # https_keypairs:
+      # - key_file: /var/lib/teleport/webproxy_key.pem
+      #  cert_file: /var/lib/teleport/webproxy_cert.pem
+
+    # To use a kubernetes_service uncomment this section
+    # kubernetes_service:
+      # enabled: true
+      # labels:
+      #   example-label: example-value
+      # listen_addr: 0.0.0.0:3027
+      # Optionally use a volume mounted kubeconfig to connect to other clusters
+      # kubeconfig_file: /var/lib/teleport/kubefiles/kubeconfig
+
+
+# Alternatively you can provide your teleport configuration under teleportConfig with static text. No variable substitution.
 otherConfig:
   useOtherConfig: false
   teleportConfig:
     # place a full teleport.yaml configuration here
 
-# Teleport configuration for high availability deployment 
+# Teleport configuration for High Availability deployment
 otherConfigHA:
   useOtherConfig: false
   teleportConfig:
@@ -192,13 +225,14 @@ service:
   annotations: {}
   ## Ref: https://kubernetes.io/docs/tutorials/services/source-ip/#source-ip-for-services-with-typeloadbalancer
   externalTrafficPolicy: ""
+  loadBalancerSourceRanges: []
 
   ## See https://github.com/kubernetes-incubator/external-dns/blob/master/docs/tutorials/aws-sd.md#verify-that-externaldns-works-service-example
   # Set something like the below in order to instruct external-dns to create a Route53 record set for your ELB on AWS:
   # external-dns.alpha.kubernetes.io/hostname: teleport.my-org.com
 
 # Use ingress in addition to service to terminate TLS outside of Teleport while using external-dns
-# You can safely use `service` only and disable `ingress`, when you just want to terminate TLS outside of Teleporty
+# You can safely use `service` only and disable `ingress`, when you just want to terminate TLS outside of Teleport
 ingress:
   enabled: false
   # annotations:
@@ -228,9 +262,6 @@ ports:
   proxytunnel:
     containerPort: 3024
 
-
-
-
 ## Additional container arguments
 extraArgs: []
 
@@ -241,34 +272,33 @@ extraVars: {}
   # SSL_CERT_FILE: "/var/lib/ca-certs/ca.pem"
 
 # Add additional volumes and mounts, for example to read other log files on the host
-extraVolumes: [] 
-
-
+extraVolumes: []
   # - name: ca-certs
   #   configMap:
   #     name: ca-certs
-extraVolumeMounts: []
 
+extraVolumeMounts: []
   # - name: ca-certs
   #   mountPath: /var/lib/ca-certs
   #   readOnly: true
-  
-# Volume mounts only for the auth service in high availability deployments
+
+# Volume mounts only for the auth service in High Availability deployments
 extraAuthVolumes: []
-extraAuthVolumeMounts: []  
+extraAuthVolumeMounts: []
 
 resources: {}
-  # We usually recommend not to specify default resources and to leave this as a conscious
-  # choice for the user. This also increases chances charts run on environments with little
-  # resources, such as Minikube. If you do want to specify resources, uncomment the following
-  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-  # limits:
-  #  cpu: 100m
-  #  memory: 200Mi
-  # requests:
-  #  cpu: 100m
-  #  memory: 100Mi
-# Specify for the seperate auth service deployment
+# We usually recommend not to specify default resources and to leave this as a conscious
+# choice for the user. This also increases chances charts run on environments with little
+# resources, such as Minikube. If you do want to specify resources, uncomment the following
+# lines, adjust them as necessary, and remove the curly braces after 'resources:'.
+# limits:
+#  cpu: 100m
+#  memory: 200Mi
+# requests:
+#  cpu: 100m
+#  memory: 100Mi
+
+# Specify resources for the seperate auth service deployment
 authresources: {}
 
 rbac:
@@ -281,6 +311,7 @@ serviceAccount:
   # The name of the ServiceAccount to use.
   # If not set and create is true, a name is generated using the fullname template
   name:
+  annotations: {}
 
 persistence:
   enabled: false
@@ -327,7 +358,7 @@ strategy: RollingUpdate
 #           values:
 #           - teleport
 #
-## For high availability, distribute teleport pods to nodes as evenly as possible
+## For High Availability, distribute teleport pods to nodes as evenly as possible
 #   podAntiAffinity:
 #     preferredDuringSchedulingIgnoredDuringExecution:
 #     - podAffinityTerm:
@@ -351,4 +382,3 @@ tolerations: []
 #   operator: "Equal"
 #   value: "teleport"
 #   effect: "NoSchedule"
-

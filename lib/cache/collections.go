@@ -18,10 +18,10 @@ package cache
 
 import (
 	"context"
+	"strings"
 
-	"github.com/gravitational/teleport/lib/backend"
-	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/services"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
 
 	"github.com/gravitational/trace"
 )
@@ -29,92 +29,163 @@ import (
 // collection is responsible for managing collection
 // of resources updates
 type collection interface {
-	// fetch fetches resources
-	fetch(ctx context.Context) error
+	// fetch fetches resources and returns a function which
+	// will apply said resources to the cache.  fetch *must*
+	// not mutate cache state outside of the apply function.
+	fetch(ctx context.Context) (apply func(ctx context.Context) error, err error)
 	// process processes event
-	processEvent(ctx context.Context, e services.Event) error
+	processEvent(ctx context.Context, e types.Event) error
 	// watchKind returns a watch
 	// required for this collection
-	watchKind() services.WatchKind
+	watchKind() types.WatchKind
 	// erase erases all data in the collection
-	erase() error
+	erase(ctx context.Context) error
 }
 
 // setupCollections returns a mapping of collections
-func setupCollections(c *Cache, watches []services.WatchKind) (map[string]collection, error) {
-	collections := make(map[string]collection, len(watches))
+func setupCollections(c *Cache, watches []types.WatchKind) (map[resourceKind]collection, error) {
+	collections := make(map[resourceKind]collection, len(watches))
 	for _, watch := range watches {
+		resourceKind := resourceKindFromWatchKind(watch)
 		switch watch.Kind {
-		case services.KindCertAuthority:
+		case types.KindCertAuthority:
 			if c.Trust == nil {
 				return nil, trace.BadParameter("missing parameter Trust")
 			}
-			collections[watch.Kind] = &certAuthority{watch: watch, Cache: c}
-		case services.KindStaticTokens:
+			collections[resourceKind] = &certAuthority{watch: watch, Cache: c}
+		case types.KindStaticTokens:
 			if c.ClusterConfig == nil {
 				return nil, trace.BadParameter("missing parameter ClusterConfig")
 			}
-			collections[watch.Kind] = &staticTokens{watch: watch, Cache: c}
-		case services.KindToken:
+			collections[resourceKind] = &staticTokens{watch: watch, Cache: c}
+		case types.KindToken:
 			if c.Provisioner == nil {
 				return nil, trace.BadParameter("missing parameter Provisioner")
 			}
-			collections[watch.Kind] = &provisionToken{watch: watch, Cache: c}
-		case services.KindClusterName:
+			collections[resourceKind] = &provisionToken{watch: watch, Cache: c}
+		case types.KindClusterName:
 			if c.ClusterConfig == nil {
 				return nil, trace.BadParameter("missing parameter ClusterConfig")
 			}
-			collections[watch.Kind] = &clusterName{watch: watch, Cache: c}
-		case services.KindClusterConfig:
+			collections[resourceKind] = &clusterName{watch: watch, Cache: c}
+		case types.KindClusterConfig:
 			if c.ClusterConfig == nil {
 				return nil, trace.BadParameter("missing parameter ClusterConfig")
 			}
-			collections[watch.Kind] = &clusterConfig{watch: watch, Cache: c}
-		case services.KindUser:
+			collections[resourceKind] = &clusterConfig{watch: watch, Cache: c}
+		case types.KindClusterAuditConfig:
+			if c.ClusterConfig == nil {
+				return nil, trace.BadParameter("missing parameter ClusterConfig")
+			}
+			collections[resourceKind] = &clusterAuditConfig{watch: watch, Cache: c}
+		case types.KindClusterNetworkingConfig:
+			if c.ClusterConfig == nil {
+				return nil, trace.BadParameter("missing parameter ClusterConfig")
+			}
+			collections[resourceKind] = &clusterNetworkingConfig{watch: watch, Cache: c}
+		case types.KindClusterAuthPreference:
+			if c.ClusterConfig == nil {
+				return nil, trace.BadParameter("missing parameter ClusterConfig")
+			}
+			collections[resourceKind] = &authPreference{watch: watch, Cache: c}
+		case types.KindSessionRecordingConfig:
+			if c.ClusterConfig == nil {
+				return nil, trace.BadParameter("missing parameter ClusterConfig")
+			}
+			collections[resourceKind] = &sessionRecordingConfig{watch: watch, Cache: c}
+		case types.KindUser:
 			if c.Users == nil {
 				return nil, trace.BadParameter("missing parameter Users")
 			}
-			collections[watch.Kind] = &user{watch: watch, Cache: c}
-		case services.KindRole:
+			collections[resourceKind] = &user{watch: watch, Cache: c}
+		case types.KindRole:
 			if c.Access == nil {
 				return nil, trace.BadParameter("missing parameter Access")
 			}
-			collections[watch.Kind] = &role{watch: watch, Cache: c}
-		case services.KindNamespace:
+			collections[resourceKind] = &role{watch: watch, Cache: c}
+		case types.KindNamespace:
 			if c.Presence == nil {
 				return nil, trace.BadParameter("missing parameter Presence")
 			}
-			collections[watch.Kind] = &namespace{watch: watch, Cache: c}
-		case services.KindNode:
+			collections[resourceKind] = &namespace{watch: watch, Cache: c}
+		case types.KindNode:
 			if c.Presence == nil {
 				return nil, trace.BadParameter("missing parameter Presence")
 			}
-			collections[watch.Kind] = &node{watch: watch, Cache: c}
-		case services.KindProxy:
+			collections[resourceKind] = &node{watch: watch, Cache: c}
+		case types.KindProxy:
 			if c.Presence == nil {
 				return nil, trace.BadParameter("missing parameter Presence")
 			}
-			collections[watch.Kind] = &proxy{watch: watch, Cache: c}
-		case services.KindAuthServer:
+			collections[resourceKind] = &proxy{watch: watch, Cache: c}
+		case types.KindAuthServer:
 			if c.Presence == nil {
 				return nil, trace.BadParameter("missing parameter Presence")
 			}
-			collections[watch.Kind] = &authServer{watch: watch, Cache: c}
-		case services.KindReverseTunnel:
+			collections[resourceKind] = &authServer{watch: watch, Cache: c}
+		case types.KindReverseTunnel:
 			if c.Presence == nil {
 				return nil, trace.BadParameter("missing parameter Presence")
 			}
-			collections[watch.Kind] = &reverseTunnel{watch: watch, Cache: c}
-		case services.KindTunnelConnection:
+			collections[resourceKind] = &reverseTunnel{watch: watch, Cache: c}
+		case types.KindTunnelConnection:
 			if c.Presence == nil {
 				return nil, trace.BadParameter("missing parameter Presence")
 			}
-			collections[watch.Kind] = &tunnelConnection{watch: watch, Cache: c}
-		case services.KindAccessRequest:
+			collections[resourceKind] = &tunnelConnection{watch: watch, Cache: c}
+		case types.KindRemoteCluster:
+			if c.Presence == nil {
+				return nil, trace.BadParameter("missing parameter Presence")
+			}
+			collections[resourceKind] = &remoteCluster{watch: watch, Cache: c}
+		case types.KindAccessRequest:
 			if c.DynamicAccess == nil {
 				return nil, trace.BadParameter("missing parameter DynamicAccess")
 			}
-			collections[watch.Kind] = &accessRequest{watch: watch, Cache: c}
+			collections[resourceKind] = &accessRequest{watch: watch, Cache: c}
+		case types.KindAppServer:
+			if c.Presence == nil {
+				return nil, trace.BadParameter("missing parameter Presence")
+			}
+			collections[resourceKind] = &appServer{watch: watch, Cache: c}
+		case types.KindWebSession:
+			switch watch.SubKind {
+			case types.KindAppSession:
+				if c.AppSession == nil {
+					return nil, trace.BadParameter("missing parameter AppSession")
+				}
+				collections[resourceKind] = &appSession{watch: watch, Cache: c}
+			case types.KindWebSession:
+				if c.WebSession == nil {
+					return nil, trace.BadParameter("missing parameter WebSession")
+				}
+				collections[resourceKind] = &webSession{watch: watch, Cache: c}
+			}
+		case types.KindWebToken:
+			if c.WebToken == nil {
+				return nil, trace.BadParameter("missing parameter WebToken")
+			}
+			collections[resourceKind] = &webToken{watch: watch, Cache: c}
+		case types.KindKubeService:
+			if c.Presence == nil {
+				return nil, trace.BadParameter("missing parameter Presence")
+			}
+			collections[resourceKind] = &kubeService{watch: watch, Cache: c}
+		case types.KindDatabaseServer:
+			if c.Presence == nil {
+				return nil, trace.BadParameter("missing parameter Presence")
+			}
+			collections[resourceKind] = &databaseServer{watch: watch, Cache: c}
+		case types.KindLock:
+			if c.Access == nil {
+				return nil, trace.BadParameter("missing parameter Access")
+			}
+			collections[resourceKind] = &lock{watch: watch, Cache: c}
+		case types.KindNetworkRestrictions:
+			if c.Restrictions == nil {
+				return nil, trace.BadParameter("missing parameter Restrictions")
+			}
+			collections[resourceKind] = &networkRestrictions{watch: watch, Cache: c}
 		default:
 			return nil, trace.BadParameter("resource %q is not supported", watch.Kind)
 		}
@@ -122,14 +193,49 @@ func setupCollections(c *Cache, watches []services.WatchKind) (map[string]collec
 	return collections, nil
 }
 
+func resourceKindFromWatchKind(wk types.WatchKind) resourceKind {
+	switch wk.Kind {
+	case types.KindWebSession:
+		// Web sessions use subkind to differentiate between
+		// the types of sessions
+		return resourceKind{
+			kind:    wk.Kind,
+			subkind: wk.SubKind,
+		}
+	}
+	return resourceKind{
+		kind: wk.Kind,
+	}
+}
+
+func resourceKindFromResource(res types.Resource) resourceKind {
+	switch res.GetKind() {
+	case types.KindWebSession:
+		// Web sessions use subkind to differentiate between
+		// the types of sessions
+		return resourceKind{
+			kind:    res.GetKind(),
+			subkind: res.GetSubKind(),
+		}
+	}
+	return resourceKind{
+		kind: res.GetKind(),
+	}
+}
+
+type resourceKind struct {
+	kind    string
+	subkind string
+}
+
 type accessRequest struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (r *accessRequest) erase() error {
-	if err := r.dynamicAccessCache.DeleteAllAccessRequests(context.TODO()); err != nil {
+func (r *accessRequest) erase(ctx context.Context) error {
+	if err := r.dynamicAccessCache.DeleteAllAccessRequests(ctx); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
 		}
@@ -137,25 +243,27 @@ func (r *accessRequest) erase() error {
 	return nil
 }
 
-func (r *accessRequest) fetch(ctx context.Context) error {
-	resources, err := r.DynamicAccess.GetAccessRequests(ctx, services.AccessRequestFilter{})
+func (r *accessRequest) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	resources, err := r.DynamicAccess.GetAccessRequests(ctx, types.AccessRequestFilter{})
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	if err := r.erase(); err != nil {
-		return trace.Wrap(err)
-	}
-	for _, resource := range resources {
-		if err := r.dynamicAccessCache.UpsertAccessRequest(ctx, resource); err != nil {
+	return func(ctx context.Context) error {
+		if err := r.erase(ctx); err != nil {
 			return trace.Wrap(err)
 		}
-	}
-	return nil
+		for _, resource := range resources {
+			if err := r.dynamicAccessCache.UpsertAccessRequest(ctx, resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
 }
 
-func (r *accessRequest) processEvent(ctx context.Context, event services.Event) error {
+func (r *accessRequest) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
+	case types.OpDelete:
 		err := r.dynamicAccessCache.DeleteAccessRequest(ctx, event.Resource.GetName())
 		if err != nil {
 			// resource could be missing in the cache
@@ -166,8 +274,8 @@ func (r *accessRequest) processEvent(ctx context.Context, event services.Event) 
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(*services.AccessRequestV3)
+	case types.OpPut:
+		resource, ok := event.Resource.(*types.AccessRequestV3)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
@@ -181,17 +289,17 @@ func (r *accessRequest) processEvent(ctx context.Context, event services.Event) 
 	return nil
 }
 
-func (r *accessRequest) watchKind() services.WatchKind {
+func (r *accessRequest) watchKind() types.WatchKind {
 	return r.watch
 }
 
 type tunnelConnection struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *tunnelConnection) erase() error {
+func (c *tunnelConnection) erase(ctx context.Context) error {
 	if err := c.presenceCache.DeleteAllTunnelConnections(); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
@@ -200,25 +308,27 @@ func (c *tunnelConnection) erase() error {
 	return nil
 }
 
-func (c *tunnelConnection) fetch(ctx context.Context) error {
+func (c *tunnelConnection) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
 	resources, err := c.Presence.GetAllTunnelConnections()
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	if err := c.erase(); err != nil {
-		return trace.Wrap(err)
-	}
-	for _, resource := range resources {
-		if err := c.presenceCache.UpsertTunnelConnection(resource); err != nil {
+	return func(ctx context.Context) error {
+		if err := c.erase(ctx); err != nil {
 			return trace.Wrap(err)
 		}
-	}
-	return nil
+		for _, resource := range resources {
+			if err := c.presenceCache.UpsertTunnelConnection(resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
 }
 
-func (c *tunnelConnection) processEvent(ctx context.Context, event services.Event) error {
+func (c *tunnelConnection) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
+	case types.OpDelete:
 		err := c.presenceCache.DeleteTunnelConnection(event.Resource.GetSubKind(), event.Resource.GetName())
 		if err != nil {
 			// resource could be missing in the cache
@@ -229,8 +339,8 @@ func (c *tunnelConnection) processEvent(ctx context.Context, event services.Even
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(services.TunnelConnection)
+	case types.OpPut:
+		resource, ok := event.Resource.(types.TunnelConnection)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
@@ -244,17 +354,89 @@ func (c *tunnelConnection) processEvent(ctx context.Context, event services.Even
 	return nil
 }
 
-func (c *tunnelConnection) watchKind() services.WatchKind {
+func (c *tunnelConnection) watchKind() types.WatchKind {
+	return c.watch
+}
+
+type remoteCluster struct {
+	*Cache
+	watch types.WatchKind
+}
+
+// erase erases all data in the collection
+func (c *remoteCluster) erase(ctx context.Context) error {
+	if err := c.presenceCache.DeleteAllRemoteClusters(); err != nil {
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+	}
+	return nil
+}
+
+func (c *remoteCluster) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	resources, err := c.Presence.GetRemoteClusters()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return func(ctx context.Context) error {
+		if err := c.erase(ctx); err != nil {
+			return trace.Wrap(err)
+		}
+		for _, resource := range resources {
+			if err := c.presenceCache.CreateRemoteCluster(resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
+}
+
+func (c *remoteCluster) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		err := c.presenceCache.DeleteRemoteCluster(event.Resource.GetName())
+		if err != nil {
+			// resource could be missing in the cache
+			// expired or not created, if the first consumed
+			// event is delete
+			if !trace.IsNotFound(err) {
+				c.WithError(err).Warningf("Failed to delete remote cluster %v.", event.Resource.GetName())
+				return trace.Wrap(err)
+			}
+		}
+	case types.OpPut:
+		resource, ok := event.Resource.(types.RemoteCluster)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		c.setTTL(resource)
+		err := c.presenceCache.DeleteRemoteCluster(event.Resource.GetName())
+		if err != nil {
+			if !trace.IsNotFound(err) {
+				c.WithError(err).Warningf("Failed to delete remote cluster %v.", event.Resource.GetName())
+				return trace.Wrap(err)
+			}
+		}
+		if err := c.presenceCache.CreateRemoteCluster(resource); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		c.Warningf("Skipping unsupported event type %v.", event.Type)
+	}
+	return nil
+}
+
+func (c *remoteCluster) watchKind() types.WatchKind {
 	return c.watch
 }
 
 type reverseTunnel struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *reverseTunnel) erase() error {
+func (c *reverseTunnel) erase(ctx context.Context) error {
 	if err := c.presenceCache.DeleteAllReverseTunnels(); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
@@ -263,26 +445,28 @@ func (c *reverseTunnel) erase() error {
 	return nil
 }
 
-func (c *reverseTunnel) fetch(ctx context.Context) error {
-	resources, err := c.Presence.GetReverseTunnels(services.SkipValidation())
+func (c *reverseTunnel) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	resources, err := c.Presence.GetReverseTunnels()
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	if err := c.erase(); err != nil {
-		return trace.Wrap(err)
-	}
-	for _, resource := range resources {
-		c.setTTL(resource)
-		if err := c.presenceCache.UpsertReverseTunnel(resource); err != nil {
+	return func(ctx context.Context) error {
+		if err := c.erase(ctx); err != nil {
 			return trace.Wrap(err)
 		}
-	}
-	return nil
+		for _, resource := range resources {
+			c.setTTL(resource)
+			if err := c.presenceCache.UpsertReverseTunnel(resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
 }
 
-func (c *reverseTunnel) processEvent(ctx context.Context, event services.Event) error {
+func (c *reverseTunnel) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
+	case types.OpDelete:
 		err := c.presenceCache.DeleteReverseTunnel(event.Resource.GetName())
 		if err != nil {
 			// resource could be missing in the cache
@@ -293,8 +477,8 @@ func (c *reverseTunnel) processEvent(ctx context.Context, event services.Event) 
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(services.ReverseTunnel)
+	case types.OpPut:
+		resource, ok := event.Resource.(types.ReverseTunnel)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
@@ -308,17 +492,17 @@ func (c *reverseTunnel) processEvent(ctx context.Context, event services.Event) 
 	return nil
 }
 
-func (c *reverseTunnel) watchKind() services.WatchKind {
+func (c *reverseTunnel) watchKind() types.WatchKind {
 	return c.watch
 }
 
 type proxy struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *proxy) erase() error {
+func (c *proxy) erase(ctx context.Context) error {
 	if err := c.presenceCache.DeleteAllProxies(); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
@@ -327,28 +511,30 @@ func (c *proxy) erase() error {
 	return nil
 }
 
-func (c *proxy) fetch(ctx context.Context) error {
+func (c *proxy) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
 	resources, err := c.Presence.GetProxies()
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
 
-	if err := c.erase(); err != nil {
-		return trace.Wrap(err)
-	}
-
-	for _, resource := range resources {
-		c.setTTL(resource)
-		if err := c.presenceCache.UpsertProxy(resource); err != nil {
+	return func(ctx context.Context) error {
+		if err := c.erase(ctx); err != nil {
 			return trace.Wrap(err)
 		}
-	}
-	return nil
+
+		for _, resource := range resources {
+			c.setTTL(resource)
+			if err := c.presenceCache.UpsertProxy(resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
 }
 
-func (c *proxy) processEvent(ctx context.Context, event services.Event) error {
+func (c *proxy) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
+	case types.OpDelete:
 		err := c.presenceCache.DeleteProxy(event.Resource.GetName())
 		if err != nil {
 			// resource could be missing in the cache
@@ -359,8 +545,8 @@ func (c *proxy) processEvent(ctx context.Context, event services.Event) error {
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(services.Server)
+	case types.OpPut:
+		resource, ok := event.Resource.(types.Server)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
@@ -374,17 +560,17 @@ func (c *proxy) processEvent(ctx context.Context, event services.Event) error {
 	return nil
 }
 
-func (c *proxy) watchKind() services.WatchKind {
+func (c *proxy) watchKind() types.WatchKind {
 	return c.watch
 }
 
 type authServer struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *authServer) erase() error {
+func (c *authServer) erase(ctx context.Context) error {
 	if err := c.presenceCache.DeleteAllAuthServers(); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
@@ -393,28 +579,30 @@ func (c *authServer) erase() error {
 	return nil
 }
 
-func (c *authServer) fetch(ctx context.Context) error {
+func (c *authServer) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
 	resources, err := c.Presence.GetAuthServers()
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
 
-	if err := c.erase(); err != nil {
-		return trace.Wrap(err)
-	}
-
-	for _, resource := range resources {
-		c.setTTL(resource)
-		if err := c.presenceCache.UpsertAuthServer(resource); err != nil {
+	return func(ctx context.Context) error {
+		if err := c.erase(ctx); err != nil {
 			return trace.Wrap(err)
 		}
-	}
-	return nil
+
+		for _, resource := range resources {
+			c.setTTL(resource)
+			if err := c.presenceCache.UpsertAuthServer(resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
 }
 
-func (c *authServer) processEvent(ctx context.Context, event services.Event) error {
+func (c *authServer) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
+	case types.OpDelete:
 		err := c.presenceCache.DeleteAuthServer(event.Resource.GetName())
 		if err != nil {
 			// resource could be missing in the cache
@@ -425,8 +613,8 @@ func (c *authServer) processEvent(ctx context.Context, event services.Event) err
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(services.Server)
+	case types.OpPut:
+		resource, ok := event.Resource.(types.Server)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
@@ -440,18 +628,18 @@ func (c *authServer) processEvent(ctx context.Context, event services.Event) err
 	return nil
 }
 
-func (c *authServer) watchKind() services.WatchKind {
+func (c *authServer) watchKind() types.WatchKind {
 	return c.watch
 }
 
 type node struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *node) erase() error {
-	if err := c.presenceCache.DeleteAllNodes(defaults.Namespace); err != nil {
+func (c *node) erase(ctx context.Context) error {
+	if err := c.presenceCache.DeleteAllNodes(ctx, apidefaults.Namespace); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
 		}
@@ -459,27 +647,29 @@ func (c *node) erase() error {
 	return nil
 }
 
-func (c *node) fetch(ctx context.Context) error {
-	resources, err := c.Presence.GetNodes(defaults.Namespace)
+func (c *node) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	resources, err := c.Presence.GetNodes(ctx, apidefaults.Namespace)
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	if err := c.erase(); err != nil {
-		return trace.Wrap(err)
-	}
-	for _, resource := range resources {
-		c.setTTL(resource)
-		if _, err := c.presenceCache.UpsertNode(resource); err != nil {
+	return func(ctx context.Context) error {
+		if err := c.erase(ctx); err != nil {
 			return trace.Wrap(err)
 		}
-	}
-	return nil
+		for _, resource := range resources {
+			c.setTTL(resource)
+			if _, err := c.presenceCache.UpsertNode(ctx, resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
 }
 
-func (c *node) processEvent(ctx context.Context, event services.Event) error {
+func (c *node) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
-		err := c.presenceCache.DeleteNode(event.Resource.GetMetadata().Namespace, event.Resource.GetName())
+	case types.OpDelete:
+		err := c.presenceCache.DeleteNode(ctx, event.Resource.GetMetadata().Namespace, event.Resource.GetName())
 		if err != nil {
 			// resource could be missing in the cache
 			// expired or not created, if the first consumed
@@ -489,13 +679,13 @@ func (c *node) processEvent(ctx context.Context, event services.Event) error {
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(services.Server)
+	case types.OpPut:
+		resource, ok := event.Resource.(types.Server)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
 		c.setTTL(resource)
-		if _, err := c.presenceCache.UpsertNode(resource); err != nil {
+		if _, err := c.presenceCache.UpsertNode(ctx, resource); err != nil {
 			return trace.Wrap(err)
 		}
 	default:
@@ -504,17 +694,17 @@ func (c *node) processEvent(ctx context.Context, event services.Event) error {
 	return nil
 }
 
-func (c *node) watchKind() services.WatchKind {
+func (c *node) watchKind() types.WatchKind {
 	return c.watch
 }
 
 type namespace struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *namespace) erase() error {
+func (c *namespace) erase(ctx context.Context) error {
 	if err := c.presenceCache.DeleteAllNamespaces(); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
@@ -523,26 +713,28 @@ func (c *namespace) erase() error {
 	return nil
 }
 
-func (c *namespace) fetch(ctx context.Context) error {
+func (c *namespace) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
 	resources, err := c.Presence.GetNamespaces()
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	if err := c.erase(); err != nil {
-		return trace.Wrap(err)
-	}
-	for _, resource := range resources {
-		c.setTTL(&resource)
-		if err := c.presenceCache.UpsertNamespace(resource); err != nil {
+	return func(ctx context.Context) error {
+		if err := c.erase(ctx); err != nil {
 			return trace.Wrap(err)
 		}
-	}
-	return nil
+		for _, resource := range resources {
+			c.setTTL(&resource)
+			if err := c.presenceCache.UpsertNamespace(resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
 }
 
-func (c *namespace) processEvent(ctx context.Context, event services.Event) error {
+func (c *namespace) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
+	case types.OpDelete:
 		err := c.presenceCache.DeleteNamespace(event.Resource.GetName())
 		if err != nil {
 			// resource could be missing in the cache
@@ -553,8 +745,8 @@ func (c *namespace) processEvent(ctx context.Context, event services.Event) erro
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(*services.Namespace)
+	case types.OpPut:
+		resource, ok := event.Resource.(*types.Namespace)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
@@ -568,23 +760,28 @@ func (c *namespace) processEvent(ctx context.Context, event services.Event) erro
 	return nil
 }
 
-func (c *namespace) watchKind() services.WatchKind {
+func (c *namespace) watchKind() types.WatchKind {
 	return c.watch
 }
 
 type certAuthority struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *certAuthority) erase() error {
-	if err := c.trustCache.DeleteAllCertAuthorities(services.UserCA); err != nil {
+func (c *certAuthority) erase(ctx context.Context) error {
+	if err := c.trustCache.DeleteAllCertAuthorities(types.UserCA); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
 		}
 	}
-	if err := c.trustCache.DeleteAllCertAuthorities(services.HostCA); err != nil {
+	if err := c.trustCache.DeleteAllCertAuthorities(types.HostCA); err != nil {
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+	}
+	if err := c.trustCache.DeleteAllCertAuthorities(types.JWTSigner); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
 		}
@@ -592,40 +789,65 @@ func (c *certAuthority) erase() error {
 	return nil
 }
 
-func (c *certAuthority) fetch(ctx context.Context) error {
-	if err := c.updateCertAuthorities(services.HostCA); err != nil {
-		return trace.Wrap(err)
-	}
-	if err := c.updateCertAuthorities(services.UserCA); err != nil {
-		return trace.Wrap(err)
-	}
-	return nil
-}
-
-func (c *certAuthority) updateCertAuthorities(caType services.CertAuthType) error {
-	authorities, err := c.Trust.GetCertAuthorities(caType, c.watch.LoadSecrets, services.SkipValidation())
+func (c *certAuthority) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	applyHostCAs, err := c.fetchCertAuthorities(types.HostCA)
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	if err := c.trustCache.DeleteAllCertAuthorities(caType); err != nil {
-		if !trace.IsNotFound(err) {
+
+	applyUserCAs, err := c.fetchCertAuthorities(types.UserCA)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	applyJWTSigners, err := c.fetchCertAuthorities(types.JWTSigner)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return func(ctx context.Context) error {
+		if err := applyHostCAs(ctx); err != nil {
 			return trace.Wrap(err)
 		}
-	}
-	for _, resource := range authorities {
-		c.setTTL(resource)
-		if err := c.trustCache.UpsertCertAuthority(resource); err != nil {
+		if err := applyUserCAs(ctx); err != nil {
 			return trace.Wrap(err)
 		}
-	}
-	return nil
+		return trace.Wrap(applyJWTSigners(ctx))
+	}, nil
 }
 
-func (c *certAuthority) processEvent(ctx context.Context, event services.Event) error {
+func (c *certAuthority) fetchCertAuthorities(caType types.CertAuthType) (apply func(ctx context.Context) error, err error) {
+	authorities, err := c.Trust.GetCertAuthorities(caType, c.watch.LoadSecrets)
+	if err != nil {
+		// DELETE IN: 5.1
+		//
+		// All clusters will support JWT signers in 5.1.
+		if strings.Contains(err.Error(), "authority type is not supported") {
+			return func(ctx context.Context) error { return nil }, nil
+		}
+		return nil, trace.Wrap(err)
+	}
+	return func(ctx context.Context) error {
+		if err := c.trustCache.DeleteAllCertAuthorities(caType); err != nil {
+			if !trace.IsNotFound(err) {
+				return trace.Wrap(err)
+			}
+		}
+		for _, resource := range authorities {
+			c.setTTL(resource)
+			if err := c.trustCache.UpsertCertAuthority(resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
+}
+
+func (c *certAuthority) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
-		err := c.trustCache.DeleteCertAuthority(services.CertAuthID{
-			Type:       services.CertAuthType(event.Resource.GetSubKind()),
+	case types.OpDelete:
+		err := c.trustCache.DeleteCertAuthority(types.CertAuthID{
+			Type:       types.CertAuthType(event.Resource.GetSubKind()),
 			DomainName: event.Resource.GetName(),
 		})
 		if err != nil {
@@ -637,8 +859,8 @@ func (c *certAuthority) processEvent(ctx context.Context, event services.Event) 
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(services.CertAuthority)
+	case types.OpPut:
+		resource, ok := event.Resource.(types.CertAuthority)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
@@ -652,17 +874,17 @@ func (c *certAuthority) processEvent(ctx context.Context, event services.Event) 
 	return nil
 }
 
-func (c *certAuthority) watchKind() services.WatchKind {
+func (c *certAuthority) watchKind() types.WatchKind {
 	return c.watch
 }
 
 type staticTokens struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *staticTokens) erase() error {
+func (c *staticTokens) erase(ctx context.Context) error {
 	err := c.clusterConfigCache.DeleteStaticTokens()
 	if err != nil {
 		if !trace.IsNotFound(err) {
@@ -672,28 +894,36 @@ func (c *staticTokens) erase() error {
 	return nil
 }
 
-func (c *staticTokens) fetch(ctx context.Context) error {
+func (c *staticTokens) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	var noTokens bool
 	staticTokens, err := c.ClusterConfig.GetStaticTokens()
 	if err != nil {
 		if !trace.IsNotFound(err) {
-			return trace.Wrap(err)
+			return nil, trace.Wrap(err)
 		}
-		if err := c.erase(); err != nil {
+		noTokens = true
+	}
+	return func(ctx context.Context) error {
+		// either zero or one instance exists, so we either erase or
+		// update, but not both.
+		if noTokens {
+			if err := c.erase(ctx); err != nil {
+				return trace.Wrap(err)
+			}
+			return nil
+		}
+		c.setTTL(staticTokens)
+		err = c.clusterConfigCache.SetStaticTokens(staticTokens)
+		if err != nil {
 			return trace.Wrap(err)
 		}
 		return nil
-	}
-	c.setTTL(staticTokens)
-	err = c.clusterConfigCache.SetStaticTokens(staticTokens)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	return nil
+	}, nil
 }
 
-func (c *staticTokens) processEvent(ctx context.Context, event services.Event) error {
+func (c *staticTokens) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
+	case types.OpDelete:
 		err := c.clusterConfigCache.DeleteStaticTokens()
 		if err != nil {
 			// resource could be missing in the cache
@@ -704,8 +934,8 @@ func (c *staticTokens) processEvent(ctx context.Context, event services.Event) e
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(services.StaticTokens)
+	case types.OpPut:
+		resource, ok := event.Resource.(types.StaticTokens)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
@@ -719,17 +949,17 @@ func (c *staticTokens) processEvent(ctx context.Context, event services.Event) e
 	return nil
 }
 
-func (c *staticTokens) watchKind() services.WatchKind {
+func (c *staticTokens) watchKind() types.WatchKind {
 	return c.watch
 }
 
 type provisionToken struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *provisionToken) erase() error {
+func (c *provisionToken) erase(ctx context.Context) error {
 	if err := c.provisionerCache.DeleteAllTokens(); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
@@ -738,27 +968,29 @@ func (c *provisionToken) erase() error {
 	return nil
 }
 
-func (c *provisionToken) fetch(ctx context.Context) error {
-	tokens, err := c.Provisioner.GetTokens()
+func (c *provisionToken) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	tokens, err := c.Provisioner.GetTokens(ctx)
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	if err := c.erase(); err != nil {
-		return trace.Wrap(err)
-	}
-	for _, resource := range tokens {
-		c.setTTL(resource)
-		if err := c.provisionerCache.UpsertToken(resource); err != nil {
+	return func(ctx context.Context) error {
+		if err := c.erase(ctx); err != nil {
 			return trace.Wrap(err)
 		}
-	}
-	return nil
+		for _, resource := range tokens {
+			c.setTTL(resource)
+			if err := c.provisionerCache.UpsertToken(ctx, resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
 }
 
-func (c *provisionToken) processEvent(ctx context.Context, event services.Event) error {
+func (c *provisionToken) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
-		err := c.provisionerCache.DeleteToken(event.Resource.GetName())
+	case types.OpDelete:
+		err := c.provisionerCache.DeleteToken(ctx, event.Resource.GetName())
 		if err != nil {
 			// resource could be missing in the cache
 			// expired or not created, if the first consumed
@@ -768,13 +1000,13 @@ func (c *provisionToken) processEvent(ctx context.Context, event services.Event)
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(services.ProvisionToken)
+	case types.OpPut:
+		resource, ok := event.Resource.(types.ProvisionToken)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
 		c.setTTL(resource)
-		if err := c.provisionerCache.UpsertToken(resource); err != nil {
+		if err := c.provisionerCache.UpsertToken(ctx, resource); err != nil {
 			return trace.Wrap(err)
 		}
 	default:
@@ -783,17 +1015,17 @@ func (c *provisionToken) processEvent(ctx context.Context, event services.Event)
 	return nil
 }
 
-func (c *provisionToken) watchKind() services.WatchKind {
+func (c *provisionToken) watchKind() types.WatchKind {
 	return c.watch
 }
 
 type clusterConfig struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *clusterConfig) erase() error {
+func (c *clusterConfig) erase(ctx context.Context) error {
 	err := c.clusterConfigCache.DeleteClusterConfig()
 	if err != nil {
 		if !trace.IsNotFound(err) {
@@ -803,29 +1035,42 @@ func (c *clusterConfig) erase() error {
 	return nil
 }
 
-func (c *clusterConfig) fetch(ctx context.Context) error {
+func (c *clusterConfig) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	var noConfig bool
 	clusterConfig, err := c.ClusterConfig.GetClusterConfig()
 	if err != nil {
 		if !trace.IsNotFound(err) {
-			return trace.Wrap(err)
+			return nil, trace.Wrap(err)
 		}
-		if err := c.erase(); err != nil {
+		noConfig = true
+	}
+	return func(ctx context.Context) error {
+		// either zero or one instance exists, so we either erase or
+		// update, but not both.
+		if noConfig {
+			if err := c.erase(ctx); err != nil {
+				return trace.Wrap(err)
+			}
+			return nil
+		}
+		c.setTTL(clusterConfig)
+
+		// To ensure backward compatibility, ClusterConfig resources/events may
+		// feature fields that now belong to separate resources/events. Since this
+		// code is able to process the new events, ignore any such legacy fields.
+		// DELETE IN 8.0.0
+		clusterConfig.ClearLegacyFields()
+
+		if err := c.clusterConfigCache.SetClusterConfig(clusterConfig); err != nil {
 			return trace.Wrap(err)
 		}
 		return nil
-	}
-	c.setTTL(clusterConfig)
-	if err := c.clusterConfigCache.SetClusterConfig(clusterConfig); err != nil {
-		if !trace.IsNotFound(err) {
-			return trace.Wrap(err)
-		}
-	}
-	return nil
+	}, nil
 }
 
-func (c *clusterConfig) processEvent(ctx context.Context, event services.Event) error {
+func (c *clusterConfig) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
+	case types.OpDelete:
 		err := c.clusterConfigCache.DeleteClusterConfig()
 		if err != nil {
 			// resource could be missing in the cache
@@ -836,12 +1081,19 @@ func (c *clusterConfig) processEvent(ctx context.Context, event services.Event) 
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(services.ClusterConfig)
+	case types.OpPut:
+		resource, ok := event.Resource.(types.ClusterConfig)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
 		c.setTTL(resource)
+
+		// To ensure backward compatibility, ClusterConfig resources/events may
+		// feature fields that now belong to separate resources/events. Since this
+		// code is able to process the new events, ignore any such legacy fields.
+		// DELETE IN 8.0.0
+		resource.ClearLegacyFields()
+
 		if err := c.clusterConfigCache.SetClusterConfig(resource); err != nil {
 			return trace.Wrap(err)
 		}
@@ -851,17 +1103,17 @@ func (c *clusterConfig) processEvent(ctx context.Context, event services.Event) 
 	return nil
 }
 
-func (c *clusterConfig) watchKind() services.WatchKind {
+func (c *clusterConfig) watchKind() types.WatchKind {
 	return c.watch
 }
 
 type clusterName struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *clusterName) erase() error {
+func (c *clusterName) erase(ctx context.Context) error {
 	err := c.clusterConfigCache.DeleteClusterName()
 	if err != nil {
 		if !trace.IsNotFound(err) {
@@ -871,29 +1123,37 @@ func (c *clusterName) erase() error {
 	return nil
 }
 
-func (c *clusterName) fetch(ctx context.Context) error {
+func (c *clusterName) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	var noName bool
 	clusterName, err := c.ClusterConfig.GetClusterName()
 	if err != nil {
 		if !trace.IsNotFound(err) {
-			return trace.Wrap(err)
+			return nil, trace.Wrap(err)
 		}
-		if err := c.erase(); err != nil {
-			return trace.Wrap(err)
+		noName = true
+	}
+	return func(ctx context.Context) error {
+		// either zero or one instance exists, so we either erase or
+		// update, but not both.
+		if noName {
+			if err := c.erase(ctx); err != nil {
+				return trace.Wrap(err)
+			}
+			return nil
+		}
+		c.setTTL(clusterName)
+		if err := c.clusterConfigCache.UpsertClusterName(clusterName); err != nil {
+			if !trace.IsNotFound(err) {
+				return trace.Wrap(err)
+			}
 		}
 		return nil
-	}
-	c.setTTL(clusterName)
-	if err := c.clusterConfigCache.UpsertClusterName(clusterName); err != nil {
-		if !trace.IsNotFound(err) {
-			return trace.Wrap(err)
-		}
-	}
-	return nil
+	}, nil
 }
 
-func (c *clusterName) processEvent(ctx context.Context, event services.Event) error {
+func (c *clusterName) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
+	case types.OpDelete:
 		err := c.clusterConfigCache.DeleteClusterName()
 		if err != nil {
 			// resource could be missing in the cache
@@ -904,8 +1164,8 @@ func (c *clusterName) processEvent(ctx context.Context, event services.Event) er
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(services.ClusterName)
+	case types.OpPut:
+		resource, ok := event.Resource.(types.ClusterName)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
@@ -919,17 +1179,17 @@ func (c *clusterName) processEvent(ctx context.Context, event services.Event) er
 	return nil
 }
 
-func (c *clusterName) watchKind() services.WatchKind {
+func (c *clusterName) watchKind() types.WatchKind {
 	return c.watch
 }
 
 type user struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *user) erase() error {
+func (c *user) erase(ctx context.Context) error {
 	if err := c.usersCache.DeleteAllUsers(); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
@@ -938,26 +1198,28 @@ func (c *user) erase() error {
 	return nil
 }
 
-func (c *user) fetch(ctx context.Context) error {
+func (c *user) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
 	resources, err := c.Users.GetUsers(false)
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	if err := c.erase(); err != nil {
-		return trace.Wrap(err)
-	}
-	for _, resource := range resources {
-		c.setTTL(resource)
-		if err := c.usersCache.UpsertUser(resource); err != nil {
+	return func(ctx context.Context) error {
+		if err := c.erase(ctx); err != nil {
 			return trace.Wrap(err)
 		}
-	}
-	return nil
+		for _, resource := range resources {
+			c.setTTL(resource)
+			if err := c.usersCache.UpsertUser(resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
 }
 
-func (c *user) processEvent(ctx context.Context, event services.Event) error {
+func (c *user) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
+	case types.OpDelete:
 		err := c.usersCache.DeleteUser(ctx, event.Resource.GetName())
 		if err != nil {
 			// resource could be missing in the cache
@@ -969,8 +1231,8 @@ func (c *user) processEvent(ctx context.Context, event services.Event) error {
 			}
 			return nil
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(services.User)
+	case types.OpPut:
+		resource, ok := event.Resource.(types.User)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
@@ -984,17 +1246,17 @@ func (c *user) processEvent(ctx context.Context, event services.Event) error {
 	return nil
 }
 
-func (c *user) watchKind() services.WatchKind {
+func (c *user) watchKind() types.WatchKind {
 	return c.watch
 }
 
 type role struct {
 	*Cache
-	watch services.WatchKind
+	watch types.WatchKind
 }
 
 // erase erases all data in the collection
-func (c *role) erase() error {
+func (c *role) erase(ctx context.Context) error {
 	if err := c.accessCache.DeleteAllRoles(); err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
@@ -1003,26 +1265,28 @@ func (c *role) erase() error {
 	return nil
 }
 
-func (c *role) fetch(ctx context.Context) error {
-	resources, err := c.Access.GetRoles()
+func (c *role) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	resources, err := c.Access.GetRoles(ctx)
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	if err := c.erase(); err != nil {
-		return trace.Wrap(err)
-	}
-	for _, resource := range resources {
-		c.setTTL(resource)
-		if err := c.accessCache.UpsertRole(ctx, resource); err != nil {
+	return func(ctx context.Context) error {
+		if err := c.erase(ctx); err != nil {
 			return trace.Wrap(err)
 		}
-	}
-	return nil
+		for _, resource := range resources {
+			c.setTTL(resource)
+			if err := c.accessCache.UpsertRole(ctx, resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
 }
 
-func (c *role) processEvent(ctx context.Context, event services.Event) error {
+func (c *role) processEvent(ctx context.Context, event types.Event) error {
 	switch event.Type {
-	case backend.OpDelete:
+	case types.OpDelete:
 		err := c.accessCache.DeleteRole(ctx, event.Resource.GetName())
 		if err != nil {
 			// resource could be missing in the cache
@@ -1033,8 +1297,8 @@ func (c *role) processEvent(ctx context.Context, event services.Event) error {
 				return trace.Wrap(err)
 			}
 		}
-	case backend.OpPut:
-		resource, ok := event.Resource.(services.Role)
+	case types.OpPut:
+		resource, ok := event.Resource.(types.Role)
 		if !ok {
 			return trace.BadParameter("unexpected type %T", event.Resource)
 		}
@@ -1048,6 +1312,793 @@ func (c *role) processEvent(ctx context.Context, event services.Event) error {
 	return nil
 }
 
-func (c *role) watchKind() services.WatchKind {
+func (c *role) watchKind() types.WatchKind {
 	return c.watch
+}
+
+type databaseServer struct {
+	*Cache
+	watch types.WatchKind
+}
+
+func (s *databaseServer) erase(ctx context.Context) error {
+	err := s.presenceCache.DeleteAllDatabaseServers(ctx, apidefaults.Namespace)
+	if err != nil && !trace.IsNotFound(err) {
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+func (s *databaseServer) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	resources, err := s.Presence.GetDatabaseServers(ctx, apidefaults.Namespace)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return func(ctx context.Context) error {
+		if err := s.erase(ctx); err != nil {
+			return trace.Wrap(err)
+		}
+		for _, resource := range resources {
+			s.setTTL(resource)
+			if _, err := s.presenceCache.UpsertDatabaseServer(ctx, resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
+}
+
+func (s *databaseServer) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		err := s.presenceCache.DeleteDatabaseServer(ctx,
+			event.Resource.GetMetadata().Namespace,
+			event.Resource.GetMetadata().Description, // Cache passes host ID via description field.
+			event.Resource.GetName())
+		if err != nil {
+			// Resource could be missing in the cache expired or not created,
+			// if the first consumed event is delete.
+			if !trace.IsNotFound(err) {
+				s.WithError(err).Warn("Failed to delete resource.")
+				return trace.Wrap(err)
+			}
+		}
+	case types.OpPut:
+		resource, ok := event.Resource.(types.DatabaseServer)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		s.setTTL(resource)
+		if _, err := s.presenceCache.UpsertDatabaseServer(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		s.Warnf("Skipping unsupported event type %v.", event.Type)
+	}
+	return nil
+}
+
+func (s *databaseServer) watchKind() types.WatchKind {
+	return s.watch
+}
+
+type appServer struct {
+	*Cache
+	watch types.WatchKind
+}
+
+// erase erases all data in the collection
+func (a *appServer) erase(ctx context.Context) error {
+	if err := a.presenceCache.DeleteAllAppServers(ctx, apidefaults.Namespace); err != nil {
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+	}
+	return nil
+}
+
+func (a *appServer) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	resources, err := a.Presence.GetAppServers(ctx, apidefaults.Namespace)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return func(ctx context.Context) error {
+		if err := a.erase(ctx); err != nil {
+			return trace.Wrap(err)
+		}
+		for _, resource := range resources {
+			a.setTTL(resource)
+			if _, err := a.presenceCache.UpsertAppServer(ctx, resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
+}
+
+func (a *appServer) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		err := a.presenceCache.DeleteAppServer(ctx, event.Resource.GetMetadata().Namespace, event.Resource.GetName())
+		if err != nil {
+			// Resource could be missing in the cache expired or not created, if the
+			// first consumed event is delete.
+			if !trace.IsNotFound(err) {
+				a.Warningf("Failed to delete resource %v.", err)
+				return trace.Wrap(err)
+			}
+		}
+	case types.OpPut:
+		resource, ok := event.Resource.(types.Server)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		a.setTTL(resource)
+		if _, err := a.presenceCache.UpsertAppServer(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		a.Warningf("Skipping unsupported event type %v.", event.Type)
+	}
+	return nil
+}
+
+func (a *appServer) watchKind() types.WatchKind {
+	return a.watch
+}
+
+type appSession struct {
+	*Cache
+	watch types.WatchKind
+}
+
+func (a *appSession) erase(ctx context.Context) error {
+	if err := a.appSessionCache.DeleteAllAppSessions(ctx); err != nil {
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+	}
+	return nil
+}
+
+func (a *appSession) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	resources, err := a.AppSession.GetAppSessions(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return func(ctx context.Context) error {
+		if err := a.erase(ctx); err != nil {
+			return trace.Wrap(err)
+		}
+		for _, resource := range resources {
+			a.setTTL(resource)
+			if err := a.appSessionCache.UpsertAppSession(ctx, resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
+}
+
+func (a *appSession) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		err := a.appSessionCache.DeleteAppSession(ctx, types.DeleteAppSessionRequest{
+			SessionID: event.Resource.GetName(),
+		})
+		if err != nil {
+			// Resource could be missing in the cache expired or not created, if the
+			// first consumed event is delete.
+			if !trace.IsNotFound(err) {
+				a.Warningf("Failed to delete resource %v.", err)
+				return trace.Wrap(err)
+			}
+		}
+	case types.OpPut:
+		resource, ok := event.Resource.(types.WebSession)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		a.setTTL(resource)
+		if err := a.appSessionCache.UpsertAppSession(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		a.Warningf("Skipping unsupported event type %v.", event.Type)
+	}
+	return nil
+}
+
+func (a *appSession) watchKind() types.WatchKind {
+	return a.watch
+}
+
+type webSession struct {
+	*Cache
+	watch types.WatchKind
+}
+
+func (r *webSession) erase(ctx context.Context) error {
+	err := r.webSessionCache.DeleteAll(ctx)
+	if err != nil && !trace.IsNotFound(err) {
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+func (r *webSession) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	resources, err := r.WebSession.List(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return func(ctx context.Context) error {
+		if err := r.erase(ctx); err != nil {
+			return trace.Wrap(err)
+		}
+		for _, resource := range resources {
+			r.setTTL(resource)
+			if err := r.webSessionCache.Upsert(ctx, resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
+}
+
+func (r *webSession) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		err := r.webSessionCache.Delete(ctx, types.DeleteWebSessionRequest{
+			SessionID: event.Resource.GetName(),
+		})
+		if err != nil {
+			// Resource could be missing in the cache expired or not created, if the
+			// first consumed event is delete.
+			if !trace.IsNotFound(err) {
+				r.WithError(err).Warn("Failed to delete resource.")
+				return trace.Wrap(err)
+			}
+		}
+	case types.OpPut:
+		resource, ok := event.Resource.(types.WebSession)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		r.setTTL(resource)
+		if err := r.webSessionCache.Upsert(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		r.WithField("event", event.Type).Warn("Skipping unsupported event type.")
+	}
+	return nil
+}
+
+func (r *webSession) watchKind() types.WatchKind {
+	return r.watch
+}
+
+type webToken struct {
+	*Cache
+	watch types.WatchKind
+}
+
+func (r *webToken) erase(ctx context.Context) error {
+	err := r.webTokenCache.DeleteAll(ctx)
+	if err != nil && !trace.IsNotFound(err) {
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+func (r *webToken) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	resources, err := r.WebToken.List(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return func(ctx context.Context) error {
+		if err := r.erase(ctx); err != nil {
+			return trace.Wrap(err)
+		}
+		for _, resource := range resources {
+			r.setTTL(resource)
+			if err := r.webTokenCache.Upsert(ctx, resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
+}
+
+func (r *webToken) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		err := r.webTokenCache.Delete(ctx, types.DeleteWebTokenRequest{
+			Token: event.Resource.GetName(),
+		})
+		if err != nil {
+			// Resource could be missing in the cache expired or not created, if the
+			// first consumed event is delete.
+			if !trace.IsNotFound(err) {
+				r.WithError(err).Warn("Failed to delete resource.")
+				return trace.Wrap(err)
+			}
+		}
+	case types.OpPut:
+		resource, ok := event.Resource.(types.WebToken)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		r.setTTL(resource)
+		if err := r.webTokenCache.Upsert(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		r.WithField("event", event.Type).Warn("Skipping unsupported event type.")
+	}
+	return nil
+}
+
+func (r *webToken) watchKind() types.WatchKind {
+	return r.watch
+}
+
+type kubeService struct {
+	*Cache
+	watch types.WatchKind
+}
+
+func (c *kubeService) erase(ctx context.Context) error {
+	if err := c.presenceCache.DeleteAllKubeServices(ctx); err != nil {
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+	}
+	return nil
+}
+
+func (c *kubeService) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	resources, err := c.Presence.GetKubeServices(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return func(ctx context.Context) error {
+		if err := c.erase(ctx); err != nil {
+			return trace.Wrap(err)
+		}
+
+		for _, resource := range resources {
+			c.setTTL(resource)
+			if err := c.presenceCache.UpsertKubeService(ctx, resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
+}
+
+func (c *kubeService) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		err := c.presenceCache.DeleteKubeService(ctx, event.Resource.GetName())
+		if err != nil {
+			if !trace.IsNotFound(err) {
+				c.Warningf("Failed to delete resource %v.", err)
+				return trace.Wrap(err)
+			}
+		}
+	case types.OpPut:
+		resource, ok := event.Resource.(types.Server)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		c.setTTL(resource)
+		if err := c.presenceCache.UpsertKubeService(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		c.Warningf("Skipping unsupported event type %v.", event.Type)
+	}
+	return nil
+}
+
+func (c *kubeService) watchKind() types.WatchKind {
+	return c.watch
+}
+
+type authPreference struct {
+	*Cache
+	watch types.WatchKind
+}
+
+func (c *authPreference) erase(ctx context.Context) error {
+	if err := c.clusterConfigCache.DeleteAuthPreference(ctx); err != nil {
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+	}
+	return nil
+}
+
+func (c *authPreference) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	var noConfig bool
+	resource, err := c.ClusterConfig.GetAuthPreference(ctx)
+	if err != nil {
+		if !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
+		noConfig = true
+	}
+	return func(ctx context.Context) error {
+		// either zero or one instance exists, so we either erase or
+		// update, but not both.
+		if noConfig {
+			if err := c.erase(ctx); err != nil {
+				return trace.Wrap(err)
+			}
+			return nil
+		}
+
+		c.setTTL(resource)
+		if err := c.clusterConfigCache.SetAuthPreference(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+		return nil
+	}, nil
+}
+
+func (c *authPreference) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		err := c.clusterConfigCache.DeleteAuthPreference(ctx)
+		if err != nil {
+			if !trace.IsNotFound(err) {
+				c.Warningf("Failed to delete resource %v.", err)
+				return trace.Wrap(err)
+			}
+		}
+	case types.OpPut:
+		resource, ok := event.Resource.(types.AuthPreference)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		c.setTTL(resource)
+		if err := c.clusterConfigCache.SetAuthPreference(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		c.Warningf("Skipping unsupported event type %v.", event.Type)
+	}
+	return nil
+}
+
+func (c *authPreference) watchKind() types.WatchKind {
+	return c.watch
+}
+
+type clusterAuditConfig struct {
+	*Cache
+	watch types.WatchKind
+}
+
+func (c *clusterAuditConfig) erase(ctx context.Context) error {
+	if err := c.clusterConfigCache.DeleteClusterAuditConfig(ctx); err != nil {
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+	}
+	return nil
+}
+
+func (c *clusterAuditConfig) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	var noConfig bool
+	resource, err := c.ClusterConfig.GetClusterAuditConfig(ctx)
+	if err != nil {
+		if !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
+		noConfig = true
+	}
+	return func(ctx context.Context) error {
+		// either zero or one instance exists, so we either erase or
+		// update, but not both.
+		if noConfig {
+			if err := c.erase(ctx); err != nil {
+				return trace.Wrap(err)
+			}
+			return nil
+		}
+
+		c.setTTL(resource)
+		if err := c.clusterConfigCache.SetClusterAuditConfig(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+		return nil
+	}, nil
+}
+
+func (c *clusterAuditConfig) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		err := c.clusterConfigCache.DeleteClusterAuditConfig(ctx)
+		if err != nil {
+			if !trace.IsNotFound(err) {
+				c.Warningf("Failed to delete resource %v.", err)
+				return trace.Wrap(err)
+			}
+		}
+	case types.OpPut:
+		resource, ok := event.Resource.(types.ClusterAuditConfig)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		c.setTTL(resource)
+		if err := c.clusterConfigCache.SetClusterAuditConfig(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		c.Warningf("Skipping unsupported event type %v.", event.Type)
+	}
+	return nil
+}
+
+func (c *clusterAuditConfig) watchKind() types.WatchKind {
+	return c.watch
+}
+
+type clusterNetworkingConfig struct {
+	*Cache
+	watch types.WatchKind
+}
+
+func (c *clusterNetworkingConfig) erase(ctx context.Context) error {
+	if err := c.clusterConfigCache.DeleteClusterNetworkingConfig(ctx); err != nil {
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+	}
+	return nil
+}
+
+func (c *clusterNetworkingConfig) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	var noConfig bool
+	resource, err := c.ClusterConfig.GetClusterNetworkingConfig(ctx)
+	if err != nil {
+		if !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
+		noConfig = true
+	}
+	return func(ctx context.Context) error {
+		// either zero or one instance exists, so we either erase or
+		// update, but not both.
+		if noConfig {
+			if err := c.erase(ctx); err != nil {
+				return trace.Wrap(err)
+			}
+			return nil
+		}
+
+		c.setTTL(resource)
+		if err := c.clusterConfigCache.SetClusterNetworkingConfig(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+		return nil
+	}, nil
+}
+
+func (c *clusterNetworkingConfig) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		err := c.clusterConfigCache.DeleteClusterNetworkingConfig(ctx)
+		if err != nil {
+			if !trace.IsNotFound(err) {
+				c.Warningf("Failed to delete resource %v.", err)
+				return trace.Wrap(err)
+			}
+		}
+	case types.OpPut:
+		resource, ok := event.Resource.(types.ClusterNetworkingConfig)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		c.setTTL(resource)
+		if err := c.clusterConfigCache.SetClusterNetworkingConfig(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		c.Warningf("Skipping unsupported event type %v.", event.Type)
+	}
+	return nil
+}
+
+func (c *clusterNetworkingConfig) watchKind() types.WatchKind {
+	return c.watch
+}
+
+type sessionRecordingConfig struct {
+	*Cache
+	watch types.WatchKind
+}
+
+func (c *sessionRecordingConfig) erase(ctx context.Context) error {
+	if err := c.clusterConfigCache.DeleteSessionRecordingConfig(ctx); err != nil {
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+	}
+	return nil
+}
+
+func (c *sessionRecordingConfig) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	var noConfig bool
+	resource, err := c.ClusterConfig.GetSessionRecordingConfig(ctx)
+	if err != nil {
+		if !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
+		noConfig = true
+	}
+	return func(ctx context.Context) error {
+		// either zero or one instance exists, so we either erase or
+		// update, but not both.
+		if noConfig {
+			if err := c.erase(ctx); err != nil {
+				return trace.Wrap(err)
+			}
+			return nil
+		}
+
+		c.setTTL(resource)
+		if err := c.clusterConfigCache.SetSessionRecordingConfig(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+		return nil
+	}, nil
+}
+
+func (c *sessionRecordingConfig) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		err := c.clusterConfigCache.DeleteSessionRecordingConfig(ctx)
+		if err != nil {
+			if !trace.IsNotFound(err) {
+				c.Warningf("Failed to delete resource %v.", err)
+				return trace.Wrap(err)
+			}
+		}
+	case types.OpPut:
+		resource, ok := event.Resource.(types.SessionRecordingConfig)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		c.setTTL(resource)
+		if err := c.clusterConfigCache.SetSessionRecordingConfig(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		c.Warningf("Skipping unsupported event type %v.", event.Type)
+	}
+	return nil
+}
+
+func (c *sessionRecordingConfig) watchKind() types.WatchKind {
+	return c.watch
+}
+
+type lock struct {
+	*Cache
+	watch types.WatchKind
+}
+
+func (c *lock) erase(ctx context.Context) error {
+	err := c.accessCache.DeleteAllLocks(ctx)
+	if err != nil && !trace.IsNotFound(err) {
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+func (c *lock) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	resources, err := c.Access.GetLocks(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return func(ctx context.Context) error {
+		if err := c.erase(ctx); err != nil {
+			return trace.Wrap(err)
+		}
+		for _, resource := range resources {
+			c.setTTL(resource)
+			if err := c.accessCache.UpsertLock(ctx, resource); err != nil {
+				return trace.Wrap(err)
+			}
+		}
+		return nil
+	}, nil
+}
+
+func (c *lock) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		err := c.accessCache.DeleteLock(ctx, event.Resource.GetName())
+		if err != nil {
+			// Resource could be missing in the cache, expired or not created,
+			// if the first consumed event is delete.
+			if !trace.IsNotFound(err) {
+				c.WithError(err).Warn("Failed to delete lock.")
+				return trace.Wrap(err)
+			}
+		}
+	case types.OpPut:
+		resource, ok := event.Resource.(types.Lock)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		c.setTTL(resource)
+		if err := c.accessCache.UpsertLock(ctx, resource); err != nil {
+			return trace.Wrap(err)
+		}
+	default:
+		c.Warnf("Skipping unsupported event type %v.", event.Type)
+	}
+	return nil
+}
+
+func (c *lock) watchKind() types.WatchKind {
+	return c.watch
+}
+
+type networkRestrictions struct {
+	*Cache
+	watch types.WatchKind
+}
+
+func (r *networkRestrictions) erase(ctx context.Context) error {
+	if err := r.restrictionsCache.DeleteNetworkRestrictions(ctx); err != nil {
+		if !trace.IsNotFound(err) {
+			return trace.Wrap(err)
+		}
+	}
+	return nil
+}
+
+func (r *networkRestrictions) fetch(ctx context.Context) (apply func(ctx context.Context) error, err error) {
+	nr, err := r.Restrictions.GetNetworkRestrictions(ctx)
+	if err != nil {
+		if !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
+		nr = nil
+	}
+	return func(ctx context.Context) error {
+		if nr == nil {
+			if err := r.erase(ctx); err != nil {
+				return trace.Wrap(err)
+			}
+			return nil
+		}
+		return trace.Wrap(r.restrictionsCache.SetNetworkRestrictions(ctx, nr))
+	}, nil
+}
+
+func (r *networkRestrictions) processEvent(ctx context.Context, event types.Event) error {
+	switch event.Type {
+	case types.OpDelete:
+		return trace.Wrap(r.restrictionsCache.DeleteNetworkRestrictions(ctx))
+	case types.OpPut:
+		resource, ok := event.Resource.(types.NetworkRestrictions)
+		if !ok {
+			return trace.BadParameter("unexpected type %T", event.Resource)
+		}
+		r.setTTL(resource)
+		return trace.Wrap(r.restrictionsCache.SetNetworkRestrictions(ctx, resource))
+	default:
+		r.Warnf("Skipping unsupported event type %v.", event.Type)
+	}
+	return nil
+}
+
+func (r *networkRestrictions) watchKind() types.WatchKind {
+	return r.watch
 }

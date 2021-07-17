@@ -1,5 +1,5 @@
 /*
-Copyright 2015-2020 Gravitational, Inc.
+Copyright 2015-2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,12 +19,23 @@ package service
 import (
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
+	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/net/http/httpguts"
+	"k8s.io/apimachinery/pkg/util/validation"
 
+	"github.com/gravitational/teleport/api/types"
+	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/lite"
@@ -34,8 +45,12 @@ import (
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/limiter"
 	"github.com/gravitational/teleport/lib/pam"
+	"github.com/gravitational/teleport/lib/plugin"
+	restricted "github.com/gravitational/teleport/lib/restrictedsession"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/srv/app"
 	"github.com/gravitational/teleport/lib/sshca"
+	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/ghodss/yaml"
@@ -74,18 +89,24 @@ type Config struct {
 	// in case if they loose connection to auth servers
 	CachePolicy CachePolicy
 
-	// SSH role an SSH endpoint server
+	// Auth service configuration. Manages cluster state and configuration.
+	Auth AuthConfig
+
+	// Proxy service configuration. Manages incoming and outbound
+	// connections to the cluster.
+	Proxy ProxyConfig
+
+	// SSH service configuration. Manages SSH servers running within the cluster.
 	SSH SSHConfig
 
-	// Auth server authentication and authorization server config
-	Auth AuthConfig
+	// App service configuration. Manages applications running within the cluster.
+	Apps AppsConfig
+
+	// Databases defines database proxy service configuration.
+	Databases DatabasesConfig
 
 	// Keygen points to a key generator implementation
 	Keygen sshca.Authority
-
-	// Proxy is SSH proxy that manages incoming and outbound connections
-	// via multiple reverse tunnels
-	Proxy ProxyConfig
 
 	// HostUUID is a unique UUID of this host (it will be known via this UUID within
 	// a teleport cluster). It's automatically generated on 1st start
@@ -96,10 +117,10 @@ type Config struct {
 
 	// ReverseTunnels is a list of reverse tunnels to create on the
 	// first cluster start
-	ReverseTunnels []services.ReverseTunnel
+	ReverseTunnels []types.ReverseTunnel
 
 	// OIDCConnectors is a list of trusted OpenID Connect identity providers
-	OIDCConnectors []services.OIDCConnector
+	OIDCConnectors []types.OIDCConnector
 
 	// PidFile is a full path of the PID file for teleport daemon
 	PIDFile string
@@ -111,7 +132,7 @@ type Config struct {
 	Presence services.Presence
 
 	// Events is events service
-	Events services.Events
+	Events types.Events
 
 	// Provisioner is a service that keeps track of provisioning tokens
 	Provisioner services.Provisioner
@@ -155,7 +176,7 @@ type Config struct {
 
 	// UploadEventsC is a channel for upload events
 	// used in tests
-	UploadEventsC chan *events.UploadEvent `json:"-"`
+	UploadEventsC chan events.UploadEvent `json:"-"`
 
 	// FileDescriptors is an optional list of file descriptors for the process
 	// to inherit and use for listeners, used for in-process updates.
@@ -183,6 +204,15 @@ type Config struct {
 
 	// BPFConfig holds configuration for the BPF service.
 	BPFConfig *bpf.Config
+
+	// Kube is a Kubernetes API gateway using Teleport client identities.
+	Kube KubeConfig
+
+	// Log optionally specifies the logger
+	Log utils.Logger
+
+	// PluginRegistry allows adding enterprise logic to Teleport services
+	PluginRegistry plugin.Registry
 }
 
 // ApplyToken assigns a given token to all internal services but only if token
@@ -293,7 +323,7 @@ type ProxyConfig struct {
 	// Enabled turns proxy role on or off for this process
 	Enabled bool
 
-	//DisableTLS is enabled if we don't want self signed certs
+	//DisableTLS is enabled if we don't want self-signed certs
 	DisableTLS bool
 
 	// DisableWebInterface allows to turn off serving the Web UI interface
@@ -304,6 +334,9 @@ type ProxyConfig struct {
 
 	// DisableReverseTunnel disables reverse tunnel on the proxy
 	DisableReverseTunnel bool
+
+	// DisableDatabaseProxy disables database access proxy listener
+	DisableDatabaseProxy bool
 
 	// ReverseTunnelListenAddr is address where reverse tunnel dialers connect to
 	ReverseTunnelListenAddr utils.NetAddr
@@ -317,13 +350,10 @@ type ProxyConfig struct {
 	// SSHAddr is address of ssh proxy
 	SSHAddr utils.NetAddr
 
-	// TLSKey is a base64 encoded private key used by web portal
-	TLSKey string
+	// MySQLAddr is address of MySQL proxy.
+	MySQLAddr utils.NetAddr
 
-	// TLSCert is a base64 encoded certificate used by web portal
-	TLSCert string
-
-	Limiter limiter.LimiterConfig
+	Limiter limiter.Config
 
 	// PublicAddrs is a list of the public addresses the proxy advertises
 	// for the HTTP endpoint. The hosts in in PublicAddr are included in the
@@ -336,12 +366,65 @@ type ProxyConfig struct {
 	SSHPublicAddrs []utils.NetAddr
 
 	// TunnelPublicAddrs is a list of the public addresses the proxy advertises
-	// for the tunnel endpoint. The hosts in in PublicAddr are included in the
+	// for the tunnel endpoint. The hosts in PublicAddr are included in the
 	// list of host principals on the TLS and SSH certificate.
 	TunnelPublicAddrs []utils.NetAddr
 
+	// PostgresPublicAddrs is a list of the public addresses the proxy
+	// advertises for Postgres clients.
+	PostgresPublicAddrs []utils.NetAddr
+
+	// MySQLPublicAddrs is a list of the public addresses the proxy
+	// advertises for MySQL clients.
+	MySQLPublicAddrs []utils.NetAddr
+
 	// Kube specifies kubernetes proxy configuration
 	Kube KubeProxyConfig
+
+	// KeyPairs are the key and certificate pairs that the proxy will load.
+	KeyPairs []KeyPairPath
+
+	// ACME is ACME protocol support config
+	ACME ACME
+}
+
+// ACME configures ACME automatic certificate renewal
+type ACME struct {
+	// Enabled enables or disables ACME support
+	Enabled bool
+	// Email receives notifications from ACME server
+	Email string
+	// URI is ACME server URI
+	URI string
+}
+
+// KeyPairPath are paths to a key and certificate file.
+type KeyPairPath struct {
+	// PrivateKey is the path to a PEM encoded private key.
+	PrivateKey string
+	// Certificate is the path to a PEM encoded certificate.
+	Certificate string
+}
+
+// KubeAddr returns the address for the Kubernetes endpoint on this proxy that
+// can be reached by clients.
+func (c ProxyConfig) KubeAddr() (string, error) {
+	if !c.Kube.Enabled {
+		return "", trace.NotFound("kubernetes support not enabled on this proxy")
+	}
+	if len(c.Kube.PublicAddrs) > 0 {
+		return fmt.Sprintf("https://%s", c.Kube.PublicAddrs[0].Addr), nil
+	}
+	host := "<proxyhost>"
+	// Try to guess the hostname from the HTTP public_addr.
+	if len(c.PublicAddrs) > 0 {
+		host = c.PublicAddrs[0].Host()
+	}
+	u := url.URL{
+		Scheme: "https",
+		Host:   net.JoinHostPort(host, strconv.Itoa(c.Kube.ListenAddr.Port(defaults.KubeListenPort))),
+	}
+	return u.String(), nil
 }
 
 // KubeProxyConfig specifies configuration for proxy service
@@ -349,18 +432,12 @@ type KubeProxyConfig struct {
 	// Enabled turns kubernetes proxy role on or off for this process
 	Enabled bool
 
-	// ListenAddr is address where reverse tunnel dialers connect to
+	// ListenAddr is the address to listen on for incoming kubernetes requests.
 	ListenAddr utils.NetAddr
-
-	// KubeAPIAddr is address of kubernetes API server
-	APIAddr utils.NetAddr
 
 	// ClusterOverride causes all traffic to go to a specific remote
 	// cluster, used only in tests
 	ClusterOverride string
-
-	// CACert is a PEM encoded kubernetes CA certificate
-	CACert []byte
 
 	// PublicAddrs is a list of the public addresses the Teleport Kube proxy can be accessed by,
 	// it also affects the host principals and routing logic
@@ -368,6 +445,10 @@ type KubeProxyConfig struct {
 
 	// KubeconfigPath is a path to kubeconfig
 	KubeconfigPath string
+
+	// LegacyKubeProxy specifies that this proxy was configured using the
+	// legacy kubernetes section.
+	LegacyKubeProxy bool
 }
 
 // AuthConfig is a configuration of the auth server
@@ -383,39 +464,48 @@ type AuthConfig struct {
 
 	// Authorities is a set of trusted certificate authorities
 	// that will be added by this auth server on the first start
-	Authorities []services.CertAuthority
+	Authorities []types.CertAuthority
 
 	// Resources is a set of previously backed up resources
 	// used to bootstrap backend state on the first start.
-	Resources []services.Resource
+	Resources []types.Resource
 
 	// Roles is a set of roles to pre-provision for this cluster
-	Roles []services.Role
+	Roles []types.Role
 
 	// ClusterName is a name that identifies this authority and all
 	// host nodes in the cluster that will share this authority domain name
 	// as a base name, e.g. if authority domain name is example.com,
 	// all nodes in the cluster will have UUIDs in the form: <uuid>.example.com
-	ClusterName services.ClusterName
+	ClusterName types.ClusterName
 
 	// StaticTokens are pre-defined host provisioning tokens supplied via config file for
 	// environments where paranoid security is not needed
-	StaticTokens services.StaticTokens
+	StaticTokens types.StaticTokens
 
 	// StorageConfig contains configuration settings for the storage backend.
 	StorageConfig backend.Config
 
-	Limiter limiter.LimiterConfig
+	Limiter limiter.Config
 
 	// NoAudit, when set to true, disables session recording and event audit
 	NoAudit bool
 
 	// Preference defines the authentication preference (type and second factor) for
 	// the auth server.
-	Preference services.AuthPreference
+	Preference types.AuthPreference
 
 	// ClusterConfig stores cluster level configuration.
-	ClusterConfig services.ClusterConfig
+	ClusterConfig types.ClusterConfig
+
+	// AuditConfig stores cluster audit configuration.
+	AuditConfig types.ClusterAuditConfig
+
+	// NetworkingConfig stores cluster networking configuration.
+	NetworkingConfig types.ClusterNetworkingConfig
+
+	// SessionRecordingConfig stores session recording configuration.
+	SessionRecordingConfig types.SessionRecordingConfig
 
 	// LicenseFile is a full path to the license file
 	LicenseFile string
@@ -430,7 +520,7 @@ type SSHConfig struct {
 	Addr                  utils.NetAddr
 	Namespace             string
 	Shell                 string
-	Limiter               limiter.LimiterConfig
+	Limiter               limiter.Config
 	Labels                map[string]string
 	CmdLabels             services.CommandLabels
 	PermitUserEnvironment bool
@@ -443,6 +533,289 @@ type SSHConfig struct {
 
 	// BPF holds BPF configuration for Teleport.
 	BPF *bpf.Config
+
+	// RestrictedSession holds kernel objects restrictions for Teleport.
+	RestrictedSession *restricted.Config
+
+	// ProxyReverseTunnelFallbackAddr optionall specifies the address of the proxy if reverse tunnel
+	// discovered proxy fails.
+	// This configuration is not exposed directly but can be set from environment via
+	// defaults.ProxyFallbackAddrEnvar.
+	//
+	// See github.com/gravitational/teleport/issues/4141 for details.
+	ProxyReverseTunnelFallbackAddr *utils.NetAddr
+
+	// AllowTCPForwarding indicates that TCP port forwarding is allowed on this node
+	AllowTCPForwarding bool
+
+	// IdleTimeoutMessage is sent to the client when a session expires due to
+	// the inactivity timeout expiring. The empty string indicates that no
+	// timeout message will be sent.
+	IdleTimeoutMessage string
+}
+
+// KubeConfig specifies configuration for kubernetes service
+type KubeConfig struct {
+	// Enabled turns kubernetes service role on or off for this process
+	Enabled bool
+
+	// ListenAddr is the address to listen on for incoming kubernetes requests.
+	// Optional.
+	ListenAddr *utils.NetAddr
+
+	// PublicAddrs is a list of the public addresses the Teleport kubernetes
+	// service can be reached by the proxy service.
+	PublicAddrs []utils.NetAddr
+
+	// KubeClusterName is the name of a kubernetes cluster this proxy is running
+	// in. If empty, defaults to the Teleport cluster name.
+	KubeClusterName string
+
+	// KubeconfigPath is a path to kubeconfig
+	KubeconfigPath string
+
+	// Labels are used for RBAC on clusters.
+	StaticLabels  map[string]string
+	DynamicLabels services.CommandLabels
+
+	// Limiter limits the connection and request rates.
+	Limiter limiter.Config
+}
+
+// DatabasesConfig configures the database proxy service.
+type DatabasesConfig struct {
+	// Enabled enables the database proxy service.
+	Enabled bool
+	// Databases is a list of databases proxied by this service.
+	Databases []Database
+}
+
+// Database represents a single database that's being proxied.
+type Database struct {
+	// Name is the database name, used to refer to in CLI.
+	Name string
+	// Description is a free-form database description.
+	Description string
+	// Protocol is the database type, e.g. postgres or mysql.
+	Protocol string
+	// URI is the database endpoint to connect to.
+	URI string
+	// StaticLabels is a map of database static labels.
+	StaticLabels map[string]string
+	// DynamicLabels is a list of database dynamic labels.
+	DynamicLabels services.CommandLabels
+	// CACert is an optional database CA certificate.
+	CACert []byte
+	// AWS contains AWS specific settings for RDS/Aurora/Redshift databases.
+	AWS DatabaseAWS
+	// GCP contains GCP specific settings for Cloud SQL databases.
+	GCP DatabaseGCP
+}
+
+// DatabaseAWS contains AWS specific settings for RDS/Aurora databases.
+type DatabaseAWS struct {
+	// Region is the cloud region database is running in when using AWS RDS.
+	Region string
+	// Redshift contains Redshift specific settings.
+	Redshift DatabaseAWSRedshift
+}
+
+// DatabaseAWSRedshift contains AWS Redshift specific settings.
+type DatabaseAWSRedshift struct {
+	// ClusterID is the Redshift cluster identifier.
+	ClusterID string
+}
+
+// DatabaseGCP contains GCP specific settings for Cloud SQL databases.
+type DatabaseGCP struct {
+	// ProjectID is the GCP project ID where the database is deployed.
+	ProjectID string
+	// InstanceID is the Cloud SQL instance ID.
+	InstanceID string
+}
+
+// Check validates the database proxy configuration.
+func (d *Database) Check() error {
+	if d.Name == "" {
+		return trace.BadParameter("empty database name")
+	}
+	// Unlike application access proxy, database proxy name doesn't necessarily
+	// need to be a valid subdomain but use the same validation logic for the
+	// simplicity and consistency.
+	if errs := validation.IsDNS1035Label(d.Name); len(errs) > 0 {
+		return trace.BadParameter("invalid database %q name: %v", d.Name, errs)
+	}
+	if !apiutils.SliceContainsStr(defaults.DatabaseProtocols, d.Protocol) {
+		return trace.BadParameter("unsupported database %q protocol %q, supported are: %v",
+			d.Name, d.Protocol, defaults.DatabaseProtocols)
+	}
+	// For MongoDB we support specifying either server address or connection
+	// string in the URI which is useful when connecting to a replica set.
+	if d.Protocol == defaults.ProtocolMongoDB &&
+		(strings.HasPrefix(d.URI, connstring.SchemeMongoDB+"://") ||
+			strings.HasPrefix(d.URI, connstring.SchemeMongoDBSRV+"://")) {
+		connString, err := connstring.ParseAndValidate(d.URI)
+		if err != nil {
+			return trace.BadParameter("invalid MongoDB database %q connection string %q: %v",
+				d.Name, d.URI, err)
+		}
+		// Validate read preference to catch typos early.
+		if connString.ReadPreference != "" {
+			if _, err := readpref.ModeFromString(connString.ReadPreference); err != nil {
+				return trace.BadParameter("invalid MongoDB database %q read preference %q",
+					d.Name, connString.ReadPreference)
+			}
+		}
+	} else if _, _, err := net.SplitHostPort(d.URI); err != nil {
+		return trace.BadParameter("invalid database %q address %q: %v",
+			d.Name, d.URI, err)
+	}
+	if len(d.CACert) != 0 {
+		if _, err := tlsca.ParseCertificatePEM(d.CACert); err != nil {
+			return trace.BadParameter("provided database %q CA doesn't appear to be a valid x509 certificate: %v",
+				d.Name, err)
+		}
+	}
+	// Validate Cloud SQL specific configuration.
+	switch {
+	case d.GCP.ProjectID != "" && d.GCP.InstanceID == "":
+		return trace.BadParameter("missing Cloud SQL instance ID for database %q", d.Name)
+	case d.GCP.ProjectID == "" && d.GCP.InstanceID != "":
+		return trace.BadParameter("missing Cloud SQL project ID for database %q", d.Name)
+	}
+	return nil
+}
+
+// AppsConfig configures application proxy service.
+type AppsConfig struct {
+	// Enabled enables application proxying service.
+	Enabled bool
+
+	// DebugApp enabled a header dumping debugging application.
+	DebugApp bool
+
+	// Apps is the list of applications that are being proxied.
+	Apps []App
+}
+
+// App is the specific application that will be proxied by the application
+// service. This needs to exist because if the "config" package tries to
+// directly create a services.App it will get into circular imports.
+type App struct {
+	// Name of the application.
+	Name string
+
+	// Description is the app description.
+	Description string
+
+	// URI is the internal address of the application.
+	URI string
+
+	// Public address of the application. This is the address users will access
+	// the application at.
+	PublicAddr string
+
+	// StaticLabels is a map of static labels to apply to this application.
+	StaticLabels map[string]string
+
+	// DynamicLabels is a list of dynamic labels to apply to this application.
+	DynamicLabels services.CommandLabels
+
+	// InsecureSkipVerify is used to skip validating the server's certificate.
+	InsecureSkipVerify bool
+
+	// Rewrite defines a block that is used to rewrite requests and responses.
+	Rewrite *Rewrite
+}
+
+// Check validates an application.
+func (a App) Check() error {
+	if a.Name == "" {
+		return trace.BadParameter("missing application name")
+	}
+	if a.URI == "" {
+		return trace.BadParameter("missing application %q URI", a.Name)
+	}
+	// Check if the application name is a valid subdomain. Don't allow names that
+	// are invalid subdomains because for trusted clusters the name is used to
+	// construct the domain that the application will be available at.
+	if errs := validation.IsDNS1035Label(a.Name); len(errs) > 0 {
+		return trace.BadParameter("application name %q must be a valid DNS subdomain: https://goteleport.com/teleport/docs/application-access/#application-name", a.Name)
+	}
+	// Parse and validate URL.
+	if _, err := url.Parse(a.URI); err != nil {
+		return trace.BadParameter("application %q URI invalid: %v", a.Name, err)
+	}
+	// If a port was specified or an IP address was provided for the public
+	// address, return an error.
+	if a.PublicAddr != "" {
+		if _, _, err := net.SplitHostPort(a.PublicAddr); err == nil {
+			return trace.BadParameter("application %q public_addr %q can not contain a port, applications will be available on the same port as the web proxy", a.Name, a.PublicAddr)
+		}
+		if net.ParseIP(a.PublicAddr) != nil {
+			return trace.BadParameter("application %q public_addr %q can not be an IP address, Teleport Application Access uses DNS names for routing", a.Name, a.PublicAddr)
+		}
+	}
+	// Make sure there are no reserved headers in the rewrite configuration.
+	// They wouldn't be rewritten even if we allowed them here but catch it
+	// early and let the user know.
+	if a.Rewrite != nil {
+		for _, h := range a.Rewrite.Headers {
+			if app.IsReservedHeader(h.Name) {
+				return trace.BadParameter("invalid application %q header rewrite configuration: header %q is reserved and can't be rewritten",
+					a.Name, http.CanonicalHeaderKey(h.Name))
+			}
+		}
+	}
+	return nil
+}
+
+// Rewrite is a list of rewriting rules to apply to requests and responses.
+type Rewrite struct {
+	// Redirect is a list of hosts that should be rewritten to the public address.
+	Redirect []string
+	// Headers is a list of extra headers to inject in the request.
+	Headers []Header
+}
+
+// Header represents a single http header passed over to the proxied application.
+type Header struct {
+	// Name is the http header name.
+	Name string
+	// Value is the http header value.
+	Value string
+}
+
+// ParseHeader parses the provided string as a http header.
+func ParseHeader(header string) (*Header, error) {
+	parts := strings.SplitN(header, ":", 2)
+	if len(parts) != 2 {
+		return nil, trace.BadParameter("failed to parse %q as http header", header)
+	}
+	name := strings.TrimSpace(parts[0])
+	value := strings.TrimSpace(parts[1])
+	if !httpguts.ValidHeaderFieldName(name) {
+		return nil, trace.BadParameter("invalid http header name: %q", header)
+	}
+	if !httpguts.ValidHeaderFieldValue(value) {
+		return nil, trace.BadParameter("invalid http header value: %q", header)
+	}
+	return &Header{
+		Name:  name,
+		Value: value,
+	}, nil
+}
+
+// ParseHeaders parses the provided list as http headers.
+func ParseHeaders(headers []string) (headersOut []Header, err error) {
+	for _, header := range headers {
+		h, err := ParseHeader(header)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		headersOut = append(headersOut, *h)
+	}
+	return headersOut, nil
 }
 
 // MakeDefaultConfig creates a new Config structure and populates it with defaults
@@ -459,6 +832,10 @@ func ApplyDefaults(cfg *Config) {
 	var sc ssh.Config
 	sc.SetDefaults()
 
+	if cfg.Log == nil {
+		cfg.Log = utils.NewLogger()
+	}
+
 	// Remove insecure and (borderline insecure) cryptographic primitives from
 	// default configuration. These can still be added back in file configuration by
 	// users, but not supported by default by Teleport. See #1856 for more
@@ -473,7 +850,7 @@ func ApplyDefaults(cfg *Config) {
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = "localhost"
-		log.Errorf("Failed to determine hostname: %v.", err)
+		cfg.Log.Errorf("Failed to determine hostname: %v.", err)
 	}
 
 	// Global defaults.
@@ -490,13 +867,13 @@ func ApplyDefaults(cfg *Config) {
 	cfg.Auth.SSHAddr = *defaults.AuthListenAddr()
 	cfg.Auth.StorageConfig.Type = lite.GetName()
 	cfg.Auth.StorageConfig.Params = backend.Params{defaults.BackendPath: filepath.Join(cfg.DataDir, defaults.BackendDir)}
-	cfg.Auth.StaticTokens = services.DefaultStaticTokens()
-	cfg.Auth.ClusterConfig = services.DefaultClusterConfig()
+	cfg.Auth.StaticTokens = types.DefaultStaticTokens()
+	cfg.Auth.ClusterConfig = types.DefaultClusterConfig()
+	cfg.Auth.AuditConfig = types.DefaultClusterAuditConfig()
+	cfg.Auth.NetworkingConfig = types.DefaultClusterNetworkingConfig()
+	cfg.Auth.SessionRecordingConfig = types.DefaultSessionRecordingConfig()
+	cfg.Auth.Preference = types.DefaultAuthPreference()
 	defaults.ConfigureLimiter(&cfg.Auth.Limiter)
-	// set new style default auth preferences
-	ap := &services.AuthPreferenceV2{}
-	ap.CheckAndSetDefaults()
-	cfg.Auth.Preference = ap
 	cfg.Auth.LicenseFile = filepath.Join(cfg.DataDir, defaults.LicenseFile)
 
 	// Proxy service defaults.
@@ -516,6 +893,18 @@ func ApplyDefaults(cfg *Config) {
 	defaults.ConfigureLimiter(&cfg.SSH.Limiter)
 	cfg.SSH.PAM = &pam.Config{Enabled: false}
 	cfg.SSH.BPF = &bpf.Config{Enabled: false}
+	cfg.SSH.RestrictedSession = &restricted.Config{Enabled: false}
+	cfg.SSH.AllowTCPForwarding = true
+
+	// Kubernetes service defaults.
+	cfg.Kube.Enabled = false
+	defaults.ConfigureLimiter(&cfg.Kube.Limiter)
+
+	// Apps service defaults. It's disabled by default.
+	cfg.Apps.Enabled = false
+
+	// Databases proxy service is disabled by default.
+	cfg.Databases.Enabled = false
 }
 
 // ApplyFIPSDefaults updates default configuration to be FedRAMP/FIPS 140-2
@@ -532,9 +921,9 @@ func ApplyFIPSDefaults(cfg *Config) {
 	// Only SSO based authentication is supported in FIPS mode. The SSO
 	// provider is where any FedRAMP/FIPS 140-2 compliance (like password
 	// complexity) should be enforced.
-	cfg.Auth.ClusterConfig.SetLocalAuth(false)
+	cfg.Auth.Preference.SetAllowLocalAuth(false)
 
 	// Update cluster configuration to record sessions at node, this way the
 	// entire cluster is FedRAMP/FIPS 140-2 compliant.
-	cfg.Auth.ClusterConfig.SetSessionRecording(services.RecordAtNode)
+	cfg.Auth.SessionRecordingConfig.SetMode(types.RecordAtNode)
 }

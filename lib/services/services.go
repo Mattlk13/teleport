@@ -16,14 +16,20 @@ limitations under the License.
 
 package services
 
+import "github.com/gravitational/teleport/api/types"
+
 // Services collects all services
 type Services interface {
 	UsersService
 	Provisioner
 	Trust
-	Events
+	types.Events
 	ClusterConfiguration
 	Access
-	DynamicAccess
+	DynamicAccessCore
 	Presence
+	Restrictions
+	AppSession
+	types.WebSessionsGetter
+	types.WebTokensGetter
 }

@@ -19,7 +19,7 @@ package etcdbk
 import (
 	"context"
 	"encoding/base64"
-	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -27,13 +27,24 @@ import (
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/test"
 	"github.com/gravitational/teleport/lib/utils"
-	"go.etcd.io/etcd/clientv3"
 
 	"github.com/gravitational/trace"
+
+	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/clientv3"
 	"gopkg.in/check.v1"
 )
 
-const customPrefix = "/custom"
+const (
+	examplePrefix = "/teleport.secrets/"
+	customPrefix  = "/custom/"
+)
+
+func TestMain(m *testing.M) {
+	utils.InitLoggerForTests()
+	os.Exit(m.Run())
+}
 
 func TestEtcd(t *testing.T) { check.TestingT(t) }
 
@@ -46,62 +57,51 @@ type EtcdSuite struct {
 var _ = check.Suite(&EtcdSuite{})
 
 func (s *EtcdSuite) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests(testing.Verbose())
-
-	// this config must match examples/etcd/teleport.yaml
+	// This config must match examples/etcd/teleport.yaml
 	s.config = backend.Params{
 		"peers":         []string{"https://127.0.0.1:2379"},
-		"prefix":        "/teleport",
+		"prefix":        examplePrefix,
 		"tls_key_file":  "../../../examples/etcd/certs/client-key.pem",
 		"tls_cert_file": "../../../examples/etcd/certs/client-cert.pem",
 		"tls_ca_file":   "../../../examples/etcd/certs/ca-cert.pem",
-		"dial_timeout":  500 * time.Millisecond,
 	}
 
+	clock := clockwork.NewFakeClock()
 	newBackend := func() (backend.Backend, error) {
-		return New(context.Background(), s.config)
+		bk, err := New(context.Background(), s.config)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		bk.clock = clock
+		return bk, nil
 	}
 	s.suite.NewBackend = newBackend
+	s.suite.Clock = fakeClock{FakeClock: clock}
 }
 
 func (s *EtcdSuite) SetUpTest(c *check.C) {
+	if !etcdTestEnabled() {
+		c.Skip("This test requires etcd, start it with examples/etcd/start-etcd.sh and set TELEPORT_ETCD_TEST=yes")
+	}
 	// Initiate a backend with a registry
 	b, err := s.suite.NewBackend()
-	if err != nil {
-		if strings.Contains(err.Error(), "connection refused") {
-			fmt.Printf("WARNING: etcd cluster is not available: %v.\n", err)
-			fmt.Printf("WARNING: Start examples/etcd/start-etcd.sh.\n")
-			c.Skip(err.Error())
-		}
-		c.Assert(err, check.IsNil)
-	}
 	c.Assert(err, check.IsNil)
 	s.bk = b.(*EtcdBackend)
 	s.suite.B = s.bk
 
-	// Check connectivity and disable the suite
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	_, err = s.bk.GetRange(ctx, []byte("/"), backend.RangeEnd([]byte("/")), backend.NoLimit)
-	err = convertErr(err)
-	if err != nil && !trace.IsNotFound(err) {
-		if strings.Contains(err.Error(), "connection refused") || trace.IsConnectionProblem(err) {
-			fmt.Println("WARNING: etcd cluster is not available. Start examples/etcd/start-etcd.sh")
-			c.Skip(err.Error())
-		}
-		c.Assert(err, check.IsNil)
-	}
-
-	s.bk.cfg.Key = legacyDefaultPrefix
+	// Clean up any pre-stored records for all used prefixes
+	ctx := context.Background()
+	_, err = s.bk.client.Delete(ctx, strings.TrimSuffix(examplePrefix, "/"), clientv3.WithPrefix())
+	c.Assert(err, check.IsNil)
+	_, err = s.bk.client.Delete(ctx, strings.TrimSuffix(customPrefix, "/"), clientv3.WithPrefix())
+	c.Assert(err, check.IsNil)
 }
 
 func (s *EtcdSuite) TearDownTest(c *check.C) {
-	ctx := context.Background()
-	_, err := s.bk.client.Delete(ctx, legacyDefaultPrefix, clientv3.WithPrefix())
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Delete(ctx, customPrefix, clientv3.WithPrefix())
-	c.Assert(err, check.IsNil)
-	err = s.bk.Close()
+	if s.bk == nil {
+		return
+	}
+	err := s.bk.Close()
 	c.Assert(err, check.IsNil)
 }
 
@@ -138,10 +138,13 @@ func (s *EtcdSuite) TestWatchersClose(c *check.C) {
 }
 
 func (s *EtcdSuite) TestLocking(c *check.C) {
-	s.suite.Locking(c)
+	s.suite.Locking(c, s.bk)
 }
 
 func (s *EtcdSuite) TestPrefix(c *check.C) {
+	s.bk.cfg.Key = customPrefix
+	c.Assert(s.bk.cfg.Validate(), check.IsNil)
+
 	var (
 		ctx  = context.Background()
 		item = backend.Item{
@@ -150,12 +153,31 @@ func (s *EtcdSuite) TestPrefix(c *check.C) {
 		}
 	)
 
-	s.bk.cfg.Key = customPrefix
+	// Item key starts with '/'.
 	_, err := s.bk.Put(ctx, item)
 	c.Assert(err, check.IsNil)
 
-	wantKey := fmt.Sprintf("%s%s", s.bk.cfg.Key, item.Key)
+	wantKey := s.bk.cfg.Key + string(item.Key)
 	s.assertKV(ctx, c, wantKey, string(item.Value))
+	got, err := s.bk.Get(ctx, item.Key)
+	c.Assert(err, check.IsNil)
+	item.ID = got.ID
+	c.Assert(*got, check.DeepEquals, item)
+
+	// Item key does not start with '/'.
+	item = backend.Item{
+		Key:   []byte("foo"),
+		Value: []byte("bar"),
+	}
+	_, err = s.bk.Put(ctx, item)
+	c.Assert(err, check.IsNil)
+
+	wantKey = s.bk.cfg.Key + string(item.Key)
+	s.assertKV(ctx, c, wantKey, string(item.Value))
+	got, err = s.bk.Get(ctx, item.Key)
+	c.Assert(err, check.IsNil)
+	item.ID = got.ID
+	c.Assert(*got, check.DeepEquals, item)
 }
 
 func (s *EtcdSuite) assertKV(ctx context.Context, c *check.C, key, val string) {
@@ -170,118 +192,49 @@ func (s *EtcdSuite) assertKV(ctx context.Context, c *check.C, key, val string) {
 	c.Assert(string(gotValue), check.Equals, val)
 }
 
-func (s *EtcdSuite) TestSyncLegacyPrefix(c *check.C) {
-	ctx := context.Background()
-	s.bk.cfg.Key = customPrefix
-
-	reset := func() {
-		_, err := s.bk.client.Delete(ctx, legacyDefaultPrefix, clientv3.WithPrefix())
-		c.Assert(err, check.IsNil)
-		_, err = s.bk.client.Delete(ctx, customPrefix, clientv3.WithPrefix())
-		c.Assert(err, check.IsNil)
+// TestCompareAndSwapOversizedValue ensures that the backend reacts with a proper
+// error message if client sends a message exceeding the configured size maximum
+// See https://github.com/gravitational/teleport/issues/4786
+func TestCompareAndSwapOversizedValue(t *testing.T) {
+	if !etcdTestEnabled() {
+		t.Skip("This test requires etcd, start it with examples/etcd/start-etcd.sh and set TELEPORT_ETCD_TEST=yes")
 	}
-	snapshot := func() map[string]string {
-		kvs := make(map[string]string)
-
-		resp, err := s.bk.client.Get(ctx, legacyDefaultPrefix, clientv3.WithPrefix())
-		c.Assert(err, check.IsNil)
-		for _, kv := range resp.Kvs {
-			kvs[string(kv.Key)] = string(kv.Value)
-		}
-
-		resp, err = s.bk.client.Get(ctx, customPrefix, clientv3.WithPrefix())
-		c.Assert(err, check.IsNil)
-		for _, kv := range resp.Kvs {
-			kvs[string(kv.Key)] = string(kv.Value)
-		}
-
-		return kvs
-	}
-
-	// Make sure the prefixes start off clean.
-	reset()
-
-	c.Log("both prefixes empty")
-	err := s.bk.syncLegacyPrefix(ctx)
-	c.Assert(err, check.IsNil)
-	c.Assert(snapshot(), check.DeepEquals, map[string]string{})
-	reset()
-
-	c.Log("data in custom prefix, no data in legacy prefix; custom prefix should be preserved")
-	_, err = s.bk.client.Put(ctx, customPrefix+"/0", "c0")
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Put(ctx, customPrefix+"/1", "c1")
-	c.Assert(err, check.IsNil)
-	err = s.bk.syncLegacyPrefix(ctx)
-	c.Assert(err, check.IsNil)
-	c.Assert(snapshot(), check.DeepEquals, map[string]string{
-		customPrefix + "/0": "c0",
-		customPrefix + "/1": "c1",
+	// setup
+	const maxClientMsgSize = 128
+	bk, err := New(context.Background(), backend.Params{
+		"peers":                          []string{"https://127.0.0.1:2379"},
+		"prefix":                         "/teleport",
+		"tls_key_file":                   "../../../examples/etcd/certs/client-key.pem",
+		"tls_cert_file":                  "../../../examples/etcd/certs/client-cert.pem",
+		"tls_ca_file":                    "../../../examples/etcd/certs/ca-cert.pem",
+		"dial_timeout":                   500 * time.Millisecond,
+		"etcd_max_client_msg_size_bytes": maxClientMsgSize,
 	})
-	reset()
+	require.NoError(t, err)
+	defer bk.Close()
+	prefix := test.MakePrefix()
+	// Explicitly exceed the message size
+	value := make([]byte, maxClientMsgSize+1)
 
-	c.Log("no data in custom prefix, data in legacy prefix copied over; custom prefix should be populated")
-	_, err = s.bk.client.Put(ctx, legacyDefaultPrefix+"/0", "l0")
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Put(ctx, legacyDefaultPrefix+"/1", "l1")
-	c.Assert(err, check.IsNil)
-	err = s.bk.syncLegacyPrefix(ctx)
-	c.Assert(err, check.IsNil)
-	c.Assert(snapshot(), check.DeepEquals, map[string]string{
-		legacyDefaultPrefix + "/0": "l0",
-		legacyDefaultPrefix + "/1": "l1",
-		customPrefix + "/0":        "l0",
-		customPrefix + "/1":        "l1",
-	})
-	reset()
+	// verify
+	_, err = bk.CompareAndSwap(context.Background(),
+		backend.Item{Key: prefix("one"), Value: []byte("1")},
+		backend.Item{Key: prefix("one"), Value: value},
+	)
+	require.True(t, trace.IsLimitExceeded(err))
+	require.Regexp(t, ".*ResourceExhausted.*", err)
+}
 
-	c.Log("data in both prefixes, custom prefix is newer; custom prefix should be preserved")
-	_, err = s.bk.client.Put(ctx, legacyDefaultPrefix+"/0", "l0")
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Put(ctx, legacyDefaultPrefix+"/1", "l1")
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Put(ctx, legacyDefaultPrefix+"/3", "l3")
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Put(ctx, customPrefix+"/0", "c0")
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Put(ctx, customPrefix+"/1", "c1")
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Put(ctx, customPrefix+"/2", "c2")
-	c.Assert(err, check.IsNil)
-	err = s.bk.syncLegacyPrefix(ctx)
-	c.Assert(err, check.IsNil)
-	c.Assert(snapshot(), check.DeepEquals, map[string]string{
-		legacyDefaultPrefix + "/0": "l0",
-		legacyDefaultPrefix + "/1": "l1",
-		legacyDefaultPrefix + "/3": "l3",
-		customPrefix + "/0":        "c0",
-		customPrefix + "/1":        "c1",
-		customPrefix + "/2":        "c2",
-	})
-	reset()
+func etcdTestEnabled() bool {
+	return os.Getenv("TELEPORT_ETCD_TEST") != ""
+}
 
-	c.Log("data in both prefixes, legacy prefix is newer; custom prefix should be replaced")
-	_, err = s.bk.client.Put(ctx, legacyDefaultPrefix+"/0", "l0")
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Put(ctx, legacyDefaultPrefix+"/1", "l1")
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Put(ctx, customPrefix+"/0", "c0")
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Put(ctx, customPrefix+"/1", "c1")
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Put(ctx, customPrefix+"/2", "c2")
-	c.Assert(err, check.IsNil)
-	_, err = s.bk.client.Put(ctx, legacyDefaultPrefix+"/3", "l3")
-	c.Assert(err, check.IsNil)
-	err = s.bk.syncLegacyPrefix(ctx)
-	c.Assert(err, check.IsNil)
-	c.Assert(snapshot(), check.DeepEquals, map[string]string{
-		legacyDefaultPrefix + "/0": "l0",
-		legacyDefaultPrefix + "/1": "l1",
-		legacyDefaultPrefix + "/3": "l3",
-		customPrefix + "/0":        "l0",
-		customPrefix + "/1":        "l1",
-		customPrefix + "/3":        "l3",
-	})
-	reset()
+func (r fakeClock) Advance(d time.Duration) {
+	// We cannot rewind time for etcd since it will not have any effect on the server
+	// so we actually sleep in this case
+	time.Sleep(d)
+}
+
+type fakeClock struct {
+	clockwork.FakeClock
 }

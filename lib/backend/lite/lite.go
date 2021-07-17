@@ -28,8 +28,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/backend"
-	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
@@ -119,7 +120,7 @@ func (cfg *Config) CheckAndSetDefaults() error {
 }
 
 // New returns a new instance of sqlite backend
-func New(ctx context.Context, params backend.Params) (*LiteBackend, error) {
+func New(ctx context.Context, params backend.Params) (*Backend, error) {
 	var cfg *Config
 	err := utils.ObjectToStruct(params, &cfg)
 	if err != nil {
@@ -130,7 +131,7 @@ func New(ctx context.Context, params backend.Params) (*LiteBackend, error) {
 
 // NewWithConfig returns a new instance of lite backend using
 // configuration struct as a parameter
-func NewWithConfig(ctx context.Context, cfg Config) (*LiteBackend, error) {
+func NewWithConfig(ctx context.Context, cfg Config) (*Backend, error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -158,7 +159,7 @@ func NewWithConfig(ctx context.Context, cfg Config) (*LiteBackend, error) {
 	}
 	closeCtx, cancel := context.WithCancel(ctx)
 	watchStarted, signalWatchStart := context.WithCancel(ctx)
-	l := &LiteBackend{
+	l := &Backend{
 		Config:           cfg,
 		db:               db,
 		Entry:            log.WithFields(log.Fields{trace.Component: BackendName}),
@@ -180,8 +181,8 @@ func NewWithConfig(ctx context.Context, cfg Config) (*LiteBackend, error) {
 	return l, nil
 }
 
-// LiteBackend uses SQLite to implement storage interfaces
-type LiteBackend struct {
+// Backend uses SQLite to implement storage interfaces
+type Backend struct {
 	Config
 	*log.Entry
 	backend.NoMigrations
@@ -202,7 +203,7 @@ type LiteBackend struct {
 
 // showPragmas is used to debug SQLite database connection
 // parameters, when called, logs some key PRAGMA values
-func (l *LiteBackend) showPragmas() error {
+func (l *Backend) showPragmas() error {
 	return l.inTransaction(l.ctx, func(tx *sql.Tx) error {
 		row := tx.QueryRowContext(l.ctx, "PRAGMA synchronous;")
 		var syncValue string
@@ -219,7 +220,7 @@ func (l *LiteBackend) showPragmas() error {
 	})
 }
 
-func (l *LiteBackend) createSchema() error {
+func (l *Backend) createSchema() error {
 	schemas := []string{
 
 		`CREATE TABLE IF NOT EXISTS kv (
@@ -256,7 +257,7 @@ func (l *LiteBackend) createSchema() error {
 	return nil
 }
 
-func (l *LiteBackend) newLease(item backend.Item) *backend.Lease {
+func (l *Backend) newLease(item backend.Item) *backend.Lease {
 	var lease backend.Lease
 	if item.Expires.IsZero() {
 		return &lease
@@ -266,17 +267,17 @@ func (l *LiteBackend) newLease(item backend.Item) *backend.Lease {
 }
 
 // SetClock sets internal backend clock
-func (l *LiteBackend) SetClock(clock clockwork.Clock) {
+func (l *Backend) SetClock(clock clockwork.Clock) {
 	l.clock = clock
 }
 
 // Clock returns clock used by the backend
-func (l *LiteBackend) Clock() clockwork.Clock {
+func (l *Backend) Clock() clockwork.Clock {
 	return l.clock
 }
 
 // Create creates item if it does not exist
-func (l *LiteBackend) Create(ctx context.Context, i backend.Item) (*backend.Lease, error) {
+func (l *Backend) Create(ctx context.Context, i backend.Item) (*backend.Lease, error) {
 	if len(i.Key) == 0 {
 		return nil, trace.BadParameter("missing parameter key")
 	}
@@ -287,7 +288,7 @@ func (l *LiteBackend) Create(ctx context.Context, i backend.Item) (*backend.Leas
 			if err != nil {
 				return trace.Wrap(err)
 			}
-			if _, err := stmt.ExecContext(ctx, backend.OpPut, created, string(i.Key), id(created), expires(i.Expires), i.Value); err != nil {
+			if _, err := stmt.ExecContext(ctx, types.OpPut, created, string(i.Key), id(created), expires(i.Expires), i.Value); err != nil {
 				return trace.Wrap(err)
 			}
 		}
@@ -308,7 +309,7 @@ func (l *LiteBackend) Create(ctx context.Context, i backend.Item) (*backend.Leas
 
 // CompareAndSwap compares item with existing item
 // and replaces is with replaceWith item
-func (l *LiteBackend) CompareAndSwap(ctx context.Context, expected backend.Item, replaceWith backend.Item) (*backend.Lease, error) {
+func (l *Backend) CompareAndSwap(ctx context.Context, expected backend.Item, replaceWith backend.Item) (*backend.Lease, error) {
 	if len(expected.Key) == 0 {
 		return nil, trace.BadParameter("missing parameter Key")
 	}
@@ -352,7 +353,7 @@ func (l *LiteBackend) CompareAndSwap(ctx context.Context, expected backend.Item,
 			if err != nil {
 				return trace.Wrap(err)
 			}
-			if _, err := stmt.ExecContext(ctx, backend.OpPut, created, string(replaceWith.Key), id(created), expires(replaceWith.Expires), replaceWith.Value); err != nil {
+			if _, err := stmt.ExecContext(ctx, types.OpPut, created, string(replaceWith.Key), id(created), expires(replaceWith.Expires), replaceWith.Value); err != nil {
 				return trace.Wrap(err)
 			}
 		}
@@ -371,7 +372,7 @@ func id(t time.Time) int64 {
 
 // Put puts value into backend (creates if it does not
 // exists, updates it otherwise)
-func (l *LiteBackend) Put(ctx context.Context, i backend.Item) (*backend.Lease, error) {
+func (l *Backend) Put(ctx context.Context, i backend.Item) (*backend.Lease, error) {
 	if i.Key == nil {
 		return nil, trace.BadParameter("missing parameter key")
 	}
@@ -386,7 +387,7 @@ func (l *LiteBackend) Put(ctx context.Context, i backend.Item) (*backend.Lease, 
 			if err != nil {
 				return trace.Wrap(err)
 			}
-			if _, err := stmt.ExecContext(ctx, backend.OpPut, created, string(i.Key), recordID, expires(i.Expires), i.Value); err != nil {
+			if _, err := stmt.ExecContext(ctx, types.OpPut, created, string(i.Key), recordID, expires(i.Expires), i.Value); err != nil {
 				return trace.Wrap(err)
 			}
 		}
@@ -410,7 +411,7 @@ const (
 )
 
 // Imported returns true if backend already imported data from another backend
-func (l *LiteBackend) Imported(ctx context.Context) (imported bool, err error) {
+func (l *Backend) Imported(ctx context.Context) (imported bool, err error) {
 	err = l.inTransaction(ctx, func(tx *sql.Tx) error {
 		q, err := tx.PrepareContext(ctx,
 			"SELECT imported from meta LIMIT 1")
@@ -430,7 +431,7 @@ func (l *LiteBackend) Imported(ctx context.Context) (imported bool, err error) {
 
 // Import imports elements, makes sure elements are imported only once
 // returns trace.AlreadyExists if elements have been imported
-func (l *LiteBackend) Import(ctx context.Context, items []backend.Item) error {
+func (l *Backend) Import(ctx context.Context, items []backend.Item) error {
 	for i := range items {
 		if items[i].Key == nil {
 			return trace.BadParameter("missing parameter key in item %v", i)
@@ -475,7 +476,7 @@ func (l *LiteBackend) Import(ctx context.Context, items []backend.Item) error {
 
 // PutRange puts range of items into backend (creates if items doe not
 // exists, updates it otherwise)
-func (l *LiteBackend) PutRange(ctx context.Context, items []backend.Item) error {
+func (l *Backend) PutRange(ctx context.Context, items []backend.Item) error {
 	for i := range items {
 		if items[i].Key == nil {
 			return trace.BadParameter("missing parameter key in item %v", i)
@@ -490,7 +491,7 @@ func (l *LiteBackend) PutRange(ctx context.Context, items []backend.Item) error 
 	return nil
 }
 
-func (l *LiteBackend) putRangeInTransaction(ctx context.Context, tx *sql.Tx, items []backend.Item, forceEventsOff bool) error {
+func (l *Backend) putRangeInTransaction(ctx context.Context, tx *sql.Tx, items []backend.Item, forceEventsOff bool) error {
 	var eventsStmt *sql.Stmt
 	var err error
 	if !l.EventsOff {
@@ -510,7 +511,7 @@ func (l *LiteBackend) putRangeInTransaction(ctx context.Context, tx *sql.Tx, ite
 			recordID = items[i].ID
 		}
 		if !l.EventsOff && !forceEventsOff {
-			if _, err := eventsStmt.ExecContext(ctx, backend.OpPut, created, string(items[i].Key), recordID, expires(items[i].Expires), items[i].Value); err != nil {
+			if _, err := eventsStmt.ExecContext(ctx, types.OpPut, created, string(items[i].Key), recordID, expires(items[i].Expires), items[i].Value); err != nil {
 				return trace.Wrap(err)
 			}
 		}
@@ -522,7 +523,7 @@ func (l *LiteBackend) putRangeInTransaction(ctx context.Context, tx *sql.Tx, ite
 }
 
 // Update updates value in the backend
-func (l *LiteBackend) Update(ctx context.Context, i backend.Item) (*backend.Lease, error) {
+func (l *Backend) Update(ctx context.Context, i backend.Item) (*backend.Lease, error) {
 	if i.Key == nil {
 		return nil, trace.BadParameter("missing parameter key")
 	}
@@ -548,7 +549,7 @@ func (l *LiteBackend) Update(ctx context.Context, i backend.Item) (*backend.Leas
 			if err != nil {
 				return trace.Wrap(err)
 			}
-			if _, err := stmt.ExecContext(ctx, backend.OpPut, created, string(i.Key), id(created), expires(i.Expires), i.Value); err != nil {
+			if _, err := stmt.ExecContext(ctx, types.OpPut, created, string(i.Key), id(created), expires(i.Expires), i.Value); err != nil {
 				return trace.Wrap(err)
 			}
 		}
@@ -561,7 +562,7 @@ func (l *LiteBackend) Update(ctx context.Context, i backend.Item) (*backend.Leas
 }
 
 // Get returns a single item or not found error
-func (l *LiteBackend) Get(ctx context.Context, key []byte) (*backend.Item, error) {
+func (l *Backend) Get(ctx context.Context, key []byte) (*backend.Item, error) {
 	if len(key) == 0 {
 		return nil, trace.BadParameter("missing parameter key")
 	}
@@ -576,7 +577,7 @@ func (l *LiteBackend) Get(ctx context.Context, key []byte) (*backend.Item, error
 }
 
 // getInTransaction returns an item, works in transaction
-func (l *LiteBackend) getInTransaction(ctx context.Context, key []byte, tx *sql.Tx, item *backend.Item) error {
+func (l *Backend) getInTransaction(ctx context.Context, key []byte, tx *sql.Tx, item *backend.Item) error {
 	// When in mirror mode, don't set the current time so the SELECT query
 	// returns expired items.
 	var now time.Time
@@ -602,7 +603,7 @@ func (l *LiteBackend) getInTransaction(ctx context.Context, key []byte, tx *sql.
 }
 
 // GetRange returns query range
-func (l *LiteBackend) GetRange(ctx context.Context, startKey []byte, endKey []byte, limit int) (*backend.GetResult, error) {
+func (l *Backend) GetRange(ctx context.Context, startKey []byte, endKey []byte, limit int) (*backend.GetResult, error) {
 	if len(startKey) == 0 {
 		return nil, trace.BadParameter("missing parameter startKey")
 	}
@@ -651,7 +652,7 @@ func (l *LiteBackend) GetRange(ctx context.Context, startKey []byte, endKey []by
 }
 
 // KeepAlive updates TTL on the lease
-func (l *LiteBackend) KeepAlive(ctx context.Context, lease backend.Lease, expires time.Time) error {
+func (l *Backend) KeepAlive(ctx context.Context, lease backend.Lease, expires time.Time) error {
 	if len(lease.Key) == 0 {
 		return trace.BadParameter("lease key is not specified")
 	}
@@ -668,7 +669,7 @@ func (l *LiteBackend) KeepAlive(ctx context.Context, lease backend.Lease, expire
 			if err != nil {
 				return trace.Wrap(err)
 			}
-			if _, err := stmt.ExecContext(ctx, backend.OpPut, created, string(item.Key), id(created), expires.UTC(), item.Value); err != nil {
+			if _, err := stmt.ExecContext(ctx, types.OpPut, created, string(item.Key), id(created), expires.UTC(), item.Value); err != nil {
 				return trace.Wrap(err)
 			}
 		}
@@ -691,7 +692,7 @@ func (l *LiteBackend) KeepAlive(ctx context.Context, lease backend.Lease, expire
 	})
 }
 
-func (l *LiteBackend) deleteInTransaction(ctx context.Context, key []byte, tx *sql.Tx) error {
+func (l *Backend) deleteInTransaction(ctx context.Context, key []byte, tx *sql.Tx) error {
 	stmt, err := tx.PrepareContext(ctx, "DELETE FROM kv WHERE key = ?")
 	if err != nil {
 		return trace.Wrap(err)
@@ -713,7 +714,7 @@ func (l *LiteBackend) deleteInTransaction(ctx context.Context, key []byte, tx *s
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		if _, err := stmt.ExecContext(ctx, backend.OpDelete, created, string(key), created.UnixNano()); err != nil {
+		if _, err := stmt.ExecContext(ctx, types.OpDelete, created, string(key), created.UnixNano()); err != nil {
 			return trace.Wrap(err)
 		}
 	}
@@ -722,7 +723,7 @@ func (l *LiteBackend) deleteInTransaction(ctx context.Context, key []byte, tx *s
 
 // Delete deletes item by key, returns NotFound error
 // if item does not exist
-func (l *LiteBackend) Delete(ctx context.Context, key []byte) error {
+func (l *Backend) Delete(ctx context.Context, key []byte) error {
 	if len(key) == 0 {
 		return trace.BadParameter("missing parameter key")
 	}
@@ -733,7 +734,7 @@ func (l *LiteBackend) Delete(ctx context.Context, key []byte) error {
 
 // DeleteRange deletes range of items with keys between startKey and endKey
 // Note that elements deleted by range do not produce any events
-func (l *LiteBackend) DeleteRange(ctx context.Context, startKey, endKey []byte) error {
+func (l *Backend) DeleteRange(ctx context.Context, startKey, endKey []byte) error {
 	if len(startKey) == 0 {
 		return trace.BadParameter("missing parameter startKey")
 	}
@@ -771,7 +772,7 @@ func (l *LiteBackend) DeleteRange(ctx context.Context, startKey, endKey []byte) 
 }
 
 // NewWatcher returns a new event watcher
-func (l *LiteBackend) NewWatcher(ctx context.Context, watch backend.Watch) (backend.Watcher, error) {
+func (l *Backend) NewWatcher(ctx context.Context, watch backend.Watch) (backend.Watcher, error) {
 	if l.EventsOff {
 		return nil, trace.BadParameter("events are turned off for this backend")
 	}
@@ -784,32 +785,32 @@ func (l *LiteBackend) NewWatcher(ctx context.Context, watch backend.Watch) (back
 }
 
 // Close closes all associated resources
-func (l *LiteBackend) Close() error {
+func (l *Backend) Close() error {
 	l.cancel()
 	return l.closeDatabase()
 }
 
 // CloseWatchers closes all the watchers
 // without closing the backend
-func (l *LiteBackend) CloseWatchers() {
+func (l *Backend) CloseWatchers() {
 	l.buf.Reset()
 }
 
-func (l *LiteBackend) isClosed() bool {
+func (l *Backend) isClosed() bool {
 	return atomic.LoadInt32(&l.closedFlag) == 1
 }
 
-func (l *LiteBackend) setClosed() {
+func (l *Backend) setClosed() {
 	atomic.StoreInt32(&l.closedFlag, 1)
 }
 
-func (l *LiteBackend) closeDatabase() error {
+func (l *Backend) closeDatabase() error {
 	l.setClosed()
 	l.buf.Close()
 	return l.db.Close()
 }
 
-func (l *LiteBackend) inTransaction(ctx context.Context, f func(tx *sql.Tx) error) (err error) {
+func (l *Backend) inTransaction(ctx context.Context, f func(tx *sql.Tx) error) (err error) {
 	start := time.Now()
 	defer func() {
 		diff := time.Since(start)

@@ -37,12 +37,12 @@ type Supervisor interface {
 
 	// RegisterFunc creates a service from function spec and registers
 	// it within the system
-	RegisterFunc(name string, fn ServiceFunc)
+	RegisterFunc(name string, fn Func)
 
 	// RegisterCriticalFunc creates a critical service from function spec and registers
 	// it within the system, if this service exits with error,
 	// the process shuts down.
-	RegisterCriticalFunc(name string, fn ServiceFunc)
+	RegisterCriticalFunc(name string, fn Func)
 
 	// ServiceCount returns the number of registered and actively running
 	// services
@@ -135,10 +135,13 @@ type LocalSupervisor struct {
 
 	eventMappings []EventMapping
 	id            string
+
+	// log specifies the logger
+	log logrus.FieldLogger
 }
 
 // NewSupervisor returns new instance of initialized supervisor
-func NewSupervisor(id string) Supervisor {
+func NewSupervisor(id string, parentLog logrus.FieldLogger) Supervisor {
 	closeContext, cancel := context.WithCancel(context.TODO())
 
 	exitContext, signalExit := context.WithCancel(context.TODO())
@@ -160,6 +163,7 @@ func NewSupervisor(id string) Supervisor {
 
 		reloadContext: reloadContext,
 		signalReload:  signalReload,
+		log:           parentLog.WithField(trace.Component, teleport.Component(teleport.ComponentProcess, id)),
 	}
 	go srv.fanOut()
 	return srv
@@ -177,7 +181,7 @@ func (e *Event) String() string {
 }
 
 func (s *LocalSupervisor) Register(srv Service) {
-	log.WithFields(logrus.Fields{"service": srv.Name(), trace.Component: teleport.ComponentProcess}).Debugf("Adding service to supervisor.")
+	s.log.WithField("service", srv.Name()).Debug("Adding service to supervisor.")
 	s.Lock()
 	defer s.Unlock()
 	s.services = append(s.services, srv)
@@ -196,36 +200,36 @@ func (s *LocalSupervisor) ServiceCount() int {
 
 // RegisterFunc creates a service from function spec and registers
 // it within the system
-func (s *LocalSupervisor) RegisterFunc(name string, fn ServiceFunc) {
+func (s *LocalSupervisor) RegisterFunc(name string, fn Func) {
 	s.Register(&LocalService{Function: fn, ServiceName: name})
 }
 
 // RegisterCriticalFunc creates a critical service from function spec and registers
 // it within the system, if this service exits with error,
 // the process shuts down.
-func (s *LocalSupervisor) RegisterCriticalFunc(name string, fn ServiceFunc) {
+func (s *LocalSupervisor) RegisterCriticalFunc(name string, fn Func) {
 	s.Register(&LocalService{Function: fn, ServiceName: name, Critical: true})
 }
 
 // RemoveService removes service from supervisor tracking list
 func (s *LocalSupervisor) RemoveService(srv Service) error {
-	l := logrus.WithFields(logrus.Fields{"service": srv.Name(), trace.Component: teleport.Component(teleport.ComponentProcess, s.id)})
+	l := s.log.WithField("service", srv.Name())
 	s.Lock()
 	defer s.Unlock()
 	for i, el := range s.services {
 		if el == srv {
 			s.services = append(s.services[:i], s.services[i+1:]...)
-			l.Debugf("Service is completed and removed.")
+			l.Debug("Service is completed and removed.")
 			return nil
 		}
 	}
-	l.Warningf("Service is completed but not found.")
+	l.Warning("Service is completed but not found.")
 	return trace.NotFound("service %v is not found", srv)
 }
 
-// ServiceExit contains information about service
+// ExitEventPayload contains information about service
 // name, and service error if it exited with error
-type ServiceExit struct {
+type ExitEventPayload struct {
 	// Service is the service that exited
 	Service Service
 	// Error is the error of the service exit
@@ -237,17 +241,17 @@ func (s *LocalSupervisor) serve(srv Service) {
 	go func() {
 		defer s.wg.Done()
 		defer s.RemoveService(srv)
-		l := log.WithFields(logrus.Fields{"service": srv.Name(), trace.Component: teleport.Component(teleport.ComponentProcess, s.id)})
-		l.Debugf("Service has started.")
+		l := s.log.WithField("service", srv.Name())
+		l.Debug("Service has started.")
 		err := srv.Serve()
 		if err != nil {
 			if err == ErrTeleportExited {
-				l.Infof("Teleport process has shut down.")
+				l.Info("Teleport process has shut down.")
 			} else {
-				l.Warningf("Teleport process has exited with error: %v", err)
+				l.WithError(err).Warning("Teleport process has exited with error.")
 				s.BroadcastEvent(Event{
 					Name:    ServiceExitedWithErrorEvent,
-					Payload: ServiceExit{Service: srv, Error: err},
+					Payload: ExitEventPayload{Service: srv, Error: err},
 				})
 			}
 		}
@@ -260,7 +264,7 @@ func (s *LocalSupervisor) Start() error {
 	s.state = stateStarted
 
 	if len(s.services) == 0 {
-		log.Warning("Supervisor has no services to run. Exiting.")
+		s.log.Warning("Supervisor has no services to run. Exiting.")
 		return nil
 	}
 
@@ -326,7 +330,7 @@ func (s *LocalSupervisor) BroadcastEvent(event Event) {
 	// Log all events other than recovered events to prevent the logs from
 	// being flooded.
 	if event.String() != TeleportOKEvent {
-		log.WithFields(logrus.Fields{"event": event.String(), trace.Component: teleport.Component(teleport.ComponentProcess, s.id)}).Debugf("Broadcasting event.")
+		s.log.WithField("event", event.String()).Debug("Broadcasting event.")
 	}
 
 	go func() {
@@ -348,7 +352,10 @@ func (s *LocalSupervisor) BroadcastEvent(event Event) {
 					return
 				}
 			}(mappedEvent)
-			log.WithFields(logrus.Fields{"in": event.String(), "out": m.String(), trace.Component: teleport.Component(teleport.ComponentProcess, s.id)}).Debugf("Broadcasting mapped event.")
+			s.log.WithFields(logrus.Fields{
+				"in":  event.String(),
+				"out": m.String(),
+			}).Debug("Broadcasting mapped event.")
 		}
 	}
 }
@@ -430,7 +437,7 @@ type Service interface {
 // LocalService is a locally defined service
 type LocalService struct {
 	// Function is a function to call
-	Function ServiceFunc
+	Function Func
 	// ServiceName is a service name
 	ServiceName string
 	// Critical is set to true
@@ -460,8 +467,8 @@ func (l *LocalService) Name() string {
 	return l.ServiceName
 }
 
-// ServiceFunc is a service function
-type ServiceFunc func() error
+// Func is a service function
+type Func func() error
 
 const (
 	stateCreated = iota

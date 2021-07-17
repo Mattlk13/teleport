@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Gravitational, Inc.
+Copyright 2017-2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,39 +19,73 @@ limitations under the License.
 package modules
 
 import (
-	"bytes"
+	"crypto/sha256"
 	"fmt"
+	"reflect"
 	"runtime"
 	"sync"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/types"
+
+	"github.com/gravitational/trace"
 )
+
+// Features provides supported and unsupported features
+type Features struct {
+	// Kubernetes enables Kubernetes Access product
+	Kubernetes bool
+	// App enables Application Access product
+	App bool
+	// DB enables database access product
+	DB bool
+	// OIDC enables OIDC connectors
+	OIDC bool
+	// SAML enables SAML connectors
+	SAML bool
+	// AccessControls enables FIPS access controls
+	AccessControls bool
+	// AdvancedAccessWorkflows enables advanced access workflows
+	AdvancedAccessWorkflows bool
+	// Cloud enables some cloud-related features
+	Cloud bool
+}
+
+// ToProto converts Features into proto.Features
+func (f Features) ToProto() *proto.Features {
+	return &proto.Features{
+		Kubernetes:              f.Kubernetes,
+		App:                     f.App,
+		DB:                      f.DB,
+		OIDC:                    f.OIDC,
+		SAML:                    f.SAML,
+		AccessControls:          f.AccessControls,
+		AdvancedAccessWorkflows: f.AdvancedAccessWorkflows,
+		Cloud:                   f.Cloud,
+	}
+}
 
 // Modules defines interface that external libraries can implement customizing
 // default teleport behavior
 type Modules interface {
-	// EmptyRoles handler is called when a new trusted cluster with empty roles
-	// is being created
-	EmptyRolesHandler() error
-	// DefaultAllowedLogins returns default allowed logins for a new admin role
-	DefaultAllowedLogins() []string
-	// DefaultKubeUsers returns default kubernetes users for a new admin role
-	DefaultKubeUsers() []string
-	// DefaultKubeGroups returns default kubernetes groups for a new admin role
-	DefaultKubeGroups() []string
 	// PrintVersion prints teleport version
 	PrintVersion()
-	// RolesFromLogins returns roles for external user based on the logins
-	// extracted from the connector
-	RolesFromLogins([]string) []string
-	// TraitsFromLogins returns traits for external user based on the logins
-	// and kubernetes groups extracted from the connector
-	TraitsFromLogins(user string, logins []string, kubeGroups []string, kubeUsers []string) map[string][]string
-	// SupportsKubernetes returns true if this cluster supports kubernetes
-	SupportsKubernetes() bool
 	// IsBoringBinary checks if the binary was compiled with BoringCrypto.
 	IsBoringBinary() bool
+	// Features returns supported features
+	Features() Features
+	// BuildType returns build type (OSS or Enterprise)
+	BuildType() string
 }
+
+const (
+	// BuildOSS specifies open source build type
+	BuildOSS = "oss"
+	// BuildEnterprise specifies enterprise build type
+	BuildEnterprise = "ent"
+)
 
 // SetModules sets the modules interface
 func SetModules(m Modules) {
@@ -67,72 +101,61 @@ func GetModules() Modules {
 	return modules
 }
 
-type defaultModules struct{}
+// ValidateResource performs additional resource checks.
+func ValidateResource(res types.Resource) error {
+	// All checks below are Cloud-specific.
+	if !GetModules().Features().Cloud {
+		return nil
+	}
 
-// EmptyRolesHandler is called when a new trusted cluster with empty roles
-// is created, no-op by default
-func (p *defaultModules) EmptyRolesHandler() error {
+	switch r := res.(type) {
+	case types.AuthPreference:
+		switch r.GetSecondFactor() {
+		case constants.SecondFactorOff, constants.SecondFactorOptional:
+			return trace.BadParameter("cannot disable two-factor authentication on Cloud")
+		}
+	case types.SessionRecordingConfig:
+		switch r.GetMode() {
+		case types.RecordAtProxy, types.RecordAtProxySync:
+			return trace.BadParameter("cannot set proxy recording mode on Cloud")
+		}
+		if !r.GetProxyChecksHostKeys() {
+			return trace.BadParameter("cannot disable strict host key checking on Cloud")
+		}
+	}
 	return nil
 }
 
-// DefaultKubeUsers returns default kubernetes users for a new admin role
-func (p *defaultModules) DefaultKubeUsers() []string {
-	return []string{teleport.TraitInternalKubeUsersVariable}
-}
+type defaultModules struct{}
 
-// DefaultKubeGroups returns default kubernetes groups for a new admin role
-func (p *defaultModules) DefaultKubeGroups() []string {
-	return []string{teleport.TraitInternalKubeGroupsVariable}
-}
-
-// DefaultAllowedLogins returns allowed logins for a new admin role
-func (p *defaultModules) DefaultAllowedLogins() []string {
-	return []string{teleport.TraitInternalLoginsVariable}
+// BuildType returns build type (OSS or Enterprise)
+func (p *defaultModules) BuildType() string {
+	return BuildOSS
 }
 
 // PrintVersion prints the Teleport version.
 func (p *defaultModules) PrintVersion() {
-	var buf bytes.Buffer
-
-	buf.WriteString(fmt.Sprintf("Teleport v%s ", teleport.Version))
-	buf.WriteString(fmt.Sprintf("git:%s ", teleport.Gitref))
-	buf.WriteString(runtime.Version())
-
-	fmt.Println(buf.String())
+	fmt.Printf("Teleport v%s git:%s %s\n", teleport.Version, teleport.Gitref, runtime.Version())
 }
 
-// RolesFromLogins returns roles for external user based on the logins
-// extracted from the connector
-//
-// By default there is only one role, "admin", so logins are ignored and
-// instead used as allowed logins (see TraitsFromLogins below).
-func (p *defaultModules) RolesFromLogins(logins []string) []string {
-	return []string{teleport.AdminRoleName}
-}
-
-// TraitsFromLogins returns traits for external user based on the logins
-// extracted from the connector
-//
-// By default logins are treated as allowed logins user traits.
-func (p *defaultModules) TraitsFromLogins(_ string, logins, kubeGroups, kubeUsers []string) map[string][]string {
-	return map[string][]string{
-		teleport.TraitLogins:     logins,
-		teleport.TraitKubeGroups: kubeGroups,
-		teleport.TraitKubeUsers:  kubeUsers,
+// Features returns supported features
+func (p *defaultModules) Features() Features {
+	return Features{
+		Kubernetes: true,
+		DB:         true,
+		App:        true,
 	}
 }
 
-// SupportsKubernetes returns true if this cluster supports kubernetes
-func (p *defaultModules) SupportsKubernetes() bool {
-	return true
-}
-
-// IsBoringBinary checks if the binary was compiled with BoringCrypto.
 func (p *defaultModules) IsBoringBinary() bool {
-	return false
+	// Check the package name for one of the boring primitives, if the package
+	// path is from BoringCrypto, we know this binary was compiled against the
+	// dev.boringcrypto branch of Go.
+	hash := sha256.New()
+	return reflect.TypeOf(hash).Elem().PkgPath() == "crypto/internal/boring"
 }
 
 var (
-	mutex           = &sync.Mutex{}
+	mutex   sync.Mutex
 	modules Modules = &defaultModules{}
 )

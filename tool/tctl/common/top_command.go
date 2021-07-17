@@ -27,13 +27,14 @@ import (
 	"time"
 
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/service"
-	"github.com/gravitational/teleport/lib/services"
 
 	"github.com/dustin/go-humanize"
-	ui "github.com/gizak/termui"
-	"github.com/gizak/termui/widgets"
+	ui "github.com/gizak/termui/v3"
+	"github.com/gizak/termui/v3/widgets"
 	"github.com/gravitational/kingpin"
 	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/trace"
@@ -55,7 +56,7 @@ type TopCommand struct {
 func (c *TopCommand) Initialize(app *kingpin.Application, config *service.Config) {
 	c.config = config
 	c.top = app.Command("top", "Report diagnostic information")
-	c.diagURL = c.top.Arg("diag-addr", "Diagnostic HTTP URL").Default("http://127.0.0.1:3434").String()
+	c.diagURL = c.top.Arg("diag-addr", "Diagnostic HTTP URL").Default("http://127.0.0.1:3000").String()
 	c.refreshPeriod = c.top.Arg("refresh", "Refresh period").Default("5s").Duration()
 }
 
@@ -70,7 +71,7 @@ func (c *TopCommand) TryRun(cmd string, client auth.ClientI) (match bool, err er
 		err = c.Top(diagClient)
 		if trace.IsConnectionProblem(err) {
 			return true, trace.ConnectionProblem(err,
-				"[CLIENT] Could not connect to metrics service at %v. Is teleport is running with --diag-addr=%v?", *c.diagURL, *c.diagURL)
+				"[CLIENT] Could not connect to metrics service at %v. Is teleport running with --diag-addr=%v?", *c.diagURL, *c.diagURL)
 		}
 		return true, trace.Wrap(err)
 	default:
@@ -134,16 +135,13 @@ func (c *TopCommand) Top(client *roundtrip.Client) error {
 
 func (c *TopCommand) render(ctx context.Context, re Report, eventID string) error {
 	h := widgets.NewParagraph()
-	h.Text = ""
 	h.Text = fmt.Sprintf("Report Generated at %v for host %v. Press <q> or Ctrl-C to quit.",
-		re.Timestamp.Format(teleport.HumanDateFormatSeconds), re.Hostname)
-	h.BorderStyle = ui.NewStyle(ui.ColorBlack)
+		re.Timestamp.Format(constants.HumanDateFormatSeconds), re.Hostname)
 	h.Border = false
 	h.TextStyle = ui.NewStyle(ui.ColorMagenta)
 
 	backendRequestsTable := func(title string, b BackendStats) *widgets.Table {
 		t := widgets.NewTable()
-		t.BorderStyle = ui.NewStyle(ui.ColorBlack)
 		t.Title = title
 		t.TitleStyle = ui.NewStyle(ui.ColorCyan)
 		t.ColumnWidths = []int{10, 10, 10, 50000}
@@ -160,17 +158,14 @@ func (c *TopCommand) render(ctx context.Context, re Report, eventID string) erro
 					req.Key.Key,
 				})
 		}
-		t.TextStyle = ui.NewStyle(ui.ColorBlack)
 		return t
 	}
 
 	t1 := widgets.NewTable()
 	t1.Title = "Cluster Stats"
 	t1.TitleStyle = ui.NewStyle(ui.ColorCyan)
-	t1.BorderStyle = ui.NewStyle(ui.ColorBlack)
 	t1.ColumnWidths = []int{30, 50000}
 	t1.RowSeparator = false
-	t1.TextStyle = ui.NewStyle(ui.ColorBlack)
 	t1.Rows = [][]string{
 		[]string{"Interactive Sessions", humanize.FormatFloat("", re.Cluster.InteractiveSessions)},
 		[]string{"Cert Gen Active Requests", humanize.FormatFloat("", re.Cluster.GenerateRequests)},
@@ -187,12 +182,10 @@ func (c *TopCommand) render(ctx context.Context, re Report, eventID string) erro
 	t2 := widgets.NewTable()
 	t2.Title = "Process Stats"
 	t2.TitleStyle = ui.NewStyle(ui.ColorCyan)
-	t2.BorderStyle = ui.NewStyle(ui.ColorBlack)
 	t2.ColumnWidths = []int{30, 50000}
 	t2.RowSeparator = false
-	t2.TextStyle = ui.NewStyle(ui.ColorBlack)
 	t2.Rows = [][]string{
-		[]string{"Start Time", re.Process.StartTime.Format(teleport.HumanDateFormatSeconds)},
+		[]string{"Start Time", re.Process.StartTime.Format(constants.HumanDateFormatSeconds)},
 		[]string{"Resident Memory Bytes", humanize.Bytes(uint64(re.Process.ResidentMemoryBytes))},
 		[]string{"Open File Descriptors", humanize.FormatFloat("", re.Process.OpenFDs)},
 		[]string{"CPU Seconds Total", humanize.FormatFloat("", re.Process.CPUSecondsTotal)},
@@ -202,10 +195,8 @@ func (c *TopCommand) render(ctx context.Context, re Report, eventID string) erro
 	t3 := widgets.NewTable()
 	t3.Title = "Go Runtime Stats"
 	t3.TitleStyle = ui.NewStyle(ui.ColorCyan)
-	t3.BorderStyle = ui.NewStyle(ui.ColorBlack)
 	t3.ColumnWidths = []int{30, 50000}
 	t3.RowSeparator = false
-	t3.TextStyle = ui.NewStyle(ui.ColorBlack)
 	t3.Rows = [][]string{
 		[]string{"Allocated Memory", humanize.Bytes(uint64(re.Go.AllocBytes))},
 		[]string{"Goroutines", humanize.FormatFloat("", re.Go.Goroutines)},
@@ -219,10 +210,16 @@ func (c *TopCommand) render(ctx context.Context, re Report, eventID string) erro
 		t := widgets.NewTable()
 		t.Title = title
 		t.TitleStyle = ui.NewStyle(ui.ColorCyan)
-		t.BorderStyle = ui.NewStyle(ui.ColorBlack)
+
+		if hist.Count == 0 {
+			t.Rows = [][]string{
+				[]string{"No data"},
+			}
+			return t
+		}
+
 		t.ColumnWidths = []int{30, 50000}
 		t.RowSeparator = false
-		t.TextStyle = ui.NewStyle(ui.ColorBlack)
 		t.Rows = [][]string{
 			[]string{"Percentile", "Latency"},
 		}
@@ -240,8 +237,8 @@ func (c *TopCommand) render(ctx context.Context, re Report, eventID string) erro
 	grid.SetRect(0, 0, termWidth, termHeight)
 
 	tabpane := widgets.NewTabPane("[1] Common", "[2] Backend Stats", "[3] Cache Stats")
-	tabpane.ActiveTabStyle = ui.NewStyle(ui.ColorCyan)
-	tabpane.InactiveTabStyle = ui.NewStyle(ui.ColorBlack)
+	tabpane.ActiveTabStyle = ui.NewStyle(ui.ColorCyan, ui.ColorClear, ui.ModifierBold|ui.ModifierUnderline)
+	tabpane.InactiveTabStyle = ui.NewStyle(ui.ColorCyan)
 	tabpane.Border = false
 
 	switch eventID {
@@ -254,12 +251,12 @@ func (c *TopCommand) render(ctx context.Context, re Report, eventID string) erro
 			),
 			ui.NewRow(0.95,
 				ui.NewCol(0.5,
-					ui.NewRow(0.15, t1),
-					ui.NewRow(0.15, t2),
-					ui.NewRow(0.15, t3),
+					ui.NewRow(0.3, t1),
+					ui.NewRow(0.3, t2),
+					ui.NewRow(0.3, t3),
 				),
 				ui.NewCol(0.5,
-					ui.NewRow(0.3, percentileTable("Generate Certificates Histogram", re.Cluster.GenerateRequestsHistogram)),
+					ui.NewRow(0.3, percentileTable("Generate Server Certificates Histogram", re.Cluster.GenerateRequestsHistogram)),
 				),
 			),
 		)
@@ -554,7 +551,7 @@ func generateReport(metrics map[string]*dto.MetricFamily, prev *Report, period t
 	// format top backend requests
 	hostname, _ := os.Hostname()
 	re := Report{
-		Version:   services.V1,
+		Version:   types.V1,
 		Timestamp: time.Now().UTC(),
 		Hostname:  hostname,
 		Backend: BackendStats{

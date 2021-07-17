@@ -18,7 +18,7 @@ package reversetunnel
 
 import (
 	"context"
-	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -27,7 +27,6 @@ import (
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/reversetunnel/track"
-	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
@@ -48,17 +47,16 @@ type ServerHandler interface {
 // The agent pool watches the reverse tunnel entries created by the admin and
 // connects/disconnects to added/deleted tunnels.
 type AgentPool struct {
-	sync.Mutex
-	*log.Entry
+	log          *log.Entry
 	cfg          AgentPoolConfig
-	agents       map[agentKey][]*Agent
 	proxyTracker *track.Tracker
 	ctx          context.Context
 	cancel       context.CancelFunc
-	// lastReport is the last time the agent has reported the stats
-	lastReport time.Time
 	// spawnLimiter limits agent spawn rate
 	spawnLimiter utils.Retry
+
+	mu     sync.Mutex
+	agents map[utils.NetAddr][]*Agent
 }
 
 // AgentPoolConfig holds configuration parameters for the agent pool
@@ -69,29 +67,29 @@ type AgentPoolConfig struct {
 	// AccessPoint is a lightweight access point
 	// that can optionally cache some values
 	AccessPoint auth.AccessPoint
-	// HostSigners is a list of host signers this agent presents itself as
-	HostSigners []ssh.Signer
+	// HostSigner is a host signer this agent presents itself as
+	HostSigner ssh.Signer
 	// HostUUID is a unique ID of this host
 	HostUUID string
-	// Context is an optional context
-	Context context.Context
-	// Cluster is a cluster name
-	Cluster string
+	// LocalCluster is a cluster name this client is a member of.
+	LocalCluster string
 	// Clock is a clock used to get time, if not set,
 	// system clock is used
 	Clock clockwork.Clock
 	// KubeDialAddr is an address of a kubernetes proxy
 	KubeDialAddr utils.NetAddr
-	// Server is a SSH server that can handle a connection (perform a handshake
-	// then process). Only set with the agent is running within a node.
+	// Server is either an SSH or application server. It can handle a connection
+	// (perform handshake and handle request).
 	Server ServerHandler
 	// Component is the Teleport component this agent pool is running in. It can
 	// either be proxy (trusted clusters) or node (dial back).
 	Component string
 	// ReverseTunnelServer holds all reverse tunnel connections.
 	ReverseTunnelServer Server
-	// ProxyAddr if set, points to the address of the ssh proxy
+	// ProxyAddr points to the address of the ssh proxy
 	ProxyAddr string
+	// Cluster is a cluster name of the proxy.
+	Cluster string
 }
 
 // CheckAndSetDefaults checks and sets defaults
@@ -102,23 +100,23 @@ func (cfg *AgentPoolConfig) CheckAndSetDefaults() error {
 	if cfg.AccessPoint == nil {
 		return trace.BadParameter("missing 'AccessPoint' parameter")
 	}
-	if len(cfg.HostSigners) == 0 {
-		return trace.BadParameter("missing 'HostSigners' parameter")
+	if cfg.HostSigner == nil {
+		return trace.BadParameter("missing 'HostSigner' parameter")
 	}
 	if len(cfg.HostUUID) == 0 {
 		return trace.BadParameter("missing 'HostUUID' parameter")
 	}
-	if cfg.Context == nil {
-		cfg.Context = context.TODO()
-	}
 	if cfg.Clock == nil {
 		cfg.Clock = clockwork.NewRealClock()
+	}
+	if cfg.Cluster == "" {
+		return trace.BadParameter("missing 'Cluster' parameter")
 	}
 	return nil
 }
 
-// NewAgentPool returns new isntance of the agent pool
-func NewAgentPool(cfg AgentPoolConfig) (*AgentPool, error) {
+// NewAgentPool returns new instance of the agent pool
+func NewAgentPool(ctx context.Context, cfg AgentPoolConfig) (*AgentPool, error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -131,27 +129,40 @@ func NewAgentPool(cfg AgentPoolConfig) (*AgentPool, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	ctx, cancel := context.WithCancel(cfg.Context)
+
+	proxyAddr, err := utils.ParseAddr(cfg.ProxyAddr)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	tr, err := track.New(ctx, track.Config{ClusterName: cfg.Cluster})
+	if err != nil {
+		cancel()
+		return nil, trace.Wrap(err)
+	}
+
 	pool := &AgentPool{
-		agents:       make(map[agentKey][]*Agent),
-		proxyTracker: track.New(ctx, track.Config{}),
+		agents:       make(map[utils.NetAddr][]*Agent),
+		proxyTracker: tr,
 		cfg:          cfg,
 		ctx:          ctx,
 		cancel:       cancel,
 		spawnLimiter: retry,
+		log: log.WithFields(log.Fields{
+			trace.Component: teleport.ComponentReverseTunnelAgent,
+			trace.ComponentFields: log.Fields{
+				"cluster": cfg.Cluster,
+			},
+		}),
 	}
-	pool.Entry = log.WithFields(log.Fields{
-		trace.Component: teleport.ComponentReverseTunnelAgent,
-		trace.ComponentFields: log.Fields{
-			"cluster": cfg.Cluster,
-		},
-	})
+	pool.proxyTracker.Start(*proxyAddr)
 	return pool, nil
 }
 
 // Start starts the agent pool
 func (m *AgentPool) Start() error {
-	m.Debugf("Starting agent pool %s.%s...", m.cfg.HostUUID, m.cfg.Cluster)
+	m.log.Debugf("Starting agent pool %s.%s...", m.cfg.HostUUID, m.cfg.Cluster)
 	go m.pollAndSyncAgents()
 	go m.processSeekEvents()
 	return nil
@@ -159,11 +170,17 @@ func (m *AgentPool) Start() error {
 
 // Stop stops the agent pool
 func (m *AgentPool) Stop() {
+	if m == nil {
+		return
+	}
 	m.cancel()
 }
 
 // Wait returns when agent pool is closed
 func (m *AgentPool) Wait() {
+	if m == nil {
+		return
+	}
 	<-m.ctx.Done()
 }
 
@@ -172,19 +189,19 @@ func (m *AgentPool) processSeekEvents() {
 	for {
 		select {
 		case <-m.ctx.Done():
-			m.Debugf("Halting seek event processing (pool closing)")
+			m.log.Debugf("Halting seek event processing (pool closing)")
 			return
 		case lease := <-m.proxyTracker.Acquire():
-			m.Debugf("Seeking: %+v.", lease.Key())
+			m.log.Debugf("Seeking: %+v.", lease.Key())
 			m.withLock(func() {
 				if err := m.addAgent(lease); err != nil {
-					m.WithError(err).Errorf("Failed to add agent.")
+					m.log.WithError(err).Errorf("Failed to add agent.")
 				}
 			})
 		}
 		select {
 		case <-m.ctx.Done():
-			m.Debugf("Halting seek event processing (pool closing)")
+			m.log.Debugf("Halting seek event processing (pool closing)")
 			return
 		case <-limiter.After():
 			limiter.Inc()
@@ -192,37 +209,17 @@ func (m *AgentPool) processSeekEvents() {
 	}
 }
 
-// FetchAndSyncAgents executes one time fetch and sync request
-// (used in tests instead of polling)
-func (m *AgentPool) FetchAndSyncAgents() error {
-	tunnels, err := m.getReverseTunnels()
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	if err := m.syncAgents(tunnels); err != nil {
-		return trace.Wrap(err)
-	}
-	return nil
-}
-
 func (m *AgentPool) withLock(f func()) {
-	m.Lock()
-	defer m.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	f()
 }
 
 type matchAgentFn func(a *Agent) bool
 
-func (m *AgentPool) closeAgentsIf(matchKey *agentKey, matchAgent matchAgentFn) {
-	if matchKey != nil {
-		m.agents[*matchKey] = filterAndClose(m.agents[*matchKey], matchAgent)
-		if len(m.agents[*matchKey]) == 0 {
-			delete(m.agents, *matchKey)
-		}
-		return
-	}
+func (m *AgentPool) closeAgents() {
 	for key, agents := range m.agents {
-		m.agents[key] = filterAndClose(agents, matchAgent)
+		m.agents[key] = filterAndClose(agents, func(*Agent) bool { return true })
 		if len(m.agents[key]) == 0 {
 			delete(m.agents, key)
 		}
@@ -234,7 +231,7 @@ func filterAndClose(agents []*Agent, matchAgent matchAgentFn) []*Agent {
 	for i := range agents {
 		agent := agents[i]
 		if matchAgent(agent) {
-			agent.Debugf("Pool is closing agent.")
+			agent.log.Debugf("Pool is closing agent.")
 			agent.Close()
 		} else {
 			filtered = append(filtered, agent)
@@ -243,59 +240,36 @@ func filterAndClose(agents []*Agent, matchAgent matchAgentFn) []*Agent {
 	return filtered
 }
 
-func (m *AgentPool) closeAgents(matchKey *agentKey) {
-	m.closeAgentsIf(matchKey, func(*Agent) bool {
-		// close all agents matching the matchKey
-		return true
-	})
-}
-
 func (m *AgentPool) pollAndSyncAgents() {
 	ticker := time.NewTicker(defaults.ResyncInterval)
 	defer ticker.Stop()
-	if err := m.FetchAndSyncAgents(); err != nil {
-		m.Warningf("Failed to get reverse tunnels: %v.", err)
-	}
 	for {
 		select {
 		case <-m.ctx.Done():
-			m.withLock(func() {
-				m.closeAgents(nil)
-			})
-			m.Debugf("Closing.")
+			m.withLock(m.closeAgents)
+			m.log.Debugf("Closing.")
 			return
 		case <-ticker.C:
-			err := m.FetchAndSyncAgents()
-			if err != nil {
-				m.Warningf("Failed to get reverse tunnels: %v.", err)
-				continue
-			}
+			m.withLock(m.removeDisconnected)
 		}
 	}
 }
 
 func (m *AgentPool) addAgent(lease track.Lease) error {
-	// If the component connecting is a proxy, get the cluster name from the
-	// clusterName (where it is the name of the remote cluster). If it's a node, get
-	// the cluster name from the agent pool configuration itself (where it is
-	// the name of the local cluster).
-	key := keyFromLease(lease)
-	clusterName := key.clusterName
-	if key.tunnelType == string(services.NodeTunnel) {
-		clusterName = m.cfg.Cluster
-	}
+	addr := lease.Key().(utils.NetAddr)
 	agent, err := NewAgent(AgentConfig{
-		Addr:                key.addr,
-		ClusterName:         clusterName,
+		Addr:                addr,
+		ClusterName:         m.cfg.Cluster,
 		Username:            m.cfg.HostUUID,
-		Signers:             m.cfg.HostSigners,
+		Signer:              m.cfg.HostSigner,
 		Client:              m.cfg.Client,
 		AccessPoint:         m.cfg.AccessPoint,
 		Context:             m.ctx,
 		KubeDialAddr:        m.cfg.KubeDialAddr,
 		Server:              m.cfg.Server,
 		ReverseTunnelServer: m.cfg.ReverseTunnelServer,
-		LocalClusterName:    m.cfg.Cluster,
+		LocalClusterName:    m.cfg.LocalCluster,
+		Component:           m.cfg.Component,
 		Tracker:             m.proxyTracker,
 		Lease:               lease,
 	})
@@ -304,119 +278,30 @@ func (m *AgentPool) addAgent(lease track.Lease) error {
 		lease.Release()
 		return trace.Wrap(err)
 	}
-	m.Debugf("Adding %v.", agent)
+	m.log.Debugf("Adding %v.", agent)
 	// start the agent in a goroutine. no need to handle Start() errors: Start() will be
 	// retrying itself until the agent is closed
 	go agent.Start()
-	m.agents[key] = append(m.agents[key], agent)
+	m.agents[addr] = append(m.agents[addr], agent)
 	return nil
 }
 
 // Counts returns a count of the number of proxies a outbound tunnel is
 // connected to. Used in tests to determine if a proxy has been found and/or
 // removed.
-func (m *AgentPool) Counts() map[string]int {
-	m.Lock()
-	defer m.Unlock()
-	out := make(map[string]int)
-	for key, agents := range m.agents {
-		count := 0
-		for _, agent := range agents {
-			if agent.getState() == agentStateConnected {
-				count++
+func (m *AgentPool) Count() int {
+	var out int
+	m.withLock(func() {
+		for _, agents := range m.agents {
+			for _, agent := range agents {
+				if agent.getState() == agentStateConnected {
+					out++
+				}
 			}
 		}
-		out[key.clusterName] += count
-	}
+	})
 
 	return out
-}
-
-// getReverseTunnels always returns a builtin node tunnel
-// that has to be established
-func (m *AgentPool) getReverseTunnels() ([]services.ReverseTunnel, error) {
-	// Proxy uses reverse tunnels for bookkeeping
-	// purposes - to communicate that trusted cluster has been
-	// deleted and all agents have to be closed.
-	// Nodes do not have this need as the agent pool should
-	// exist as long as the node is running.
-	switch m.cfg.Component {
-	case teleport.ComponentProxy:
-		return m.cfg.AccessPoint.GetReverseTunnels()
-	case teleport.ComponentNode:
-		reverseTunnel := services.NewReverseTunnel(
-			m.cfg.Cluster,
-			[]string{m.cfg.ProxyAddr},
-		)
-		reverseTunnel.SetType(services.NodeTunnel)
-		return []services.ReverseTunnel{reverseTunnel}, nil
-	default:
-		return nil, trace.BadParameter("unsupported component %q", m.cfg.Component)
-	}
-}
-
-// reportStats submits report about agents state once in a while at info
-// level. Always logs more detailed information at debug level.
-func (m *AgentPool) reportStats() {
-	var logReport bool
-	if m.cfg.Clock.Now().Sub(m.lastReport) > defaults.ReportingPeriod {
-		m.lastReport = m.cfg.Clock.Now()
-		logReport = true
-	}
-
-	for key, agents := range m.agents {
-		countPerState := map[string]int{
-			agentStateConnecting:   0,
-			agentStateConnected:    0,
-			agentStateDisconnected: 0,
-		}
-		for _, a := range agents {
-			countPerState[a.getState()]++
-		}
-		for state, count := range countPerState {
-			gauge, err := trustedClustersStats.GetMetricWithLabelValues(key.clusterName, state)
-			if err != nil {
-				m.Warningf("Failed to get gauge: %v.", err)
-				continue
-			}
-			gauge.Set(float64(count))
-		}
-		if logReport {
-			m.WithFields(log.Fields{"target": key.clusterName, "stats": countPerState}).Info("Outbound tunnel stats.")
-		} else {
-			m.WithFields(log.Fields{"target": key.clusterName, "stats": countPerState}).Debug("Outbound tunnel stats.")
-		}
-	}
-}
-
-func (m *AgentPool) syncAgents(tunnels []services.ReverseTunnel) error {
-	m.Lock()
-	defer m.Unlock()
-
-	keys, err := tunnelsToAgentKeys(tunnels)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	agentsToAdd, agentsToRemove := diffTunnels(m.agents, keys)
-
-	// remove agents from deleted reverse tunnels
-	for _, key := range agentsToRemove {
-		m.proxyTracker.Stop(agentToTrackingKey(key))
-		m.closeAgents(&key)
-	}
-	// add agents from added reverse tunnels
-	for _, key := range agentsToAdd {
-		m.proxyTracker.Start(agentToTrackingKey(key))
-	}
-
-	// Remove disconnected agents from the list of agents.
-	m.removeDisconnected()
-
-	// Report tunnel statistics.
-	m.reportStats()
-
-	return nil
 }
 
 // removeDisconnected removes disconnected agents from the list of agents.
@@ -437,79 +322,73 @@ func (m *AgentPool) removeDisconnected() {
 	}
 }
 
-func tunnelsToAgentKeys(tunnels []services.ReverseTunnel) (map[agentKey]bool, error) {
-	vals := make(map[agentKey]bool)
-	for _, tunnel := range tunnels {
-		keys, err := tunnelToAgentKeys(tunnel)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		for _, key := range keys {
-			vals[key] = true
-		}
-	}
-	return vals, nil
+// Make sure ServerHandlerToListener implements both interfaces.
+var _ = net.Listener(ServerHandlerToListener{})
+var _ = ServerHandler(ServerHandlerToListener{})
+
+// ServerHandlerToListener is an adapter from ServerHandler to net.Listener. It
+// can be used as a Server field in AgentPoolConfig, while also being passed to
+// http.Server.Serve (or any other func Serve(net.Listener)).
+type ServerHandlerToListener struct {
+	connCh     chan net.Conn
+	closeOnce  *sync.Once
+	tunnelAddr string
 }
 
-func tunnelToAgentKeys(tunnel services.ReverseTunnel) ([]agentKey, error) {
-	out := make([]agentKey, len(tunnel.GetDialAddrs()))
-	for i, addr := range tunnel.GetDialAddrs() {
-		netaddr, err := utils.ParseAddr(addr)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		out[i] = agentKey{addr: *netaddr, tunnelType: string(tunnel.GetType()), clusterName: tunnel.GetClusterName()}
-	}
-	return out, nil
-}
-
-func diffTunnels(existingTunnels map[agentKey][]*Agent, arrivedKeys map[agentKey]bool) ([]agentKey, []agentKey) {
-	var agentsToRemove, agentsToAdd []agentKey
-	for existingKey := range existingTunnels {
-		if _, ok := arrivedKeys[existingKey]; !ok { // agent was removed
-			agentsToRemove = append(agentsToRemove, existingKey)
-		}
-	}
-
-	for arrivedKey := range arrivedKeys {
-		if _, ok := existingTunnels[arrivedKey]; !ok { // agent was added
-			agentsToAdd = append(agentsToAdd, arrivedKey)
-		}
-	}
-
-	return agentsToAdd, agentsToRemove
-}
-
-// agentKey is used to uniquely identify agents.
-type agentKey struct {
-	// clusterName is a cluster name of this agent
-	clusterName string
-
-	// tunnelType is the type of tunnel, is either node or proxy.
-	tunnelType string
-
-	// addr is the address this tunnel is agent is connected to. For example:
-	// proxy.example.com:3024.
-	addr utils.NetAddr
-}
-
-func keyFromLease(lease track.Lease) agentKey {
-	key := lease.Key().(track.Key)
-	return agentKey{
-		clusterName: key.Cluster,
-		tunnelType:  key.Type,
-		addr:        key.Addr,
+// NewServerHandlerToListener creates a new ServerHandlerToListener adapter.
+func NewServerHandlerToListener(tunnelAddr string) ServerHandlerToListener {
+	return ServerHandlerToListener{
+		connCh:     make(chan net.Conn),
+		closeOnce:  new(sync.Once),
+		tunnelAddr: tunnelAddr,
 	}
 }
 
-func agentToTrackingKey(key agentKey) track.Key {
-	return track.Key{
-		Cluster: key.clusterName,
-		Type:    key.tunnelType,
-		Addr:    key.addr,
-	}
+func (l ServerHandlerToListener) HandleConnection(c net.Conn) {
+	// HandleConnection must block as long as c is used.
+	// Wrap c to only return after c.Close() has been called.
+	cc := newConnCloser(c)
+	l.connCh <- cc
+	cc.wait()
 }
 
-func (a *agentKey) String() string {
-	return fmt.Sprintf("agentKey(cluster=%v, type=%v, addr=%v)", a.clusterName, a.tunnelType, a.addr.String())
+func (l ServerHandlerToListener) Accept() (net.Conn, error) {
+	c, ok := <-l.connCh
+	if !ok {
+		return nil, io.EOF
+	}
+	return c, nil
 }
+
+func (l ServerHandlerToListener) Close() error {
+	l.closeOnce.Do(func() { close(l.connCh) })
+	return nil
+}
+
+func (l ServerHandlerToListener) Addr() net.Addr {
+	return reverseTunnelAddr(l.tunnelAddr)
+}
+
+type connCloser struct {
+	net.Conn
+	closeOnce *sync.Once
+	closed    chan struct{}
+}
+
+func newConnCloser(c net.Conn) connCloser {
+	return connCloser{Conn: c, closeOnce: new(sync.Once), closed: make(chan struct{})}
+}
+
+func (c connCloser) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func (c connCloser) wait() { <-c.closed }
+
+// reverseTunnelAddr is a net.Addr implementation for a listener based on a
+// reverse tunnel.
+type reverseTunnelAddr string
+
+func (reverseTunnelAddr) Network() string  { return "ssh-reversetunnel" }
+func (a reverseTunnelAddr) String() string { return string(a) }

@@ -1,5 +1,5 @@
 /*
-Copyright 2018 Gravitational, Inc.
+Copyright 2018-2020 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,36 +18,61 @@ limitations under the License.
 package filesessions
 
 import (
+	"context"
+	"io/ioutil"
+	"os"
 	"testing"
 
+	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/events/test"
 	"github.com/gravitational/teleport/lib/utils"
 
-	"gopkg.in/check.v1"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
+
+	"github.com/gravitational/trace"
 )
 
-func TestFile(t *testing.T) { check.TestingT(t) }
-
-type FileSuite struct {
-	test.HandlerSuite
-}
-
-var _ = check.Suite(&FileSuite{})
-
-func (s *FileSuite) SetUpSuite(c *check.C) {
+func TestMain(m *testing.M) {
 	utils.InitLoggerForTests()
+	os.Exit(m.Run())
+}
 
-	var err error
-	s.HandlerSuite.Handler, err = NewHandler(Config{
-		Directory: c.MkDir(),
+// TestStreams tests various streaming upload scenarios
+func TestStreams(t *testing.T) {
+	dir, err := ioutil.TempDir("", "teleport-streams")
+	require.Nil(t, err)
+	defer os.RemoveAll(dir)
+
+	handler, err := NewHandler(Config{
+		Directory: dir,
 	})
-	c.Assert(err, check.IsNil)
-}
+	require.Nil(t, err)
+	defer handler.Close()
 
-func (s *FileSuite) TestUploadDownload(c *check.C) {
-	s.UploadDownload(c)
-}
+	t.Run("Stream", func(t *testing.T) {
+		test.Stream(t, handler)
+	})
+	t.Run("Resume", func(t *testing.T) {
+		completeCount := atomic.NewUint64(0)
+		handler, err := NewHandler(Config{
+			Directory: dir,
+			OnBeforeComplete: func(ctx context.Context, upload events.StreamUpload) error {
+				if completeCount.Inc() <= 1 {
+					return trace.ConnectionProblem(nil, "simulate failure %v", completeCount.Load())
+				}
+				return nil
+			},
+		})
+		require.Nil(t, err)
+		defer handler.Close()
 
-func (s *FileSuite) TestDownloadNotFound(c *check.C) {
-	s.DownloadNotFound(c)
+		test.StreamResumeManyParts(t, handler)
+	})
+	t.Run("UploadDownload", func(t *testing.T) {
+		test.UploadDownload(t, handler)
+	})
+	t.Run("DownloadNotFound", func(t *testing.T) {
+		test.DownloadNotFound(t, handler)
+	})
 }

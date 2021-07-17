@@ -20,24 +20,25 @@ package bpf
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	os_exec "os/exec"
-	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
 
-	"github.com/gravitational/trace"
-
-	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/aquasecurity/libbpfgo"
+	"github.com/gravitational/teleport/api/constants"
+	apievents "github.com/gravitational/teleport/api/types/events"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/lib/events"
-	"github.com/gravitational/teleport/lib/session"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/pborman/uuid"
 	"gopkg.in/check.v1"
@@ -45,17 +46,12 @@ import (
 
 type Suite struct{}
 
-var _ = fmt.Printf
+//go:embed bytecode/counter_test.bpf.o
+var counterTestBPF []byte
+
 var _ = check.Suite(&Suite{})
 
-func TestBPF(t *testing.T) { check.TestingT(t) }
-
-func (s *Suite) SetUpSuite(c *check.C) {
-	utils.InitLoggerForTests()
-}
-func (s *Suite) TearDownSuite(c *check.C) {}
-func (s *Suite) SetUpTest(c *check.C)     {}
-func (s *Suite) TearDownTest(c *check.C)  {}
+func TestRootBPF(t *testing.T) { check.TestingT(t) }
 
 func (s *Suite) TestWatch(c *check.C) {
 	// This test must be run as root and the host has to be capable of running
@@ -78,9 +74,10 @@ func (s *Suite) TestWatch(c *check.C) {
 		Enabled:    true,
 		CgroupPath: dir,
 	})
+	defer service.Close()
 
 	// Create a fake audit log that can be used to capture the events emitted.
-	auditLog := newFakeLog()
+	emitter := &events.MockEmitter{}
 
 	// Create and start a program that does nothing. Since sleep will run longer
 	// than we wait below, nothing should be emit to the Audit Log.
@@ -91,50 +88,49 @@ func (s *Suite) TestWatch(c *check.C) {
 	// Create a monitoring session for init. The events we execute should not
 	// have PID 1, so nothing should be captured in the Audit Log.
 	cgroupID, err := service.OpenSession(&SessionContext{
-		Namespace: defaults.Namespace,
+		Namespace: apidefaults.Namespace,
 		SessionID: uuid.New(),
 		ServerID:  uuid.New(),
 		Login:     "foo",
 		User:      "foo@example.com",
 		PID:       cmd.Process.Pid,
-		AuditLog:  auditLog,
+		Emitter:   emitter,
 		Events: map[string]bool{
-			teleport.EnhancedRecordingCommand: true,
-			teleport.EnhancedRecordingDisk:    true,
-			teleport.EnhancedRecordingNetwork: true,
+			constants.EnhancedRecordingCommand: true,
+			constants.EnhancedRecordingDisk:    true,
+			constants.EnhancedRecordingNetwork: true,
 		},
 	})
 	c.Assert(err, check.IsNil)
 	c.Assert(cgroupID > 0, check.Equals, true)
 
-	// Execute "ls" in a loop.
-	go func() {
-		for {
-			// Find "ls" binary.
-			lsPath, err := os_exec.LookPath("ls")
-			c.Assert(err, check.IsNil)
+	// Find "ls" binary.
+	lsPath, err := os_exec.LookPath("ls")
+	c.Assert(err, check.IsNil)
 
-			// Run "ls".
-			err = os_exec.Command(lsPath).Run()
-			c.Assert(err, check.IsNil)
+	// Execute "ls" a few times
+	for i := 0; i < 5; i++ {
+		// Run "ls".
+		err = os_exec.Command(lsPath).Run()
+		c.Assert(err, check.IsNil)
 
-			// Delay.
-			time.Sleep(250 * time.Millisecond)
+		// Delay.
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// Make sure no events from "ls" were generated
+	for _, e := range emitter.Events() {
+		var pid uint64
+
+		switch ev := e.(type) {
+		case *apievents.SessionCommand:
+			pid = ev.BPFMetadata.PID
+		case *apievents.SessionDisk:
+			pid = ev.BPFMetadata.PID
+		case *apievents.SessionNetwork:
+			pid = ev.BPFMetadata.PID
 		}
-	}()
-
-	// Keep checking that even though events are being executed, that they are
-	// not emitted to the audit log because the cgroup they are in is not being
-	// monitored.
-	timer := time.NewTimer(250 * time.Millisecond)
-	defer timer.Stop()
-	for {
-		select {
-		case <-time.Tick(250 * time.Millisecond):
-			c.Assert(auditLog.events, check.HasLen, 0)
-		case <-timer.C:
-			return
-		}
+		c.Assert(int(pid), check.Equals, cmd.Process.Pid)
 	}
 }
 
@@ -158,13 +154,8 @@ func (s *Suite) TestObfuscate(c *check.C) {
 	shellPath, err := os_exec.LookPath("sh")
 	c.Assert(err, check.IsNil)
 
-	// Create a context that will be used to close and stop the BPF programs
-	// at the end of the test.
-	closeContext, closeFunc := context.WithCancel(context.Background())
-	defer closeFunc()
-
 	// Start execsnoop.
-	execsnoop, err := startExec(closeContext, defaults.PerfBufferPageCount)
+	execsnoop, err := startExec(8192)
 	defer execsnoop.close()
 	c.Assert(err, check.IsNil)
 
@@ -203,17 +194,16 @@ func (s *Suite) TestObfuscate(c *check.C) {
 	}()
 	go func() {
 		for {
-			select {
-			case eventBytes := <-execsnoop.events():
-				// Unmarshal the event.
-				var event rawExecEvent
-				err := unmarshalEvent(eventBytes, &event)
-				c.Assert(err, check.IsNil)
+			eventBytes := <-execsnoop.events()
+			// Unmarshal the event.
+			var event rawExecEvent
+			err := unmarshalEvent(eventBytes, &event)
+			c.Assert(err, check.IsNil)
 
-				// Check the event is what we expect, in this case "ls".
-				if convertString(unsafe.Pointer(&event.Command)) == "ls" {
-					doneFunc()
-				}
+			// Check the event is what we expect, in this case "ls".
+			if ConvertString(unsafe.Pointer(&event.Command)) == "ls" {
+				doneFunc()
+				break
 			}
 		}
 
@@ -241,13 +231,8 @@ func (s *Suite) TestScript(c *check.C) {
 		c.Skip(fmt.Sprintf("Tests for package bpf can not be run: %v.", err))
 	}
 
-	// Create a context that will be used to close and stop the BPF programs
-	// at the end of the test.
-	closeContext, closeFunc := context.WithCancel(context.Background())
-	defer closeFunc()
-
 	// Start execsnoop.
-	execsnoop, err := startExec(closeContext, defaults.PerfBufferPageCount)
+	execsnoop, err := startExec(8192)
 	defer execsnoop.close()
 	c.Assert(err, check.IsNil)
 
@@ -283,17 +268,16 @@ func (s *Suite) TestScript(c *check.C) {
 	}()
 	go func() {
 		for {
-			select {
-			case eventBytes := <-execsnoop.events():
-				// Unmarshal the event.
-				var event rawExecEvent
-				err := unmarshalEvent(eventBytes, &event)
-				c.Assert(err, check.IsNil)
+			eventBytes := <-execsnoop.events()
+			// Unmarshal the event.
+			var event rawExecEvent
+			err := unmarshalEvent(eventBytes, &event)
+			c.Assert(err, check.IsNil)
 
-				// Check the event is what we expect, in this case "ls".
-				if convertString(unsafe.Pointer(&event.Command)) == "ls" {
-					doneFunc()
-				}
+			// Check the event is what we expect, in this case "ls".
+			if ConvertString(unsafe.Pointer(&event.Command)) == "ls" {
+				doneFunc()
+				break
 			}
 		}
 
@@ -328,25 +312,20 @@ func (s *Suite) TestPrograms(c *check.C) {
 	}))
 	defer ts.Close()
 
-	// Create a context that will be used to close and stop the BPF programs
-	// at the end of the test.
-	closeContext, closeFunc := context.WithCancel(context.Background())
-	defer closeFunc()
-
 	// Start execsnoop.
-	execsnoop, err := startExec(closeContext, defaults.PerfBufferPageCount)
-	defer execsnoop.close()
+	execsnoop, err := startExec(8192)
 	c.Assert(err, check.IsNil)
+	defer execsnoop.close()
 
 	// Start opensnoop.
-	opensnoop, err := startOpen(closeContext, defaults.PerfBufferPageCount)
-	defer opensnoop.close()
+	opensnoop, err := startOpen(8192)
 	c.Assert(err, check.IsNil)
+	defer opensnoop.close()
 
 	// Start tcpconnect.
-	tcpconnect, err := startConn(closeContext, defaults.PerfBufferPageCount)
-	defer tcpconnect.close()
+	tcpconnect, err := startConn(8192)
 	c.Assert(err, check.IsNil)
+	defer tcpconnect.close()
 
 	// Loop over all three programs and make sure events are received off the
 	// perf buffer.
@@ -406,6 +385,67 @@ func (s *Suite) TestPrograms(c *check.C) {
 	}
 }
 
+// TestBPFCounter tests that BPF-to-Prometheus counter works ok
+func (s *Suite) TestBPFCounter(c *check.C) {
+	// This test must be run as root. Only root can create cgroups.
+	if !isRoot() {
+		c.Skip("Tests for package bpf can only be run as root.")
+	}
+
+	// Check that the host is capable of running BPF programs.
+	err := IsHostCompatible()
+	if err != nil {
+		c.Skip(fmt.Sprintf("Tests for package bpf can not be run: %v.", err))
+	}
+
+	module, err := libbpfgo.NewModuleFromBuffer(counterTestBPF, "counter_test")
+	c.Assert(err, check.IsNil)
+
+	// Load into the kernel
+	err = module.BPFLoadObject()
+	c.Assert(err, check.IsNil)
+
+	err = AttachSyscallTracepoint(module, "close")
+	c.Assert(err, check.IsNil)
+
+	promCounter := prometheus.NewCounter(prometheus.CounterOpts{Name: "test"})
+
+	counter, err := NewCounter(module, "test_counter", promCounter)
+	c.Assert(err, check.IsNil)
+
+	// Make sure the counter starts with 0
+	c.Assert(testutil.ToFloat64(promCounter), check.Equals, float64(0))
+
+	// close(1234) will cause the counter to get incremented.
+	magicFD := 1234
+
+	// First do it a few times as to no overflow the doorbell buffer
+	gentleBumps := 10
+	for i := 0; i < gentleBumps; i++ {
+		syscall.Close(magicFD)
+	}
+
+	// Not ideal but no other good way to know that the counter was updated
+	time.Sleep(time.Second)
+
+	// Make sure all are accounted for
+	c.Assert(testutil.ToFloat64(promCounter), check.Equals, float64(gentleBumps))
+
+	// Next, pound the counter to heopfully overflow the doorbell.
+	poundingBumps := 100000
+	for i := 0; i < poundingBumps; i++ {
+		syscall.Close(magicFD)
+	}
+
+	// Not ideal but no other good way to know that the counter was updated
+	time.Sleep(time.Second)
+
+	// Make sure all are accounted for
+	c.Assert(testutil.ToFloat64(promCounter), check.Equals, float64(gentleBumps+poundingBumps))
+
+	counter.Close()
+}
+
 // waitForEvent will wait for an event to arrive over the perf buffer and
 // signal when it has.
 func waitForEvent(ctx context.Context, cancel context.CancelFunc, eventCh <-chan []byte) {
@@ -445,58 +485,6 @@ func executeHTTP(c *check.C, doneContext context.Context, endpoint string) {
 
 		time.Sleep(250 * time.Millisecond)
 	}
-}
-
-// fakeLog is used in tests to obtain events emitted to the Audit Log.
-type fakeLog struct {
-	mu     sync.Mutex
-	events []events.EventFields
-}
-
-func newFakeLog() *fakeLog {
-	return &fakeLog{
-		events: make([]events.EventFields, 0),
-	}
-}
-
-func (a *fakeLog) EmitAuditEvent(e events.Event, f events.EventFields) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	a.events = append(a.events, f)
-	return nil
-}
-
-func (a *fakeLog) PostSessionSlice(s events.SessionSlice) error {
-	return trace.NotImplemented("not implemented")
-}
-
-func (a *fakeLog) UploadSessionRecording(r events.SessionRecording) error {
-	return trace.NotImplemented("not implemented")
-}
-
-func (a *fakeLog) GetSessionChunk(namespace string, sid session.ID, offsetBytes int, maxBytes int) ([]byte, error) {
-	return nil, trace.NotFound("")
-}
-
-func (a *fakeLog) GetSessionEvents(namespace string, sid session.ID, after int, includePrintEvents bool) ([]events.EventFields, error) {
-	return nil, trace.NotFound("")
-}
-
-func (a *fakeLog) SearchEvents(fromUTC, toUTC time.Time, query string, limit int) ([]events.EventFields, error) {
-	return nil, trace.NotFound("")
-}
-
-func (a *fakeLog) SearchSessionEvents(fromUTC time.Time, toUTC time.Time, limit int) ([]events.EventFields, error) {
-	return nil, trace.NotFound("")
-}
-
-func (a *fakeLog) WaitForDelivery(context.Context) error {
-	return trace.NotImplemented("not implemented")
-}
-
-func (a *fakeLog) Close() error {
-	return trace.NotFound("")
 }
 
 // isRoot returns a boolean if the test is being run as root or not. Tests

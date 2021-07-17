@@ -20,14 +20,20 @@ package test
 
 import (
 	"context"
+	"encoding/hex"
+	"math/rand"
 	"sync/atomic"
 	"time"
 
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/fixtures"
 
 	"github.com/gravitational/trace"
+
+	"github.com/jonboulle/clockwork"
 	"github.com/pborman/uuid"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/check.v1"
 )
 
@@ -37,6 +43,7 @@ type BackendSuite struct {
 	// used for concurrent operations tests
 	B2         backend.Backend
 	NewBackend func() (backend.Backend, error)
+	Clock      clockwork.FakeClock
 }
 
 // CRUD tests create read update scenarios
@@ -98,6 +105,27 @@ func (s *BackendSuite) CRUD(c *check.C) {
 	out, err = s.B.Get(ctx, item.Key)
 	c.Assert(err, check.IsNil)
 	c.Assert(string(out.Value), check.Equals, string(item.Value))
+
+	// put with large key and binary value succeeds.
+	// NB: DynamoDB has a maximum overall key length of 1024 bytes, so
+	//     we need to pick a random key size that will still fit in 1KiB
+	//     when combined with the (currently) 33-byte prefix prepended
+	//     by `prefix()`, so:
+	//         (485 bytes * 2 (for hex encoding)) + 33 = 1003
+	//     which gives us a little bit of room to spare
+	keyBytes := make([]byte, 485)
+	rand.Read(keyBytes)
+	key := hex.EncodeToString(keyBytes)
+
+	data := make([]byte, 1024)
+	rand.Read(data)
+	item = backend.Item{Key: prefix(key), Value: data}
+	_, err = s.B.Put(ctx, item)
+	c.Assert(err, check.IsNil)
+
+	out, err = s.B.Get(ctx, item.Key)
+	c.Assert(err, check.IsNil)
+	c.Assert(out.Value, check.DeepEquals, item.Value)
 }
 
 // Range tests scenarios with range queries
@@ -276,23 +304,16 @@ func (s *BackendSuite) Expiration(c *check.C) {
 	_, err := s.B.Put(ctx, itemA)
 	c.Assert(err, check.IsNil)
 
-	_, err = s.B.Put(ctx, backend.Item{Key: prefix("b"), Value: []byte("val1"), Expires: time.Now().Add(time.Second)})
+	_, err = s.B.Put(ctx, backend.Item{Key: prefix("b"), Value: []byte("val1"), Expires: s.Clock.Now().Add(1 * time.Second)})
 	c.Assert(err, check.IsNil)
 
-	var items []backend.Item
-	for i := 0; i < 4; i++ {
-		time.Sleep(time.Second)
-		res, err := s.B.GetRange(ctx, prefix(""), backend.RangeEnd(prefix("")), backend.NoLimit)
-		c.Assert(err, check.IsNil)
-		if len(res.Items) == 1 {
-			items = res.Items
-			break
-		}
-	}
-	ExpectItems(c, items, []backend.Item{itemA})
+	s.Clock.Advance(4 * time.Second)
+	res, err := s.B.GetRange(ctx, prefix(""), backend.RangeEnd(prefix("")), backend.NoLimit)
+	c.Assert(err, check.IsNil)
+	ExpectItems(c, res.Items, []backend.Item{itemA})
 }
 
-// addSeconds adds seconds with a seconds precission
+// addSeconds adds seconds with a seconds precision
 // always rounding up to the next second,
 // because TTL engines are usually 1 second precision
 func addSeconds(t time.Time, seconds int64) time.Time {
@@ -308,52 +329,38 @@ func (s *BackendSuite) KeepAlive(c *check.C) {
 	c.Assert(err, check.IsNil)
 	defer watcher.Close()
 
-	item := backend.Item{Key: prefix("key"), Value: []byte("val1"), Expires: addSeconds(time.Now(), 2)}
-	lease, err := s.B.Put(ctx, item)
+	expiresAt := addSeconds(s.Clock.Now(), 2)
+	item, lease := s.addItem(context.TODO(), c, prefix("key"), "val1", expiresAt)
+
+	s.Clock.Advance(1 * time.Second)
+
+	// Move the expiration further in the future to avoid processing
+	// skew and ensure the item is available when we delete it.
+	// It does not affect the running time of the test
+	updatedAt := addSeconds(s.Clock.Now(), 60)
+	err = s.B.KeepAlive(context.TODO(), lease, updatedAt)
 	c.Assert(err, check.IsNil)
 
-	time.Sleep(time.Second)
-
-	// make sure that the value has not expired
-	out, err := s.B.Get(ctx, item.Key)
-	c.Assert(err, check.IsNil)
-	c.Assert(string(out.Value), check.Equals, string(item.Value))
-	c.Assert(string(out.Key), check.Equals, string(item.Key))
-
-	err = s.B.KeepAlive(ctx, *lease, addSeconds(time.Now(), 2))
-	c.Assert(err, check.IsNil)
-
-	// should have expired if not keep alive
-	diff := time.Until(addSeconds(time.Now(), 1))
-	time.Sleep(diff + 100*time.Millisecond)
-
-	out, err = s.B.Get(ctx, item.Key)
-	c.Assert(err, check.IsNil)
-	c.Assert(string(out.Value), check.Equals, string(item.Value))
-	c.Assert(string(out.Key), check.Equals, string(item.Key))
-
+	// Since the backend translates absolute expiration timestamp to a TTL
+	// and collecting events takes arbitrary time, the expiration timestamps
+	// on the collected events might have a slight skew
 	events := collectEvents(c, watcher, 3)
-	c.Assert(events[1].Type, check.Equals, backend.OpPut)
-	c.Assert(string(events[1].Item.Key), check.Equals, string(item.Key))
-	c.Assert(events[2].Type, check.Equals, backend.OpPut)
-	c.Assert(string(events[2].Item.Key), check.Equals, string(item.Key))
+	verifyEvents(c, events, []backend.Event{
+		{Type: types.OpInit, Item: backend.Item{}},
+		{Type: types.OpPut, Item: backend.Item{Key: prefix("key"), Value: []byte("val1"), Expires: expiresAt}},
+		{Type: types.OpPut, Item: backend.Item{Key: prefix("key"), Value: []byte("val1"), Expires: updatedAt}},
+	})
 
-	c.Assert(string(events[1].Item.Value), check.Equals, string(item.Value))
-	c.Assert(string(events[2].Item.Value), check.Equals, string(item.Value))
-
-	c.Assert(events[1].Item.Expires.IsZero(), check.Not(check.Equals), true, check.Commentf("expected non zero expiration time"))
-	c.Assert(events[2].Item.Expires.IsZero(), check.Not(check.Equals), true, check.Commentf("expected non zero expiration time"))
-	c.Assert(events[2].Item.Expires.After(events[1].Item.Expires), check.Equals, true, check.Commentf("expected %v after %v", events[2].Item.Expires, events[1].Item.Expires))
-
-	err = s.B.Delete(ctx, item.Key)
+	err = s.B.Delete(context.TODO(), item.Key)
+	require.NoError(c, err)
 	c.Assert(err, check.IsNil)
 
-	_, err = s.B.Get(ctx, item.Key)
-	fixtures.ExpectNotFound(c, err)
+	_, err = s.B.Get(context.TODO(), item.Key)
+	c.Assert(err, check.FitsTypeOf, trace.NotFound(""))
 
 	// keep alive on deleted or expired object should fail
-	err = s.B.KeepAlive(ctx, *lease, addSeconds(time.Now(), 2))
-	fixtures.ExpectNotFound(c, err)
+	err = s.B.KeepAlive(context.TODO(), lease, updatedAt.Add(1*time.Second))
+	c.Assert(err, check.FitsTypeOf, trace.NotFound(""))
 }
 
 func collectEvents(c *check.C, watcher backend.Watcher, count int) []backend.Event {
@@ -385,7 +392,7 @@ func (s *BackendSuite) Events(c *check.C) {
 	// Make sure INIT event is emitted.
 	select {
 	case e := <-watcher.Events():
-		c.Assert(string(e.Type), check.Equals, string(backend.OpInit))
+		c.Assert(e.Type, check.Equals, types.OpInit)
 	case <-watcher.Done():
 		c.Fatalf("Watcher has unexpectedly closed.")
 	case <-time.After(2 * time.Second):
@@ -404,7 +411,7 @@ func (s *BackendSuite) Events(c *check.C) {
 	// Make sure a PUT event is emitted.
 	select {
 	case e := <-watcher.Events():
-		c.Assert(e.Type, check.Equals, backend.OpPut)
+		c.Assert(e.Type, check.Equals, types.OpPut)
 		c.Assert(string(e.Item.Key), check.Equals, string(item.Key))
 		c.Assert(string(e.Item.Value), check.Equals, string(item.Value))
 	case <-watcher.Done():
@@ -424,7 +431,7 @@ func (s *BackendSuite) Events(c *check.C) {
 	// Make sure a DELETE event is emitted.
 	select {
 	case e := <-watcher.Events():
-		c.Assert(e.Type, check.Equals, backend.OpDelete)
+		c.Assert(e.Type, check.Equals, types.OpDelete)
 		c.Assert(string(e.Item.Key), check.Equals, string(item.Key))
 	case <-watcher.Done():
 		c.Fatalf("Watcher has unexpectedly closed.")
@@ -436,7 +443,7 @@ func (s *BackendSuite) Events(c *check.C) {
 	item = &backend.Item{
 		Key:     prefix("c"),
 		Value:   []byte("val"),
-		Expires: time.Now().Add(1 * time.Second),
+		Expires: s.Clock.Now().Add(1 * time.Second),
 	}
 	_, err = s.B.Put(ctx, *item)
 	c.Assert(err, check.IsNil)
@@ -448,7 +455,7 @@ func (s *BackendSuite) Events(c *check.C) {
 	// Make sure a PUT event is emitted.
 	select {
 	case e := <-watcher.Events():
-		c.Assert(e.Type, check.Equals, backend.OpPut)
+		c.Assert(e.Type, check.Equals, types.OpPut)
 		c.Assert(string(e.Item.Key), check.Equals, string(item.Key))
 		c.Assert(string(e.Item.Value), check.Equals, string(item.Value))
 	case <-watcher.Done():
@@ -457,8 +464,8 @@ func (s *BackendSuite) Events(c *check.C) {
 		c.Fatalf("Timeout waiting for event.")
 	}
 
-	// Wait a few second for the item to expire.
-	time.Sleep(3 * time.Second)
+	// Wait a few seconds for the item to expire.
+	s.Clock.Advance(3 * time.Second)
 
 	// Make sure item has been removed.
 	_, err = s.B.Get(ctx, item.Key)
@@ -467,7 +474,7 @@ func (s *BackendSuite) Events(c *check.C) {
 	// Make sure a DELETE event is emitted.
 	select {
 	case e := <-watcher.Events():
-		c.Assert(e.Type, check.Equals, backend.OpDelete)
+		c.Assert(e.Type, check.Equals, types.OpDelete)
 		c.Assert(string(e.Item.Key), check.Equals, string(item.Key))
 	case <-watcher.Done():
 		c.Fatalf("Watcher has unexpectedly closed.")
@@ -511,55 +518,80 @@ func (s *BackendSuite) WatchersClose(c *check.C) {
 }
 
 // Locking tests locking logic
-func (s *BackendSuite) Locking(c *check.C) {
+func (s *BackendSuite) Locking(c *check.C, bk backend.Backend) {
 	tok1 := "token1"
 	tok2 := "token2"
-	ttl := time.Second * 5
+	ttl := 5 * time.Second
 
-	ctx := context.TODO()
+	// If all this takes more than a minute then something external to the test
+	// has probably gone bad (e.g. db server has ceased to exist), so it's
+	// probably best to bail out with a sensible error (& call stack) rather
+	// than wait for the test to time out
+	ctx, cancel := context.WithTimeout(context.TODO(), 1*time.Minute)
+	defer cancel()
 
-	err := backend.ReleaseLock(ctx, s.B, tok1)
-	fixtures.ExpectNotFound(c, err)
+	// Manually drive the clock at ~10x speed to make sure anyone waiting on it
+	// will eventually be woken. This will automatically be stopped when the
+	// test exits thanks to the deferred cancel above.
+	go func() {
+		t := time.NewTicker(100 * time.Millisecond)
+		defer t.Stop()
 
-	c.Assert(backend.AcquireLock(ctx, s.B, tok1, ttl), check.IsNil)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+
+			case <-t.C:
+				s.Clock.Advance(1 * time.Second)
+			}
+		}
+	}()
+
+	lock, err := backend.AcquireLock(ctx, bk, tok1, ttl)
+	c.Assert(err, check.IsNil)
 	x := int32(7)
 
 	go func() {
 		atomic.StoreInt32(&x, 9)
-		c.Assert(backend.ReleaseLock(ctx, s.B, tok1), check.IsNil)
+		c.Assert(lock.Release(ctx, bk), check.IsNil)
 	}()
-	c.Assert(backend.AcquireLock(ctx, s.B, tok1, ttl), check.IsNil)
+	lock, err = backend.AcquireLock(ctx, bk, tok1, ttl)
+	c.Assert(err, check.IsNil)
 	atomic.AddInt32(&x, 9)
 
 	c.Assert(atomic.LoadInt32(&x), check.Equals, int32(18))
-	c.Assert(backend.ReleaseLock(ctx, s.B, tok1), check.IsNil)
+	c.Assert(lock.Release(ctx, bk), check.IsNil)
 
-	c.Assert(backend.AcquireLock(ctx, s.B, tok1, ttl), check.IsNil)
+	lock, err = backend.AcquireLock(ctx, bk, tok1, ttl)
+	c.Assert(err, check.IsNil)
 	atomic.StoreInt32(&x, 7)
 	go func() {
 		atomic.StoreInt32(&x, 9)
-		c.Assert(backend.ReleaseLock(ctx, s.B, tok1), check.IsNil)
+		c.Assert(lock.Release(ctx, bk), check.IsNil)
 	}()
-	c.Assert(backend.AcquireLock(ctx, s.B, tok1, ttl), check.IsNil)
+	lock, err = backend.AcquireLock(ctx, bk, tok1, ttl)
+	c.Assert(err, check.IsNil)
 	atomic.AddInt32(&x, 9)
 	c.Assert(atomic.LoadInt32(&x), check.Equals, int32(18))
-	c.Assert(backend.ReleaseLock(ctx, s.B, tok1), check.IsNil)
+	c.Assert(lock.Release(ctx, bk), check.IsNil)
 
 	y := int32(0)
-	c.Assert(backend.AcquireLock(ctx, s.B, tok1, ttl), check.IsNil)
-	c.Assert(backend.AcquireLock(ctx, s.B, tok2, ttl), check.IsNil)
+	lock1, err := backend.AcquireLock(ctx, bk, tok1, ttl)
+	c.Assert(err, check.IsNil)
+	lock2, err := backend.AcquireLock(ctx, bk, tok2, ttl)
+	c.Assert(err, check.IsNil)
 	go func() {
 		atomic.StoreInt32(&y, 15)
-		c.Assert(backend.ReleaseLock(ctx, s.B, tok1), check.IsNil)
-		c.Assert(backend.ReleaseLock(ctx, s.B, tok2), check.IsNil)
+		c.Assert(lock1.Release(ctx, bk), check.IsNil)
+		c.Assert(lock2.Release(ctx, bk), check.IsNil)
 	}()
 
-	c.Assert(backend.AcquireLock(ctx, s.B, tok1, ttl), check.IsNil)
+	lock, err = backend.AcquireLock(ctx, bk, tok1, ttl)
+	c.Assert(err, check.IsNil)
 	c.Assert(atomic.LoadInt32(&y), check.Equals, int32(15))
 
-	c.Assert(backend.ReleaseLock(ctx, s.B, tok1), check.IsNil)
-	err = backend.ReleaseLock(ctx, s.B, tok1)
-	fixtures.ExpectNotFound(c, err)
+	c.Assert(lock.Release(ctx, bk), check.IsNil)
 }
 
 // ConcurrentOperations tests concurrent operations on the same
@@ -649,7 +681,7 @@ func (s *BackendSuite) Mirror(c *check.C, b backend.Backend) {
 	// Make sure INIT event is emitted.
 	select {
 	case e := <-watcher.Events():
-		c.Assert(string(e.Type), check.Equals, string(backend.OpInit))
+		c.Assert(e.Type, check.Equals, types.OpInit)
 	case <-watcher.Done():
 		c.Fatalf("Watcher has unexpectedly closed.")
 	case <-time.After(2 * time.Second):
@@ -676,7 +708,7 @@ func (s *BackendSuite) Mirror(c *check.C, b backend.Backend) {
 	// Make sure a PUT event is emitted.
 	select {
 	case e := <-watcher.Events():
-		c.Assert(e.Type, check.Equals, backend.OpPut)
+		c.Assert(e.Type, check.Equals, types.OpPut)
 		c.Assert(string(e.Item.Key), check.Equals, string(item.Key))
 		c.Assert(string(e.Item.Value), check.Equals, string(item.Value))
 	case <-watcher.Done():
@@ -716,6 +748,17 @@ func (s *BackendSuite) Mirror(c *check.C, b backend.Backend) {
 	c.Assert(item.ID, check.Equals, originalID)
 }
 
+func (s *BackendSuite) addItem(ctx context.Context, c *check.C, key []byte, value string, expires time.Time) (backend.Item, backend.Lease) {
+	item := backend.Item{
+		Key:     key,
+		Value:   []byte(value),
+		Expires: expires,
+	}
+	lease, err := s.B.Put(ctx, item)
+	c.Assert(err, check.IsNil)
+	return item, *lease
+}
+
 // MakePrefix returns function that appends unique prefix
 // to any key, used to make test suite concurrent-run proof
 func MakePrefix() func(k string) []byte {
@@ -733,5 +776,41 @@ func ExpectItems(c *check.C, items, expected []backend.Item) {
 	for i := range items {
 		c.Assert(string(items[i].Key), check.Equals, string(expected[i].Key))
 		c.Assert(string(items[i].Value), check.Equals, string(expected[i].Value))
+	}
+}
+
+func verifyEvents(c *check.C, obtained, expected []backend.Event) {
+	verifyIncreasingIDs(c, obtained)
+	verifyNoDuplicateIDs(c, obtained)
+	verifyExpireTimestampsIncreasing(c, obtained, expected)
+}
+
+func verifyIncreasingIDs(c *check.C, obtained []backend.Event) {
+	lastID := int64(-1)
+	for _, item := range obtained {
+		c.Assert(item.Item.ID > lastID, check.Equals, true, check.Commentf("must be increasing"))
+		lastID = item.Item.ID
+	}
+}
+
+func verifyNoDuplicateIDs(c *check.C, obtained []backend.Event) {
+	dedup := make(map[int64]struct{})
+	for _, event := range obtained {
+		if _, ok := dedup[event.Item.ID]; ok {
+			c.Fatalf("Duplicate ID for %v.", event.Item.ID)
+		}
+		dedup[event.Item.ID] = struct{}{}
+	}
+}
+
+func verifyExpireTimestampsIncreasing(c *check.C, obtained, expected []backend.Event) {
+	c.Assert(obtained, check.HasLen, len(expected))
+	for i := range expected {
+		if obtained[i].Item.Expires.After(expected[i].Item.Expires) {
+			c.Errorf("Expected %v >= %v",
+				expected[i].Item.Expires,
+				obtained[i].Item.Expires,
+			)
+		}
 	}
 }
